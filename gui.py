@@ -15,7 +15,7 @@ BUILD_DATE = "10/07/2026"
 
 STEPS = [
     ("batch", "批量导入", "📁"),
-    ("approve", "人工审核", "✍️"),
+    ("approve", "人工核对", "✍️"),
     ("fill", "自动填写", "🌐"),
 ]
 
@@ -356,7 +356,7 @@ class App(customtkinter.CTk):
 
         titles = {
             "batch": "批量导入",
-            "approve": "人工审核",
+            "approve": "人工核对",
             "fill": "自动填写",
         }
         self.controls_header.configure(text=titles[key])
@@ -452,7 +452,7 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkButton(
             parent,
-            text="前往人工审核 →",
+            text="前往人工核对 →",
             height=40,
             fg_color="transparent",
             border_width=2,
