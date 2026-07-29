@@ -10,10 +10,8 @@ VinCert is a desktop tool for batch-importing certificates, reviewing OCR result
 [![Target](https://img.shields.io/badge/target-Windows-0078D4)](.)
 
 ---
-# v0.1 (21/07/2026) Release Notes
+# v0.2 (29/07/2026) Release Notes
 
-- **New Two-step workflow:** 批量提取 → 核对填写
-- **Folder batch import** — pick a folder; root-level PDFs are scanned and parsed automatically
-- **Multi-page PDF preview** — all pages rendered in a scrollable canvas, scaled to window width
-- **Rule-based field extraction** from embedded PDF text (no OCR yet) specialised for 天溯 calibration certificates
-- **Approve queue** — reviewed certificates accumulate for a future batch autofill step
+- **Simplification** — removed custom PDF viewer & placeholder browser view for seperated control and better functionality
+- **Updated UI & UX** — Cleaner document control & operations
+- **Installation Ease** — requirements.txt to ensure consistent environments
