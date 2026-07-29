@@ -1,3 +1,23 @@
-customtkinter
-pymupdf>=1.24.0
-Pillow>=10.0.0
+# VinCert dependencies
+# Target: Windows 10/11, Python 3.11 or 3.12 (64-bit, official python.org installer)
+# Also works on macOS for development.
+#
+# Setup (Windows):
+#   py -3.11 -m venv .venv
+#   .venv\Scripts\activate
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#   python gui.py
+#
+# Notes:
+# - Use the official Python installer and enable "tcl/tk and IDLE"
+#   (CustomTkinter needs tkinter).
+# - Prefer 64-bit Python; PyMuPDF / Pillow ship Windows wheels for it.
+# - No OCR packages yet (PaddleOCR is not required for digital PDF text).
+
+# --- UI ---
+customtkinter==6.0.0
+
+# --- PDF / images ---
+pymupdf==1.28.0
+Pillow==12.3.0

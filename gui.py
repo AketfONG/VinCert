@@ -4,16 +4,12 @@ VinCert — certificate OCR / parse desktop app.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
-import tkinter as tk
 
 import customtkinter
-from PIL import ImageTk
 from tkinter import filedialog
 
 from vincert.models import CertificateFields, ParseResult
-from vincert.pdf_io import page_count, render_page
 from vincert.pipeline import parse_certificate
 from vincert.folder_import import find_pdfs_in_folder
 
@@ -21,12 +17,16 @@ customtkinter.set_appearance_mode("System")
 customtkinter.set_default_color_theme("blue")
 
 SIDEBAR_WIDTH = 188
-CONTROLS_WIDTH = 360
+DOC_SIDEBAR_WIDTH = 400
+DOC_SIDEBAR_MARGIN = 10
+MAIN_MIN_WIDTH = 480
+CONTENT_WRAP = MAIN_MIN_WIDTH - 48
+DOC_WRAP = DOC_SIDEBAR_WIDTH - 32
 STEP_TILE_SIZE = 144
 STEP_TILE_PADX = 18
 SETTINGS_BTN_HEIGHT = 40
-BUILD_VERSION = "v0.1"
-BUILD_DATE = "21/07/2026"
+BUILD_VERSION = "v0.2"
+BUILD_DATE = "29/07/2026"
 
 STEPS = [
     ("extract", "批量提取", "📂"),
@@ -76,32 +76,29 @@ class App(customtkinter.CTk):
         super().__init__()
 
         self.title("VinCert")
-        self.geometry("1400x820")
+        self.geometry(
+            f"{SIDEBAR_WIDTH + DOC_SIDEBAR_WIDTH + MAIN_MIN_WIDTH + 40}x820"
+        )
 
         self._imported_files: list[str] = []
         self._parse_results: dict[str, ParseResult] = {}
         self._autofill_queue: list[str] = []
+        self._removed_paths: set[str] = set()
         self._current_cert_index = 0
         self._current_step = "extract"
 
-        # Extract / preview state
         self._source_folder: str | None = None
-        self._preview_path: str | None = None
-        self._preview_page_count = 0
-        self._preview_photos: list[ImageTk.PhotoImage] = []
+        self._selected_path: str | None = None
         self._doc_buttons: dict[str, customtkinter.CTkButton] = {}
         self._extract_busy = False
-        self._pdf_resize_after_id: str | None = None
-        self._last_pdf_canvas_width = 0
-        self._extract_text_expanded = False
 
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=0, minsize=SIDEBAR_WIDTH)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_columnconfigure(2, weight=0, minsize=CONTROLS_WIDTH)
+        self.grid_columnconfigure(1, weight=0, minsize=DOC_SIDEBAR_WIDTH)
+        self.grid_columnconfigure(2, weight=1, minsize=MAIN_MIN_WIDTH)
 
         self._build_sidebar()
-        self._build_center_stack()
+        self._build_doc_sidebar()
         self._build_controls_panel()
         self._apply_min_window_size()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -301,158 +298,105 @@ class App(customtkinter.CTk):
             else:
                 self._apply_tile_style(key, "normal")
 
-    # ----------------------------------------------------------- center panels
-    def _build_center_stack(self):
-        self.center_stack = customtkinter.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        self.center_stack.grid(row=0, column=1, sticky="nsew")
-        self.center_stack.grid_rowconfigure(0, weight=1)
-        self.center_stack.grid_columnconfigure(0, weight=1)
-
-        self._build_website_panel()
-        self._build_extract_preview_panel()
-
-        self.website_panel.grid(row=0, column=0, sticky="nsew")
-        self.extract_preview_panel.grid(row=0, column=0, sticky="nsew")
-
-    def _build_website_panel(self):
-        self.website_panel = customtkinter.CTkFrame(
-            self.center_stack, corner_radius=0, fg_color="transparent"
+    # ------------------------------------------------------------- doc sidebar
+    def _build_doc_sidebar(self):
+        self.doc_sidebar = customtkinter.CTkFrame(
+            self,
+            width=DOC_SIDEBAR_WIDTH,
+            corner_radius=0,
+            fg_color=APP_BG_COLOR,
         )
-        self.website_panel.grid_rowconfigure(1, weight=1)
-        self.website_panel.grid_columnconfigure(0, weight=1)
+        self.doc_sidebar.grid(row=0, column=1, sticky="nsew")
+        self.doc_sidebar.grid_propagate(False)
+        self.doc_sidebar.grid_columnconfigure(0, weight=1)
+        self.doc_sidebar.grid_rowconfigure(0, weight=1)
 
-        toolbar = customtkinter.CTkFrame(self.website_panel, fg_color="transparent")
-        toolbar.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        toolbar.grid_columnconfigure(1, weight=1)
+        self.doc_panel = customtkinter.CTkFrame(
+            self.doc_sidebar,
+            corner_radius=10,
+            fg_color=EMBED_BG_COLOR,
+        )
+        self.doc_panel.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=DOC_SIDEBAR_MARGIN,
+            pady=DOC_SIDEBAR_MARGIN,
+        )
+        self.doc_panel.grid_columnconfigure(0, weight=1)
+        self.doc_panel.grid_rowconfigure(4, weight=1)
 
         customtkinter.CTkLabel(
-            toolbar,
-            text="目标网页",
-            font=customtkinter.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, padx=(0, 10))
+            self.doc_panel,
+            text="文档列表",
+            font=customtkinter.CTkFont(size=16, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
 
-        self.url_entry = customtkinter.CTkEntry(
-            toolbar,
-            placeholder_text="https://example.com/form",
-        )
-        self.url_entry.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-
-        customtkinter.CTkButton(
-            toolbar,
-            text="打开",
-            width=64,
-            command=self._on_open_website,
-        ).grid(row=0, column=2, padx=(0, 6))
+        btn_row = customtkinter.CTkFrame(self.doc_panel, fg_color="transparent")
+        btn_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
+        btn_row.grid_columnconfigure((0, 1), weight=1)
 
         customtkinter.CTkButton(
-            toolbar,
-            text="刷新",
-            width=64,
+            btn_row,
+            text="选择文件夹…",
+            command=self._pick_folder,
+        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+
+        customtkinter.CTkButton(
+            btn_row,
+            text="清空",
             fg_color="transparent",
             border_width=2,
             text_color=("gray10", "gray90"),
             hover_color=OUTLINE_BTN_HOVER,
-            command=self._on_refresh_website,
-        ).grid(row=0, column=3)
+            command=self._clear_extract,
+        ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        browser_frame = customtkinter.CTkFrame(
-            self.website_panel, corner_radius=0, fg_color=EMBED_BG_COLOR
+        self.folder_label = customtkinter.CTkLabel(
+            self.doc_panel,
+            text="未选择文件夹",
+            font=customtkinter.CTkFont(size=11),
+            text_color="gray60",
+            anchor="w",
+            wraplength=DOC_WRAP,
+            justify="left",
         )
-        browser_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        browser_frame.grid_rowconfigure(0, weight=1)
-        browser_frame.grid_columnconfigure(0, weight=1)
+        self.folder_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
 
-        self.browser_placeholder = customtkinter.CTkLabel(
-            browser_frame,
-            text="网页嵌入区域\n\n此处将显示浏览器中的目标网站\n填写流程可对照网页进行操作",
-            font=customtkinter.CTkFont(size=14),
+        customtkinter.CTkLabel(
+            self.doc_panel,
+            text="根目录 PDF",
+            font=customtkinter.CTkFont(size=12, weight="bold"),
+            text_color="gray60",
+            anchor="w",
+        ).grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        self.doc_list_frame = customtkinter.CTkScrollableFrame(
+            self.doc_panel, fg_color=EMBED_BG_COLOR
+        )
+        self.doc_list_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=(0, 14))
+        self.doc_list_frame.grid_columnconfigure(0, weight=1)
+        self.doc_list_frame.bind("<Configure>", self._update_doc_list_scrollbar)
+        self.doc_list_frame._parent_canvas.bind(
+            "<Configure>", self._update_doc_list_scrollbar, add="+"
+        )
+
+        self.doc_list_empty = customtkinter.CTkLabel(
+            self.doc_list_frame,
+            text="选择文件夹后，\nPDF 将显示在这里",
             text_color="gray50",
             justify="center",
         )
-        self.browser_placeholder.grid(row=0, column=0, sticky="nsew")
+        self.doc_list_empty.grid(row=0, column=0, pady=24)
+        self._update_doc_list_scrollbar()
 
-    def _build_extract_preview_panel(self):
-        """Full-width scrollable PDF preview."""
-        self.extract_preview_panel = customtkinter.CTkFrame(
-            self.center_stack, corner_radius=0, fg_color="transparent"
-        )
-        self.extract_preview_panel.grid_rowconfigure(1, weight=1)
-        self.extract_preview_panel.grid_columnconfigure(0, weight=1)
-
-        header = customtkinter.CTkFrame(self.extract_preview_panel, fg_color="transparent")
-        header.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
-        header.grid_columnconfigure(1, weight=1)
-
-        customtkinter.CTkLabel(
-            header,
-            text="PDF 预览",
-            font=customtkinter.CTkFont(size=13, weight="bold"),
-        ).grid(row=0, column=0, padx=(0, 12))
-
-        self.preview_file_label = customtkinter.CTkLabel(
-            header,
-            text="未选择文件",
-            font=customtkinter.CTkFont(size=12),
-            text_color="gray60",
-            anchor="w",
-        )
-        self.preview_file_label.grid(row=0, column=1, sticky="ew")
-
-        self.preview_page_label = customtkinter.CTkLabel(
-            header,
-            text="0 页",
-            font=customtkinter.CTkFont(size=12),
-            text_color="gray60",
-        )
-        self.preview_page_label.grid(row=0, column=2, padx=(8, 0))
-
-        left = customtkinter.CTkFrame(self.extract_preview_panel, fg_color=EMBED_BG_COLOR)
-        left.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        left.grid_rowconfigure(0, weight=1)
-        left.grid_columnconfigure(0, weight=1)
-        self.pdf_preview_shell = left
-
-        canvas_bg = customtkinter.ThemeManager.theme["CTkFrame"]["fg_color"]
-        if isinstance(canvas_bg, (tuple, list)):
-            canvas_bg = canvas_bg[1 if customtkinter.get_appearance_mode() == "Dark" else 0]
-
-        self.pdf_viewport = customtkinter.CTkFrame(left, fg_color="transparent")
-        self.pdf_viewport.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        self.pdf_viewport.grid_rowconfigure(0, weight=1)
-        self.pdf_viewport.grid_columnconfigure(0, weight=1)
-
-        self.pdf_canvas = tk.Canvas(
-            self.pdf_viewport,
-            highlightthickness=0,
-            bg=canvas_bg,
-            # Pixel units → trackpad deltas map 1:1 for smoother feel.
-            yscrollincrement=1,
-            xscrollincrement=1,
-        )
-        self.pdf_vscroll = customtkinter.CTkScrollbar(
-            self.pdf_viewport,
-            orientation="vertical",
-            command=self.pdf_canvas.yview,
-        )
-        self.pdf_canvas.configure(yscrollcommand=self.pdf_vscroll.set)
-        self.pdf_canvas.grid(row=0, column=0, sticky="nsew")
-        self.pdf_vscroll.grid(row=0, column=1, sticky="ns")
-        self.pdf_canvas.bind("<Configure>", self._on_pdf_canvas_configure)
-
-        self._draw_pdf_placeholder(
-            "选择文件夹并点选文档列表中的证书后，\n在此滚动预览全部页面"
-        )
-
-        self.bind_all("<MouseWheel>", self._on_pdf_preview_wheel, add="+")
-        self.bind_all("<Button-4>", self._on_pdf_preview_wheel, add="+")
-        self.bind_all("<Button-5>", self._on_pdf_preview_wheel, add="+")
-
+    # ------------------------------------------------------------- main panel
     def _build_controls_panel(self):
         self.controls_panel = customtkinter.CTkFrame(
-            self, width=CONTROLS_WIDTH, corner_radius=0, fg_color=APP_BG_COLOR
+            self, corner_radius=0, fg_color=APP_BG_COLOR
         )
         self.controls_panel.grid(row=0, column=2, sticky="nsew", padx=0)
-        self.controls_panel.grid_propagate(False)
         self.controls_panel.grid_rowconfigure(1, weight=1)
         self.controls_panel.grid_columnconfigure(0, weight=1)
 
@@ -462,10 +406,10 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=16, weight="bold"),
             anchor="w",
         )
-        self.controls_header.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        self.controls_header.grid(row=0, column=0, padx=24, pady=(16, 8), sticky="ew")
 
         self.controls_body = customtkinter.CTkFrame(self.controls_panel, fg_color="transparent")
-        self.controls_body.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.controls_body.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 16))
         self.controls_body.grid_rowconfigure(0, weight=1)
         self.controls_body.grid_columnconfigure(0, weight=1)
 
@@ -477,10 +421,6 @@ class App(customtkinter.CTk):
             frame = customtkinter.CTkFrame(self.controls_body, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
             frame.grid_columnconfigure(0, weight=1)
-            # Let extract list grow
-            if key == "extract":
-                frame.grid_rowconfigure(4, weight=1)
-                frame.grid_rowconfigure(7, weight=0)
             builder(frame)
             self.step_views[key] = frame
 
@@ -501,20 +441,18 @@ class App(customtkinter.CTk):
             if name == key:
                 frame.tkraise()
 
-        if key == "extract":
-            self.extract_preview_panel.tkraise()
-        else:
-            self.website_panel.tkraise()
-
         if key == "review":
+            self._load_approve_fields_for_current()
             self._update_autofill_button()
 
     def set_status(self, message: str):
         print(f"[VinCert] {message}")
 
     def _apply_min_window_size(self):
-        min_width = SIDEBAR_WIDTH + CONTROLS_WIDTH + 520
-        self.minsize(min_width, SIDEBAR_MIN_HEIGHT)
+        self.minsize(
+            SIDEBAR_WIDTH + DOC_SIDEBAR_WIDTH + MAIN_MIN_WIDTH,
+            SIDEBAR_MIN_HEIGHT,
+        )
 
     def _build_cert_nav_row(self, parent, row: int) -> customtkinter.CTkLabel:
         nav_row = customtkinter.CTkFrame(parent, fg_color="transparent")
@@ -548,61 +486,12 @@ class App(customtkinter.CTk):
     def _build_extract_controls(self, parent: customtkinter.CTkFrame):
         customtkinter.CTkLabel(
             parent,
-            text="选择含证书 PDF 的文件夹（仅根目录），点选文档预览与核对提取结果。",
+            text="从左侧文档列表点选证书，核对提取结果后前往填写。",
             font=customtkinter.CTkFont(size=12),
             text_color="gray60",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 12))
-
-        btn_row = customtkinter.CTkFrame(parent, fg_color="transparent")
-        btn_row.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        btn_row.grid_columnconfigure((0, 1), weight=1)
-
-        customtkinter.CTkButton(
-            btn_row,
-            text="选择文件夹…",
-            command=self._pick_folder,
-        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
-
-        customtkinter.CTkButton(
-            btn_row,
-            text="清空",
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
-            command=self._clear_extract,
-        ).grid(row=0, column=1, padx=(6, 0), sticky="ew")
-
-        self.folder_label = customtkinter.CTkLabel(
-            parent,
-            text="未选择文件夹",
-            font=customtkinter.CTkFont(size=12),
-            text_color="gray60",
-            anchor="w",
-            wraplength=CONTROLS_WIDTH - 48,
-            justify="left",
-        )
-        self.folder_label.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-
-        customtkinter.CTkLabel(
-            parent,
-            text="文档列表",
-            font=customtkinter.CTkFont(size=13, weight="bold"),
-            anchor="w",
-        ).grid(row=3, column=0, sticky="ew", pady=(0, 6))
-
-        self.doc_list_frame = customtkinter.CTkScrollableFrame(parent, height=180)
-        self.doc_list_frame.grid(row=4, column=0, sticky="nsew", pady=(0, 10))
-        self.doc_list_frame.grid_columnconfigure(0, weight=1)
-
-        self.doc_list_empty = customtkinter.CTkLabel(
-            self.doc_list_frame,
-            text="文件夹根目录下的 PDF 将显示在这里",
-            text_color="gray50",
-        )
-        self.doc_list_empty.grid(row=0, column=0, pady=20)
 
         # Parsed fields — match keys for webpage verification + autofill targets
         customtkinter.CTkLabel(
@@ -610,7 +499,7 @@ class App(customtkinter.CTk):
             text="比对字段",
             font=customtkinter.CTkFont(size=12, weight="bold"),
             anchor="w",
-        ).grid(row=5, column=0, sticky="ew", pady=(0, 2))
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 2))
 
         customtkinter.CTkLabel(
             parent,
@@ -618,27 +507,26 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=11),
             text_color="gray60",
             anchor="w",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
-        ).grid(row=6, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=2, column=0, sticky="ew", pady=(0, 6))
 
         self.extract_match_frame = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.extract_match_frame.grid(row=7, column=0, sticky="ew", pady=(0, 10))
-        self.extract_match_frame.grid_columnconfigure(1, weight=1)
+        self.extract_match_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        self.extract_match_frame.grid_columnconfigure(0, weight=1)
 
         customtkinter.CTkLabel(
             parent,
             text="填写字段",
             font=customtkinter.CTkFont(size=12, weight="bold"),
             anchor="w",
-        ).grid(row=8, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=4, column=0, sticky="ew", pady=(0, 6))
 
         self.extract_autofill_frame = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.extract_autofill_frame.grid(row=9, column=0, sticky="ew", pady=(0, 8))
-        self.extract_autofill_frame.grid_columnconfigure(1, weight=1)
+        self.extract_autofill_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        self.extract_autofill_frame.grid_columnconfigure(0, weight=1)
 
-        self.extract_field_values: dict[str, customtkinter.CTkLabel] = {}
-        field_wrap = CONTROLS_WIDTH - 48 - 104
+        self.extract_field_entries: dict[str, customtkinter.CTkEntry] = {}
         for frame, field_defs in (
             (self.extract_match_frame, MATCH_FIELDS),
             (self.extract_autofill_frame, METROLOGY_FIELDS),
@@ -651,68 +539,25 @@ class App(customtkinter.CTk):
                     width=96,
                     font=customtkinter.CTkFont(size=11),
                     text_color="gray60",
-                ).grid(row=row, column=0, sticky="nw", pady=2)
+                ).grid(row=row, column=0, sticky="w", pady=4)
 
-                value_label = customtkinter.CTkLabel(
+                entry = customtkinter.CTkEntry(
                     frame,
-                    text="—",
-                    anchor="w",
-                    justify="left",
-                    wraplength=field_wrap,
-                    font=customtkinter.CTkFont(size=12),
+                    placeholder_text=f"请输入{label}",
                 )
-                value_label.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=2)
-                self.extract_field_values[key] = value_label
+                entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
+                self.extract_field_entries[key] = entry
 
         self.extract_errors_label = customtkinter.CTkLabel(
             parent,
             text="",
             anchor="w",
             justify="left",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             font=customtkinter.CTkFont(size=11),
             text_color="#c0392b",
         )
-        self.extract_errors_label.grid(row=10, column=0, sticky="ew", pady=(0, 6))
-
-        # Collapsible raw text — below parsed fields
-        self.extract_text_section = customtkinter.CTkFrame(parent, fg_color="transparent")
-        self.extract_text_section.grid(row=11, column=0, sticky="ew", pady=(0, 8))
-        self.extract_text_section.grid_columnconfigure(0, weight=1)
-
-        text_header = customtkinter.CTkFrame(self.extract_text_section, fg_color="transparent")
-        text_header.grid(row=0, column=0, sticky="ew")
-        text_header.grid_columnconfigure(0, weight=1)
-
-        customtkinter.CTkLabel(
-            text_header,
-            text="提取文本（封面页）",
-            font=customtkinter.CTkFont(size=12, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w")
-
-        self.extract_text_toggle = customtkinter.CTkButton(
-            text_header,
-            text="▶",
-            width=28,
-            height=24,
-            fg_color="transparent",
-            hover_color=OUTLINE_BTN_HOVER,
-            command=self._toggle_extract_text,
-        )
-        self.extract_text_toggle.grid(row=0, column=1, padx=(6, 0))
-
-        self.extract_text_body = customtkinter.CTkFrame(self.extract_text_section, fg_color="transparent")
-        self.extract_text_body.grid(row=1, column=0, sticky="ew", pady=(6, 0))
-        self.extract_text_body.grid_columnconfigure(0, weight=1)
-
-        self.extract_text_box = customtkinter.CTkTextbox(
-            self.extract_text_body,
-            height=72,
-            font=customtkinter.CTkFont(family="Courier", size=11),
-        )
-        self.extract_text_box.grid(row=0, column=0, sticky="ew")
-        self.extract_text_body.grid_remove()
+        self.extract_errors_label.grid(row=6, column=0, sticky="ew", pady=(0, 6))
 
         customtkinter.CTkButton(
             parent,
@@ -723,34 +568,37 @@ class App(customtkinter.CTk):
             text_color=("gray10", "gray90"),
             hover_color=OUTLINE_BTN_HOVER,
             command=self._reparse_all,
-        ).grid(row=12, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=8, column=0, sticky="ew", pady=(0, 8))
 
         self.extract_status_label = customtkinter.CTkLabel(
             parent,
             text="等待选择文件夹",
             font=customtkinter.CTkFont(size=12),
             text_color="gray60",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
             anchor="w",
         )
-        self.extract_status_label.grid(row=13, column=0, sticky="ew", pady=(0, 8))
+        self.extract_status_label.grid(row=7, column=0, sticky="ew", pady=(0, 8))
 
         customtkinter.CTkButton(
             parent,
             text="前往核对填写 →",
             height=40,
             command=self._go_to_review,
-        ).grid(row=14, column=0, sticky="ew")
+        ).grid(row=9, column=0, sticky="ew")
 
-    def _toggle_extract_text(self):
-        self._extract_text_expanded = not self._extract_text_expanded
-        if self._extract_text_expanded:
-            self.extract_text_body.grid()
-            self.extract_text_toggle.configure(text="▼")
+    def _update_doc_list_scrollbar(self, _event=None):
+        canvas = self.doc_list_frame._parent_canvas
+        scrollbar = self.doc_list_frame._scrollbar
+        self.update_idletasks()
+        bbox = canvas.bbox("all")
+        content_height = 0 if bbox is None else bbox[3] - bbox[1]
+        needs_scroll = content_height > canvas.winfo_height()
+        if needs_scroll:
+            scrollbar.grid()
         else:
-            self.extract_text_body.grid_remove()
-            self.extract_text_toggle.configure(text="▶")
+            scrollbar.grid_remove()
 
     def _pick_folder(self):
         path = filedialog.askdirectory(parent=self, title="选择证书文件夹")
@@ -765,14 +613,11 @@ class App(customtkinter.CTk):
         self._imported_files.clear()
         self._parse_results.clear()
         self._autofill_queue.clear()
+        self._removed_paths.clear()
         self._current_cert_index = 0
-        self._preview_path = None
-        self._clear_pdf_preview()
+        self._selected_path = None
         self._rebuild_doc_list()
         self.folder_label.configure(text="未选择文件夹")
-        self.preview_file_label.configure(text="未选择文件")
-        self.preview_page_label.configure(text="0 页")
-        self.extract_text_box.delete("1.0", "end")
         self._clear_extract_fields_display()
         self.extract_status_label.configure(text="等待选择文件夹")
         self._update_cert_nav_labels()
@@ -802,6 +647,7 @@ class App(customtkinter.CTk):
         self._imported_files = paths
         self._parse_results.clear()
         self._autofill_queue.clear()
+        self._removed_paths.clear()
         self._current_cert_index = 0
         self._rebuild_doc_list()
         self._update_cert_nav_labels()
@@ -841,6 +687,7 @@ class App(customtkinter.CTk):
         self._imported_files = paths
         self._parse_results = results
         self._autofill_queue.clear()
+        self._removed_paths.clear()
         self._current_cert_index = 0
         ok = sum(1 for r in results.values() if r.ok)
         self.extract_status_label.configure(text=f"已加载 {len(paths)} 份 · 解析成功 {ok}")
@@ -879,8 +726,19 @@ class App(customtkinter.CTk):
         ok = sum(1 for r in results.values() if r.ok)
         self.extract_status_label.configure(text=f"重新解析完成 · 成功 {ok}/{len(results)}")
         self._rebuild_doc_list()
-        if self._preview_path:
-            self._show_parse_result(self._preview_path)
+        if self._selected_path:
+            self._show_parse_result(self._selected_path)
+
+    def _doc_status_mark(self, path: str) -> str:
+        if path in self._removed_paths:
+            return "❌"
+        if path in self._autofill_queue:
+            return "✅"
+        # Fullwidth spaces approximate emoji width so numbers stay aligned.
+        return "　　"
+
+    def _doc_list_label(self, path: str, index: int) -> str:
+        return f"{self._doc_status_mark(path)} {index + 1}. {Path(path).name}"
 
     def _rebuild_doc_list(self):
         for child in self.doc_list_frame.winfo_children():
@@ -890,20 +748,18 @@ class App(customtkinter.CTk):
         if not self._imported_files:
             self.doc_list_empty = customtkinter.CTkLabel(
                 self.doc_list_frame,
-                text="文件夹根目录下的 PDF 将显示在这里",
+                text="选择文件夹后，\nPDF 将显示在这里",
                 text_color="gray50",
+                justify="center",
             )
             self.doc_list_empty.grid(row=0, column=0, pady=20)
+            self._update_doc_list_scrollbar()
             return
 
         for i, path in enumerate(self._imported_files):
-            name = Path(path).name
-            result = self._parse_results.get(path)
-            mark = "✓" if result and result.ok else "·"
-            label = f"{mark}  {i + 1}. {name}"
             btn = customtkinter.CTkButton(
                 self.doc_list_frame,
-                text=label,
+                text=self._doc_list_label(path, i),
                 anchor="w",
                 height=32,
                 fg_color="transparent",
@@ -915,10 +771,18 @@ class App(customtkinter.CTk):
             self._doc_buttons[path] = btn
 
         self._highlight_selected_doc()
+        self._update_doc_list_scrollbar()
+
+    def _refresh_doc_list_marks(self):
+        for i, path in enumerate(self._imported_files):
+            btn = self._doc_buttons.get(path)
+            if btn is not None:
+                btn.configure(text=self._doc_list_label(path, i))
+        self._highlight_selected_doc()
 
     def _highlight_selected_doc(self):
         for path, btn in self._doc_buttons.items():
-            if path == self._preview_path:
+            if path == self._selected_path:
                 btn.configure(fg_color=DOC_ROW_ACTIVE, text_color=("white", "white"))
             else:
                 btn.configure(fg_color="transparent", text_color=("gray10", "gray90"))
@@ -926,17 +790,51 @@ class App(customtkinter.CTk):
     def _select_document(self, path: str):
         if path not in self._imported_files:
             return
-        self._preview_path = path
+        if self._selected_path and self._selected_path != path:
+            self._save_extract_fields_to_result()
+        self._selected_path = path
         self._current_cert_index = self._imported_files.index(path)
         self._update_cert_nav_labels()
         self._highlight_selected_doc()
-        self.preview_file_label.configure(text=Path(path).name)
         self._show_parse_result(path)
-        self._render_all_pages(path)
+        if self._current_step == "review" and hasattr(self, "field_entries"):
+            self._load_approve_fields_for_current()
+            self._update_review_cert_status()
+
+    def _save_extract_fields_to_result(self):
+        path = self._selected_path
+        if path is None or path not in self._parse_results:
+            return
+        existing = self._parse_results[path]
+        base = existing.fields
+        fields = CertificateFields(
+            name=base.name,
+            serial_num=base.serial_num,
+            model=base.model,
+            measurement_unit=base.measurement_unit,
+            measurement_date=base.measurement_date,
+            measurement_type=base.measurement_type,
+            certificate_no=base.certificate_no,
+            client_name=base.client_name,
+            manufacturer=base.manufacturer,
+            due_date=base.due_date,
+            issue_date=base.issue_date,
+        )
+        for key in self.extract_field_entries:
+            setattr(fields, key, self.extract_field_entries[key].get().strip())
+        self._parse_results[path] = ParseResult(
+            source_path=existing.source_path,
+            page_count=existing.page_count,
+            raw_text=existing.raw_text,
+            lines=existing.lines,
+            fields=fields,
+            method=existing.method,
+            errors=list(existing.errors),
+        )
 
     def _clear_extract_fields_display(self):
-        for label in self.extract_field_values.values():
-            label.configure(text="—")
+        for entry in self.extract_field_entries.values():
+            entry.delete(0, "end")
         self.extract_errors_label.configure(text="")
 
     def _show_parse_result(self, path: str):
@@ -945,216 +843,23 @@ class App(customtkinter.CTk):
             result = parse_certificate(path)
             self._parse_results[path] = result
 
-        self.extract_text_box.delete("1.0", "end")
-        display_text = "\n".join(result.lines) if result.lines else result.raw_text
-        self.extract_text_box.insert("1.0", display_text or "（无文本）")
-
         fields = result.fields
-        for key, label_widget in self.extract_field_values.items():
-            value = getattr(fields, key, "") or "—"
-            label_widget.configure(text=value)
+        for key, entry in self.extract_field_entries.items():
+            entry.delete(0, "end")
+            value = getattr(fields, key, "")
+            if value:
+                entry.insert(0, value)
 
         if result.errors:
             self.extract_errors_label.configure(text="⚠ " + "\n".join(result.errors))
         else:
             self.extract_errors_label.configure(text="")
 
-    def _on_pdf_preview_wheel(self, event):
-        if self._current_step != "extract":
-            return
-        widget_under = self.winfo_containing(event.x_root, event.y_root)
-        if widget_under is None or not self._is_descendant(
-            widget_under, self.pdf_preview_shell
-        ):
-            return
-        if self.pdf_canvas.yview() == (0.0, 1.0):
-            return
-
-        if event.num == 4:
-            pixels = -120
-        elif event.num == 5:
-            pixels = 120
-        else:
-            delta = event.delta
-            if delta == 0:
-                return
-            if sys.platform == "darwin":
-                # Trackpad deltas are small (±1–10); amplify for tall PDF pages.
-                pixels = -delta * 5
-            else:
-                pixels = int(-delta / 120) * 96
-
-        self.pdf_canvas.yview_scroll(pixels, "units")
-        return "break"
-
-    def _pdf_preview_width(self) -> int:
-        self.pdf_canvas.update_idletasks()
-        width = self.pdf_canvas.winfo_width()
-        if width <= 1:
-            width = self.pdf_viewport.winfo_width()
-        return max(240, width - 24)
-
-    def _pdf_caption_color(self) -> str:
-        mode = customtkinter.get_appearance_mode()
-        return "#9a9a9a" if mode == "Dark" else "#6b6b6b"
-
-    def _draw_pdf_placeholder(self, text: str, *, color: str | None = None):
-        self.pdf_canvas.delete("all")
-        self._preview_photos.clear()
-        self.pdf_canvas.update_idletasks()
-        width = max(self.pdf_canvas.winfo_width(), 240)
-        height = max(self.pdf_canvas.winfo_height(), 200)
-        self.pdf_canvas.create_text(
-            width // 2,
-            max(80, height // 3),
-            text=text,
-            fill=color or self._pdf_caption_color(),
-            font=("Helvetica", 13),
-            justify="center",
-            width=max(200, width - 48),
-            tags=("placeholder",),
-        )
-        self.pdf_canvas.configure(scrollregion=(0, 0, width, height))
-
-    def _on_pdf_canvas_configure(self, event):
-        if event.width <= 1:
-            return
-        # Keep placeholder text centered when empty.
-        if self.pdf_canvas.find_withtag("placeholder"):
-            self.pdf_canvas.coords(
-                "placeholder",
-                event.width // 2,
-                max(80, event.height // 3),
-            )
-            self.pdf_canvas.itemconfigure(
-                "placeholder", width=max(200, event.width - 48)
-            )
-            self.pdf_canvas.configure(
-                scrollregion=(0, 0, event.width, max(event.height, 200))
-            )
-        if not self._preview_path:
-            return
-        if abs(event.width - self._last_pdf_canvas_width) < 8:
-            return
-        self._last_pdf_canvas_width = event.width
-        if self._pdf_resize_after_id is not None:
-            self.after_cancel(self._pdf_resize_after_id)
-        path = self._preview_path
-        self._pdf_resize_after_id = self.after(250, lambda: self._render_all_pages(path))
-
-    def _scroll_pdf_to_top(self):
-        self.pdf_canvas.yview_moveto(0)
-
-    def _clear_pdf_preview(self):
-        self._draw_pdf_placeholder(
-            "选择文件夹并点选文档列表中的证书后，\n在此滚动预览全部页面"
-        )
-
-    def _render_all_pages(self, path: str):
-        """Render every page as canvas images for smooth scrolling."""
-        try:
-            n = page_count(path)
-        except Exception as exc:  # noqa: BLE001
-            self._draw_pdf_placeholder(f"预览失败\n{exc}", color="#c0392b")
-            self.preview_page_label.configure(text="0 页")
-            return
-
-        self._preview_page_count = n
-        self.preview_page_label.configure(text=f"{n} 页")
-        preview_width = self._pdf_preview_width()
-
-        self.pdf_canvas.delete("all")
-        self._preview_photos.clear()
-        self.pdf_canvas.create_text(
-            preview_width // 2,
-            40,
-            text="正在渲染页面…",
-            fill=self._pdf_caption_color(),
-            font=("Helvetica", 13),
-            tags=("loading",),
-        )
-        self.pdf_canvas.configure(scrollregion=(0, 0, preview_width, 80))
-        self.update_idletasks()
-
-        y = 12
-        rendered = 0
-        caption_color = self._pdf_caption_color()
-        canvas_width = max(self.pdf_canvas.winfo_width(), preview_width)
-
-        for i in range(n):
-            if path != self._preview_path:
-                return
-
-            self.pdf_canvas.itemconfigure(
-                "loading", text=f"正在渲染页面… {i + 1}/{n}"
-            )
-            self.update_idletasks()
-
-            try:
-                image = render_page(path, i, zoom=2.0, max_width=preview_width)
-            except Exception as exc:  # noqa: BLE001
-                y += 8
-                self.pdf_canvas.create_text(
-                    canvas_width // 2,
-                    y,
-                    text=f"— 第 {i + 1} / {n} 页（渲染失败）—",
-                    fill=caption_color,
-                    font=("Helvetica", 11),
-                    anchor="n",
-                )
-                y += 22
-                self.pdf_canvas.create_text(
-                    canvas_width // 2,
-                    y,
-                    text=str(exc),
-                    fill="#c0392b",
-                    font=("Helvetica", 11),
-                    anchor="n",
-                    width=max(200, preview_width - 24),
-                )
-                y += 36
-                continue
-
-            y += 8 if rendered else 4
-            self.pdf_canvas.create_text(
-                canvas_width // 2,
-                y,
-                text=f"— 第 {i + 1} / {n} 页 —",
-                fill=caption_color,
-                font=("Helvetica", 11),
-                anchor="n",
-            )
-            y += 22
-
-            photo = ImageTk.PhotoImage(image)
-            self._preview_photos.append(photo)
-            self.pdf_canvas.create_image(
-                canvas_width // 2,
-                y,
-                image=photo,
-                anchor="n",
-            )
-            y += image.height + 12
-            rendered += 1
-            self.pdf_canvas.configure(scrollregion=(0, 0, canvas_width, y + 8))
-
-        self.pdf_canvas.delete("loading")
-
-        if path != self._preview_path:
-            return
-
-        if rendered == 0:
-            self._draw_pdf_placeholder("未能渲染任何页面")
-            return
-
-        self.pdf_canvas.configure(scrollregion=(0, 0, canvas_width, y + 8))
-        self._scroll_pdf_to_top()
-        self._last_pdf_canvas_width = self.pdf_canvas.winfo_width()
-
     def _go_to_review(self):
         if not self._imported_files:
             self.extract_status_label.configure(text="请先选择文件夹并完成提取")
             return
+        self._save_extract_fields_to_result()
         self._load_approve_fields_for_current()
         self.show_step("review")
 
@@ -1165,7 +870,7 @@ class App(customtkinter.CTk):
             text="核对识别结果；批准后计入自动填写队列，可用主按钮批量写入网页。",
             font=customtkinter.CTkFont(size=12),
             text_color="gray60",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
         ).grid(row=0, column=0, sticky="w", pady=(0, 12))
 
@@ -1193,12 +898,11 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=11),
             text_color="gray60",
             anchor="w",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
         ).grid(row=4, column=0, sticky="ew", pady=(0, 6))
 
-        self.match_field_labels: dict[str, customtkinter.CTkLabel] = {}
-        match_wrap = CONTROLS_WIDTH - 48 - 104
+        self.field_entries: dict[str, customtkinter.CTkEntry] = {}
         for row, (key, label) in enumerate(MATCH_FIELDS, start=5):
             customtkinter.CTkLabel(
                 parent,
@@ -1206,17 +910,11 @@ class App(customtkinter.CTk):
                 anchor="w",
                 width=96,
                 text_color="gray60",
-            ).grid(row=row, column=0, sticky="nw", pady=2)
+            ).grid(row=row, column=0, sticky="w", pady=4)
 
-            value_label = customtkinter.CTkLabel(
-                parent,
-                text="—",
-                anchor="w",
-                justify="left",
-                wraplength=match_wrap,
-            )
-            value_label.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=2)
-            self.match_field_labels[key] = value_label
+            entry = customtkinter.CTkEntry(parent, placeholder_text=f"请输入{label}")
+            entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
+            self.field_entries[key] = entry
 
         fill_header_row = 5 + len(MATCH_FIELDS)
         customtkinter.CTkLabel(
@@ -1226,7 +924,6 @@ class App(customtkinter.CTk):
             anchor="w",
         ).grid(row=fill_header_row, column=0, sticky="ew", pady=(10, 8))
 
-        self.field_entries: dict[str, customtkinter.CTkEntry] = {}
         for offset, (key, label) in enumerate(METROLOGY_FIELDS):
             row = fill_header_row + 1 + offset
             customtkinter.CTkLabel(
@@ -1254,27 +951,17 @@ class App(customtkinter.CTk):
             command=self._on_approve_entry,
         ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
 
-        customtkinter.CTkButton(
+        self.remove_toggle_button = customtkinter.CTkButton(
             actions,
-            text="跳过",
+            text="移除",
             height=40,
             fg_color="transparent",
             border_width=2,
             text_color=("gray10", "gray90"),
             hover_color=OUTLINE_BTN_HOVER,
-            command=self._on_skip_entry,
-        ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
-
-        customtkinter.CTkButton(
-            actions,
-            text="移出队列",
-            height=40,
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
-            command=self._on_unqueue_entry,
-        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            command=self._on_toggle_remove_entry,
+        )
+        self.remove_toggle_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
         self.autofill_button = customtkinter.CTkButton(
             parent,
@@ -1290,7 +977,7 @@ class App(customtkinter.CTk):
             text="批准证书后计入填写队列",
             font=customtkinter.CTkFont(size=12),
             text_color="gray60",
-            wraplength=CONTROLS_WIDTH - 48,
+            wraplength=CONTENT_WRAP,
             justify="left",
             anchor="w",
         )
@@ -1299,9 +986,6 @@ class App(customtkinter.CTk):
     def _clear_approve_fields(self):
         for entry in self.field_entries.values():
             entry.delete(0, "end")
-        if hasattr(self, "match_field_labels"):
-            for label in self.match_field_labels.values():
-                label.configure(text="—")
 
     def _current_cert_path(self) -> str | None:
         if not self._imported_files:
@@ -1322,8 +1006,9 @@ class App(customtkinter.CTk):
             due_date=base.due_date,
             issue_date=base.issue_date,
         )
-        for key, _ in METROLOGY_FIELDS:
-            setattr(fields, key, self.field_entries[key].get().strip())
+        for key, _ in EXTRACT_DISPLAY_FIELDS:
+            if key in self.field_entries:
+                setattr(fields, key, self.field_entries[key].get().strip())
         return fields
 
     def _save_current_fields_to_result(self) -> ParseResult | None:
@@ -1367,9 +1052,6 @@ class App(customtkinter.CTk):
         fields: CertificateFields = result.fields
         for key, entry in self.field_entries.items():
             entry.insert(0, getattr(fields, key, "") or "")
-        if hasattr(self, "match_field_labels"):
-            for key, label in self.match_field_labels.items():
-                label.configure(text=getattr(fields, key, "") or "—")
         self._update_review_cert_status()
 
     def _update_review_cert_status(self):
@@ -1378,8 +1060,14 @@ class App(customtkinter.CTk):
         path = self._current_cert_path()
         if path is None:
             self.review_cert_status.configure(text="当前：无证书", text_color="gray60")
+            self._update_remove_toggle_button()
             return
-        if path in self._autofill_queue:
+        if path in self._removed_paths:
+            self.review_cert_status.configure(
+                text="当前：已移除",
+                text_color=("#c0392b", "#e74c3c"),
+            )
+        elif path in self._autofill_queue:
             pos = self._autofill_queue.index(path) + 1
             self.review_cert_status.configure(
                 text=f"当前：已批准 · 队列第 {pos}/{len(self._autofill_queue)} 份",
@@ -1387,6 +1075,16 @@ class App(customtkinter.CTk):
             )
         else:
             self.review_cert_status.configure(text="当前：未批准", text_color="gray60")
+        self._update_remove_toggle_button()
+
+    def _update_remove_toggle_button(self):
+        if not hasattr(self, "remove_toggle_button"):
+            return
+        path = self._current_cert_path()
+        if path is not None and path in self._removed_paths:
+            self.remove_toggle_button.configure(text="撤销移除")
+        else:
+            self.remove_toggle_button.configure(text="移除")
 
     def _update_autofill_button(self):
         if not hasattr(self, "autofill_button"):
@@ -1397,8 +1095,9 @@ class App(customtkinter.CTk):
             self.autofill_status_label.configure(text="批准证书后计入填写队列")
         else:
             self.autofill_status_label.configure(
-                text=f"队列中共 {n} 份已批准证书，点击主按钮写入左侧网页"
+                text=f"队列中共 {n} 份已批准证书，点击主按钮开始自动填写"
             )
+        self._refresh_doc_list_marks()
         self._update_review_cert_status()
 
     def _on_prev_certificate(self):
@@ -1434,32 +1133,36 @@ class App(customtkinter.CTk):
             self.set_status("没有可批准的证书")
             return
         self._save_current_fields_to_result()
+        self._removed_paths.discard(path)
         if path not in self._autofill_queue:
             self._autofill_queue.append(path)
         self._update_autofill_button()
         self.set_status(f"已批准，队列 {len(self._autofill_queue)} 份")
         for i in range(self._current_cert_index + 1, len(self._imported_files)):
-            if self._imported_files[i] not in self._autofill_queue:
+            candidate = self._imported_files[i]
+            if candidate not in self._autofill_queue and candidate not in self._removed_paths:
                 self._current_cert_index = i
                 self._update_cert_nav_labels()
                 self._load_approve_fields_for_current()
                 return
         self._update_review_cert_status()
 
-    def _on_skip_entry(self):
-        self.set_status("已跳过当前条目")
-        self._on_next_certificate()
-
-    def _on_unqueue_entry(self):
+    def _on_toggle_remove_entry(self):
         path = self._current_cert_path()
         if path is None:
+            self.set_status("没有可操作的证书")
             return
+        if path in self._removed_paths:
+            self._removed_paths.discard(path)
+            self._update_autofill_button()
+            self.set_status("已撤销移除")
+            return
+
+        self._removed_paths.add(path)
         if path in self._autofill_queue:
             self._autofill_queue.remove(path)
-            self._update_autofill_button()
-            self.set_status("已从填写队列移除")
-        else:
-            self.set_status("当前证书不在填写队列中")
+        self._update_autofill_button()
+        self.set_status("已移除当前条目")
 
     def _on_master_autofill(self):
         n = len(self._autofill_queue)
@@ -1469,20 +1172,6 @@ class App(customtkinter.CTk):
             return
         self.autofill_status_label.configure(text=f"正在自动填写 {n} 份…")
         self.set_status(f"自动填写 {n} 份（网页写入待实现）")
-
-    # ------------------------------------------------------------------ website
-    def _on_open_website(self):
-        url = self.url_entry.get().strip()
-        if url:
-            self.browser_placeholder.configure(
-                text=f"网页嵌入区域\n\n{url}\n\n（浏览器嵌入待实现）"
-            )
-            self.set_status(f"已打开：{url}")
-        else:
-            self.set_status("请输入网址")
-
-    def _on_refresh_website(self):
-        self.set_status("网页已刷新（待实现）")
 
     def _on_close(self):
         self.destroy()
