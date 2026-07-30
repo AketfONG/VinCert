@@ -52,7 +52,9 @@ TILE_BG_ACTIVE = ("gray72", "gray26")
 TILE_ICON_NORMAL = _theme_frame["top_fg_color"]
 TILE_ICON_HOVER = ("gray76", "gray28")
 TILE_ICON_ACTIVE = ("gray70", "gray32")
-OUTLINE_BTN_HOVER = ("gray70", "gray30")
+SECONDARY_BTN_FG = ("#c9d1d9", "#3d444b")
+SECONDARY_BTN_HOVER = ("#b4bec8", "#4a525a")
+SECONDARY_BTN_TEXT = ("gray10", "gray90")
 DOC_ROW_ACTIVE = ("#3b8ed0", "#1f6aa5")
 
 MATCH_FIELDS = [
@@ -68,7 +70,15 @@ METROLOGY_FIELDS = [
     ("measurement_unit", "检测机构"),
 ]
 
+# Review-only user fields (not OCR-extracted).
+REVIEW_USER_FIELDS = [
+    ("result_info", "计量结果信息"),
+]
+
+REVIEW_FILL_FIELDS = METROLOGY_FIELDS + REVIEW_USER_FIELDS
 EXTRACT_DISPLAY_FIELDS = MATCH_FIELDS + METROLOGY_FIELDS
+REVIEW_DISPLAY_FIELDS = MATCH_FIELDS + REVIEW_FILL_FIELDS
+DEFAULT_RESULT_INFO = "合格"
 EXPORT_COLUMNS = [
     ("name", "名称"),
     ("serial_num", "编号"),
@@ -161,10 +171,9 @@ class App(customtkinter.CTk):
             self.sidebar,
             text="设置",
             height=SETTINGS_BTN_HEIGHT,
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
             command=self._on_open_settings,
         ).grid(row=7, column=0, padx=STEP_TILE_PADX, pady=(0, 18), sticky="ew")
 
@@ -354,10 +363,9 @@ class App(customtkinter.CTk):
         customtkinter.CTkButton(
             btn_row,
             text="清空",
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
             command=self._clear_extract,
         ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
@@ -552,6 +560,7 @@ class App(customtkinter.CTk):
                 entry = customtkinter.CTkEntry(
                     frame,
                     placeholder_text=f"请输入{label}",
+                    border_width=0,
                 )
                 entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
                 self.extract_field_entries[key] = entry
@@ -748,9 +757,17 @@ class App(customtkinter.CTk):
     def _highlight_selected_doc(self):
         for path, btn in self._doc_buttons.items():
             if path == self._selected_path:
-                btn.configure(fg_color=DOC_ROW_ACTIVE, text_color=("white", "white"))
+                btn.configure(
+                    fg_color=DOC_ROW_ACTIVE,
+                    hover_color=DOC_ROW_ACTIVE,
+                    text_color=("white", "white"),
+                )
             else:
-                btn.configure(fg_color="transparent", text_color=("gray10", "gray90"))
+                btn.configure(
+                    fg_color="transparent",
+                    hover_color=TILE_BG_HOVER,
+                    text_color=("gray10", "gray90"),
+                )
 
     def _select_document(self, path: str):
         if path not in self._imported_files:
@@ -783,6 +800,7 @@ class App(customtkinter.CTk):
             manufacturer=base.manufacturer,
             due_date=base.due_date,
             issue_date=base.issue_date,
+            result_info=base.result_info,
         )
         for key in self.extract_field_entries:
             setattr(fields, key, self.extract_field_entries[key].get().strip())
@@ -878,7 +896,11 @@ class App(customtkinter.CTk):
                 text_color="gray60",
             ).grid(row=row, column=0, sticky="w", pady=4)
 
-            entry = customtkinter.CTkEntry(parent, placeholder_text=f"请输入{label}")
+            entry = customtkinter.CTkEntry(
+                parent,
+                placeholder_text=f"请输入{label}",
+                border_width=0,
+            )
             entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
             self.field_entries[key] = entry
 
@@ -890,7 +912,7 @@ class App(customtkinter.CTk):
             anchor="w",
         ).grid(row=fill_header_row, column=0, sticky="ew", pady=(10, 8))
 
-        for offset, (key, label) in enumerate(METROLOGY_FIELDS):
+        for offset, (key, label) in enumerate(REVIEW_FILL_FIELDS):
             row = fill_header_row + 1 + offset
             customtkinter.CTkLabel(
                 parent,
@@ -901,11 +923,15 @@ class App(customtkinter.CTk):
                 text_color="gray60",
             ).grid(row=row, column=0, sticky="w", pady=4)
 
-            entry = customtkinter.CTkEntry(parent, placeholder_text=f"请输入{label}")
+            entry = customtkinter.CTkEntry(
+                parent,
+                placeholder_text=f"请输入{label}",
+                border_width=0,
+            )
             entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
             self.field_entries[key] = entry
 
-        action_row = fill_header_row + 1 + len(METROLOGY_FIELDS)
+        action_row = fill_header_row + 1 + len(REVIEW_FILL_FIELDS)
         actions = customtkinter.CTkFrame(parent, fg_color="transparent")
         actions.grid(row=action_row, column=0, sticky="ew", pady=(16, 0))
         actions.grid_columnconfigure((0, 1), weight=1)
@@ -923,10 +949,9 @@ class App(customtkinter.CTk):
             actions,
             text="移除",
             height=40,
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
             command=self._on_toggle_remove_entry,
         )
         self.remove_toggle_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
@@ -944,10 +969,9 @@ class App(customtkinter.CTk):
             parent,
             text="导出 Excel (0)",
             height=40,
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
             command=self._on_export_excel,
         )
         self.export_excel_button.grid(row=action_row + 2, column=0, sticky="ew", pady=(10, 0))
@@ -985,8 +1009,9 @@ class App(customtkinter.CTk):
             manufacturer=base.manufacturer,
             due_date=base.due_date,
             issue_date=base.issue_date,
+            result_info=base.result_info,
         )
-        for key, _ in EXTRACT_DISPLAY_FIELDS:
+        for key, _ in REVIEW_DISPLAY_FIELDS:
             if key in self.field_entries:
                 setattr(fields, key, self.field_entries[key].get().strip())
         return fields
@@ -1031,7 +1056,10 @@ class App(customtkinter.CTk):
             return
         fields: CertificateFields = result.fields
         for key, entry in self.field_entries.items():
-            entry.insert(0, getattr(fields, key, "") or "")
+            value = getattr(fields, key, "") or ""
+            if not value and key == "result_info":
+                value = DEFAULT_RESULT_INFO
+            entry.insert(0, value)
         self._update_review_cert_status()
 
     def _update_review_cert_status(self):
