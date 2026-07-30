@@ -69,6 +69,14 @@ METROLOGY_FIELDS = [
 ]
 
 EXTRACT_DISPLAY_FIELDS = MATCH_FIELDS + METROLOGY_FIELDS
+EXPORT_COLUMNS = [
+    ("name", "名称"),
+    ("serial_num", "编号"),
+    ("model", "型号"),
+    ("measurement_unit", "计量单位"),
+    ("measurement_date", "计量日期"),
+    ("measurement_type", "计量类型"),
+]
 
 
 class App(customtkinter.CTk):
@@ -537,7 +545,7 @@ class App(customtkinter.CTk):
                     text=label,
                     anchor="w",
                     width=96,
-                    font=customtkinter.CTkFont(size=11),
+                    font=customtkinter.CTkFont(size=12),
                     text_color="gray60",
                 ).grid(row=row, column=0, sticky="w", pady=4)
 
@@ -559,17 +567,6 @@ class App(customtkinter.CTk):
         )
         self.extract_errors_label.grid(row=6, column=0, sticky="ew", pady=(0, 6))
 
-        customtkinter.CTkButton(
-            parent,
-            text="全部重新解析",
-            height=36,
-            fg_color="transparent",
-            border_width=2,
-            text_color=("gray10", "gray90"),
-            hover_color=OUTLINE_BTN_HOVER,
-            command=self._reparse_all,
-        ).grid(row=8, column=0, sticky="ew", pady=(0, 8))
-
         self.extract_status_label = customtkinter.CTkLabel(
             parent,
             text="等待选择文件夹",
@@ -586,7 +583,7 @@ class App(customtkinter.CTk):
             text="前往核对填写 →",
             height=40,
             command=self._go_to_review,
-        ).grid(row=9, column=0, sticky="ew")
+        ).grid(row=8, column=0, sticky="ew")
 
     def _update_doc_list_scrollbar(self, _event=None):
         canvas = self.doc_list_frame._parent_canvas
@@ -697,38 +694,6 @@ class App(customtkinter.CTk):
             self._select_document(paths[0])
         self.set_status(f"文件夹加载完成：{len(paths)} PDF")
 
-    def _reparse_all(self):
-        if not self._imported_files:
-            self.extract_status_label.configure(text="没有可解析的文档")
-            return
-        if self._extract_busy:
-            self.extract_status_label.configure(text="正在处理中，请稍候…")
-            return
-
-        paths = list(self._imported_files)
-        self._extract_busy = True
-        results: dict[str, ParseResult] = {}
-        try:
-            for i, path in enumerate(paths, start=1):
-                self.extract_status_label.configure(text=f"解析进度 {i}/{len(paths)}")
-                self.update_idletasks()
-                results[path] = parse_certificate(path)
-            self._on_reparse_done(results)
-        except Exception as exc:  # noqa: BLE001
-            self.extract_status_label.configure(text=f"失败：{exc}")
-            self.set_status(f"重新解析失败：{exc}")
-        finally:
-            self._extract_busy = False
-
-    def _on_reparse_done(self, results: dict[str, ParseResult]):
-        self._extract_busy = False
-        self._parse_results.update(results)
-        ok = sum(1 for r in results.values() if r.ok)
-        self.extract_status_label.configure(text=f"重新解析完成 · 成功 {ok}/{len(results)}")
-        self._rebuild_doc_list()
-        if self._selected_path:
-            self._show_parse_result(self._selected_path)
-
     def _doc_status_mark(self, path: str) -> str:
         if path in self._removed_paths:
             return "❌"
@@ -791,11 +756,10 @@ class App(customtkinter.CTk):
         if path not in self._imported_files:
             return
         if self._selected_path and self._selected_path != path:
-            self._save_extract_fields_to_result()
+            self._save_fields_before_navigate()
         self._selected_path = path
         self._current_cert_index = self._imported_files.index(path)
-        self._update_cert_nav_labels()
-        self._highlight_selected_doc()
+        self._sync_cert_index_to_list()
         self._show_parse_result(path)
         if self._current_step == "review" and hasattr(self, "field_entries"):
             self._load_approve_fields_for_current()
@@ -840,8 +804,9 @@ class App(customtkinter.CTk):
     def _show_parse_result(self, path: str):
         result = self._parse_results.get(path)
         if result is None:
-            result = parse_certificate(path)
-            self._parse_results[path] = result
+            self._clear_extract_fields_display()
+            self.extract_errors_label.configure(text="⚠ 尚未解析此文档")
+            return
 
         fields = result.fields
         for key, entry in self.extract_field_entries.items():
@@ -909,6 +874,7 @@ class App(customtkinter.CTk):
                 text=label,
                 anchor="w",
                 width=96,
+                font=customtkinter.CTkFont(size=12),
                 text_color="gray60",
             ).grid(row=row, column=0, sticky="w", pady=4)
 
@@ -931,6 +897,8 @@ class App(customtkinter.CTk):
                 text=label,
                 anchor="w",
                 width=96,
+                font=customtkinter.CTkFont(size=12),
+                text_color="gray60",
             ).grid(row=row, column=0, sticky="w", pady=4)
 
             entry = customtkinter.CTkEntry(parent, placeholder_text=f"请输入{label}")
@@ -972,6 +940,18 @@ class App(customtkinter.CTk):
         )
         self.autofill_button.grid(row=action_row + 1, column=0, sticky="ew", pady=(16, 0))
 
+        self.export_excel_button = customtkinter.CTkButton(
+            parent,
+            text="导出 Excel (0)",
+            height=40,
+            fg_color="transparent",
+            border_width=2,
+            text_color=("gray10", "gray90"),
+            hover_color=OUTLINE_BTN_HOVER,
+            command=self._on_export_excel,
+        )
+        self.export_excel_button.grid(row=action_row + 2, column=0, sticky="ew", pady=(10, 0))
+
         self.autofill_status_label = customtkinter.CTkLabel(
             parent,
             text="批准证书后计入填写队列",
@@ -981,7 +961,7 @@ class App(customtkinter.CTk):
             justify="left",
             anchor="w",
         )
-        self.autofill_status_label.grid(row=action_row + 2, column=0, sticky="ew", pady=(10, 0))
+        self.autofill_status_label.grid(row=action_row + 3, column=0, sticky="ew", pady=(10, 0))
 
     def _clear_approve_fields(self):
         for entry in self.field_entries.values():
@@ -1047,8 +1027,8 @@ class App(customtkinter.CTk):
             return
         result = self._parse_results.get(path)
         if result is None:
-            result = parse_certificate(path)
-            self._parse_results[path] = result
+            self._update_review_cert_status()
+            return
         fields: CertificateFields = result.fields
         for key, entry in self.field_entries.items():
             entry.insert(0, getattr(fields, key, "") or "")
@@ -1091,6 +1071,8 @@ class App(customtkinter.CTk):
             return
         n = len(self._autofill_queue)
         self.autofill_button.configure(text=f"自动填写 ({n})")
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(text=f"导出 Excel ({n})")
         if n == 0:
             self.autofill_status_label.configure(text="批准证书后计入填写队列")
         else:
@@ -1100,17 +1082,37 @@ class App(customtkinter.CTk):
         self._refresh_doc_list_marks()
         self._update_review_cert_status()
 
+    def _save_fields_before_navigate(self):
+        if self._current_step == "review" and hasattr(self, "field_entries"):
+            self._save_current_fields_to_result()
+        elif self._selected_path:
+            self._save_extract_fields_to_result()
+
+    def _sync_cert_index_to_list(self):
+        path = self._current_cert_path()
+        if path is None:
+            return
+        self._selected_path = path
+        self._highlight_selected_doc()
+        self._update_cert_nav_labels()
+
     def _on_prev_certificate(self):
+        if not self._imported_files:
+            return
+        self._save_fields_before_navigate()
         if self._current_cert_index > 0:
             self._current_cert_index -= 1
-        self._update_cert_nav_labels()
+        self._sync_cert_index_to_list()
         self._load_approve_fields_for_current()
         self.set_status("上一份")
 
     def _on_next_certificate(self):
-        if self._imported_files and self._current_cert_index < len(self._imported_files) - 1:
+        if not self._imported_files:
+            return
+        self._save_fields_before_navigate()
+        if self._current_cert_index < len(self._imported_files) - 1:
             self._current_cert_index += 1
-        self._update_cert_nav_labels()
+        self._sync_cert_index_to_list()
         self._load_approve_fields_for_current()
         self.set_status("下一份")
 
@@ -1142,7 +1144,7 @@ class App(customtkinter.CTk):
             candidate = self._imported_files[i]
             if candidate not in self._autofill_queue and candidate not in self._removed_paths:
                 self._current_cert_index = i
-                self._update_cert_nav_labels()
+                self._sync_cert_index_to_list()
                 self._load_approve_fields_for_current()
                 return
         self._update_review_cert_status()
@@ -1172,6 +1174,66 @@ class App(customtkinter.CTk):
             return
         self.autofill_status_label.configure(text=f"正在自动填写 {n} 份…")
         self.set_status(f"自动填写 {n} 份（网页写入待实现）")
+
+    def _export_rows(self) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for path in self._autofill_queue:
+            result = self._parse_results.get(path)
+            if result is None:
+                continue
+            fields = result.fields
+            rows.append([getattr(fields, key, "") or "" for key, _label in EXPORT_COLUMNS])
+        return rows
+
+    def _default_export_path(self) -> Path:
+        base_dir = Path(self._source_folder) if self._source_folder else Path.cwd()
+        return base_dir / "vincert_batch_import.xlsx"
+
+    def _on_export_excel(self):
+        self._save_fields_before_navigate()
+        rows = self._export_rows()
+        if not rows:
+            self.autofill_status_label.configure(text="没有可导出的已批准证书")
+            self.set_status("导出 Excel：队列为空")
+            return
+
+        default_path = self._default_export_path()
+        target = filedialog.asksaveasfilename(
+            parent=self,
+            title="导出 Excel",
+            initialdir=str(default_path.parent),
+            initialfile=default_path.name,
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")],
+        )
+        if not target:
+            self.set_status("已取消导出 Excel")
+            return
+
+        try:
+            from openpyxl import Workbook  # pyright: ignore[reportMissingModuleSource]
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "VinCert"
+            sheet.append([label for _key, label in EXPORT_COLUMNS])
+            for row in rows:
+                sheet.append(row)
+
+            for idx, (_key, label) in enumerate(EXPORT_COLUMNS, start=1):
+                max_len = len(label)
+                for row in rows:
+                    max_len = max(max_len, len(str(row[idx - 1])))
+                sheet.column_dimensions[chr(64 + idx)].width = min(max_len + 4, 36)
+
+            workbook.save(target)
+        except Exception as exc:  # noqa: BLE001
+            self.autofill_status_label.configure(text=f"导出失败：{exc}")
+            self.set_status(f"导出 Excel 失败：{exc}")
+            return
+
+        self.autofill_status_label.configure(text=f"已导出 {len(rows)} 份到 Excel")
+        self.set_status(f"已导出 Excel：{Path(target).name}")
 
     def _on_close(self):
         self.destroy()

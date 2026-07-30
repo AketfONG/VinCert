@@ -9,6 +9,21 @@ VinCert is a desktop tool for batch-importing certificates, reviewing OCR result
 [![Status](https://img.shields.io/badge/status-prototype-yellow)](.)
 [![Target](https://img.shields.io/badge/target-Windows-0078D4)](.)
 
+## Setup (Windows)
+
+```bat
+py -3.11 -m venv .venv
+.venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install paddlepaddle==2.6.2 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+pip install -r requirements.txt
+python gui.py
+```
+
+Use official **64-bit Python 3.11** and enable **tcl/tk**. Digital PDFs parse from embedded text; scanned PDFs fall back to PaddleOCR (same approach as 证书扫描, without Django).
+
+In `核对填写`, approved entries can also be exported to Excel for later batch import. The generated workbook uses this column order: `名称`, `编号`, `型号`, `计量单位`, `计量日期`, `计量类型`.
+
 ---
 # v0.2 (29/07/2026) Release Notes
 

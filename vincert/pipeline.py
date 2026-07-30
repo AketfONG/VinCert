@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .models import CertificateFields, ParseResult
-from .parse_metrology import parse_fields
+from .parse_metrology import clean_lines, parse_fields
 from .pdf_io import extract_all_text, extract_page_text, page_count
 
 
@@ -13,13 +13,14 @@ def parse_certificate(
     pdf_path: str | Path,
     *,
     cover_page_only: bool = True,
+    use_ocr_fallback: bool = True,
 ) -> ParseResult:
     """
     Parse a metrology certificate PDF.
 
     Prefer embedded digital text (accurate for issuers like 天溯).
-    cover_page_only=True uses page 0 for fields (title page), but still
-    reports full page_count.
+    If the cover page has no text and ``use_ocr_fallback`` is True, run
+    PaddleOCR on a rendered cover image (same approach as 证书扫描).
     """
     path = Path(pdf_path)
     errors: list[str] = []
@@ -51,18 +52,32 @@ def parse_certificate(
             errors=[str(exc)],
         )
 
-    if not raw.strip():
-        errors.append("no embedded text on cover page (scanned PDF — OCR fallback not enabled yet)")
+    method = "embedded_text"
+    if not raw.strip() and use_ocr_fallback:
+        try:
+            from .ocr import ocr_availability_message, ocr_pdf_cover, is_ocr_available
+
+            if not is_ocr_available():
+                errors.append(ocr_availability_message())
+            else:
+                ocr_lines = ocr_pdf_cover(path)
+                raw = "\n".join(ocr_lines)
+                method = "ocr"
+                if not raw.strip():
+                    errors.append("OCR produced no text on cover page")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"OCR failed: {exc}")
+    elif not raw.strip():
+        errors.append("no embedded text on cover page (OCR fallback disabled)")
 
     fields = parse_fields(raw) if raw.strip() else CertificateFields()
-    from .parse_metrology import clean_lines
 
     return ParseResult(
         source_path=str(path),
         page_count=n,
         raw_text=raw,
-        lines=clean_lines(raw),
+        lines=clean_lines(raw) if raw.strip() else [],
         fields=fields,
-        method="embedded_text",
+        method=method,
         errors=errors,
     )

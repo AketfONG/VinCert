@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations #loose order of declaration and definition
 
 from dataclasses import asdict, dataclass, field
 
