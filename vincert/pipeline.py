@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, fields as dataclass_fields
+from dataclasses import asdict
 from pathlib import Path
 
 from .models import CertificateFields, ParseResult
@@ -72,8 +72,9 @@ def merge_fields(
 def parse_certificate(
     pdf_path: str | Path,
     *,
-    cover_page_only: bool = False,
-    use_ocr_fallback: bool = True,
+    cover_page_only: bool = True,
+    use_ocr_fallback: bool = False,
+    force_ocr: bool = False,
     fill_missing_pages: bool = True,
 ) -> ParseResult:
     """
@@ -82,8 +83,9 @@ def parse_certificate(
     Prefer embedded digital text on the cover page.
     If key fields are still blank, scan later pages and fill only missing values
     (e.g. 上海计量 puts 校准日期 on page 2).
-    If the cover has no text and ``use_ocr_fallback`` is True, run PaddleOCR
-    on a rendered cover image.
+
+    OCR (manual ``force_ocr`` / optional fallback) follows ji_liang:
+      cover @150% → PaddleOCR → OCR-line field extract (+ digital parser fill).
     """
     path = Path(pdf_path)
     errors: list[str] = []
@@ -113,32 +115,41 @@ def parse_certificate(
         )
 
     method = "embedded_text"
-    if not raw.strip() and use_ocr_fallback:
+    fields = CertificateFields()
+    run_ocr = force_ocr or (not raw.strip() and use_ocr_fallback)
+
+    if run_ocr:
         try:
             from .ocr import ocr_availability_message, ocr_pdf_cover, is_ocr_available
+            from .parse_ocr import parse_ocr_lines
 
             if not is_ocr_available():
                 errors.append(ocr_availability_message())
             else:
                 ocr_lines = ocr_pdf_cover(path)
-                raw = "\n".join(ocr_lines)
-                method = "ocr"
-                if not raw.strip():
+                if ocr_lines:
+                    raw = "\n".join(ocr_lines)
+                    method = "ocr"
+                    # Primary: ji_liang OCR-line heuristics; fill gaps via digital parser.
+                    fields = parse_ocr_lines(ocr_lines)
+                    fields = merge_fields(fields, parse_fields(raw))
+                else:
                     errors.append("OCR produced no text on cover page")
+                    if not raw.strip():
+                        method = "ocr"
         except Exception as exc:  # noqa: BLE001
             errors.append(f"OCR failed: {exc}")
     elif not raw.strip():
-        errors.append("no embedded text on cover page (OCR fallback disabled)")
+        errors.append("封面无嵌入文本（可使用 OCR提取）")
 
-    fields = parse_fields(raw) if raw.strip() else CertificateFields()
+    if method != "ocr":
+        fields = parse_fields(raw) if raw.strip() else CertificateFields()
+
     used_extra_pages = False
 
-    should_scan_pages = (fill_missing_pages or not cover_page_only) and n > 1
-    if should_scan_pages and _missing_fill_keys(fields):
-        # Always scan remaining pages for blanks; cover_page_only=False also
-        # keeps concatenating raw text for debugging/display.
+    if fill_missing_pages and n > 1 and _missing_fill_keys(fields):
         for page_index in range(1, n):
-            if cover_page_only and not _missing_fill_keys(fields):
+            if not _missing_fill_keys(fields):
                 break
             try:
                 page_raw = extract_page_text(path, page_index)
@@ -150,12 +161,10 @@ def parse_certificate(
             if not cover_page_only:
                 raw = f"{raw}\n{page_raw}" if raw.strip() else page_raw
             page_fields = parse_fields(page_raw)
-            before = _missing_fill_keys(fields)
+            before_missing = set(_missing_fill_keys(fields))
             fields = merge_fields(fields, page_fields)
-            if _missing_fill_keys(fields) != before:
+            if set(_missing_fill_keys(fields)) != before_missing:
                 used_extra_pages = True
-            if cover_page_only and not _missing_fill_keys(fields):
-                break
 
     if used_extra_pages and method == "embedded_text":
         method = "embedded_text_multipage"

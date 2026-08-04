@@ -25,6 +25,9 @@ pymupdf==1.28.0
 Pillow==12.3.0
 openpyxl>=3.1.5,<4.0
 
+# --- MAS browser autofill ---
+playwright>=1.40.0,<2.0
+
 # --- OCR (Windows CPU; same stack family as 证书扫描/ji_liang) ---
 # Install paddlepaddle from the official CPU index BEFORE this file if PyPI
 # does not resolve the wheel (see Setup above).
