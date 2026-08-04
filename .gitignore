@@ -223,3 +223,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# VinCert / Playwright — local runtime data (do not commit contents)
+mas_browser_data/
+eams_credentials.json
+exports/*
+!exports/.gitkeep
+failed_items/*
+!failed_items/.gitkeep
+.vincert_tmp/
