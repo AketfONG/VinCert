@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations #loose order of declaration and definition
 
 from dataclasses import asdict, dataclass, field
 
@@ -18,6 +18,7 @@ class CertificateFields:
     manufacturer: str = ""  # 制造厂
     due_date: str = ""  # 本次检测有效期至
     issue_date: str = ""  # 发布日期
+    result_info: str = ""  # 计量结果信息（用户填写，默认合格）
 
     def match_fields(self) -> dict[str, str]:
         """Fields used to verify the correct webpage record before autofill."""
@@ -34,6 +35,7 @@ class CertificateFields:
             "measurement_date": self.measurement_date,
             "due_date": self.due_date,
             "measurement_unit": self.measurement_unit,
+            "result_info": self.result_info,
         }
 
     def as_display_dict(self) -> dict[str, str]:
@@ -45,6 +47,7 @@ class CertificateFields:
             "measurement_date": "本次检测日期",
             "due_date": "本次检测有效期至",
             "measurement_unit": "检测机构",
+            "result_info": "计量结果信息",
             "model": "型号/规格",
             "certificate_no": "证书编号",
             "client_name": "客户名称",
