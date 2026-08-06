@@ -49,6 +49,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "buttons_bold": True,
         "content_centering": True,
         "status_dots": False,
+        "doc_list_scale_fonts": True,
         "failed_items_dir": str(DEFAULT_FAILED_ITEMS_DIR),
         "testing_mode": False,
         "demo_folder": "",
@@ -72,6 +73,8 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["content_centering"] = bool(data["content_centering"])
     if "status_dots" in data:
         out["status_dots"] = bool(data["status_dots"])
+    if "doc_list_scale_fonts" in data:
+        out["doc_list_scale_fonts"] = bool(data["doc_list_scale_fonts"])
     if "failed_items_dir" in data and data["failed_items_dir"]:
         out["failed_items_dir"] = str(data["failed_items_dir"])
     if "testing_mode" in data:
@@ -135,6 +138,15 @@ def load_status_dots(path: Path | None = None) -> bool:
 
 def save_status_dots(enabled: bool, path: Path | None = None) -> Path:
     return save_ui_settings(status_dots=bool(enabled))
+
+
+def load_doc_list_scale_fonts(path: Path | None = None) -> bool:
+    """Return True when document-list canvas text follows UI zoom scaling."""
+    return bool(load_ui_settings(path).get("doc_list_scale_fonts", True))
+
+
+def save_doc_list_scale_fonts(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(doc_list_scale_fonts=bool(enabled))
 
 
 def load_failed_items_dir(path: Path | None = None) -> Path:
@@ -204,7 +216,7 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.4.1"
+BUILD_VERSION = "v0.5"
 BUILD_DATE = "06/08/2026"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
@@ -371,6 +383,7 @@ class App(customtkinter.CTk):
         self._buttons_bold = load_buttons_bold()
         self._content_centering = load_content_centering()
         self._status_dots = load_status_dots()
+        self._doc_list_scale_fonts = load_doc_list_scale_fonts()
         self._failed_items_dir = load_failed_items_dir()
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
@@ -1444,6 +1457,22 @@ class App(customtkinter.CTk):
         self.status_dots_switch.configure(command=self._on_status_dots_toggle)
         self.status_dots_switch.grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(10, 0))
 
+        self.doc_list_scale_fonts_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="列表文字缩放",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._doc_list_scale_fonts:
+            self.doc_list_scale_fonts_switch.select()
+        else:
+            self.doc_list_scale_fonts_switch.deselect()
+        self.doc_list_scale_fonts_switch.configure(
+            command=self._on_doc_list_scale_fonts_toggle
+        )
+        self.doc_list_scale_fonts_switch.grid(
+            row=2, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+        )
+
         customtkinter.CTkLabel(
             content,
             text="失败证书目录",
@@ -1723,6 +1752,9 @@ class App(customtkinter.CTk):
     def _on_status_dots_toggle(self):
         self._apply_status_dots(bool(self.status_dots_switch.get()))
 
+    def _on_doc_list_scale_fonts_toggle(self):
+        self._apply_doc_list_scale_fonts(bool(self.doc_list_scale_fonts_switch.get()))
+
     def _apply_content_centering(self, enabled: bool):
         self._content_centering = enabled
         save_content_centering(enabled)
@@ -1734,6 +1766,14 @@ class App(customtkinter.CTk):
         save_status_dots(enabled)
         self._refresh_doc_list_marks()
         self.set_status("已使用圆点图标" if enabled else "已使用表情图标")
+
+    def _apply_doc_list_scale_fonts(self, enabled: bool):
+        self._doc_list_scale_fonts = enabled
+        save_doc_list_scale_fonts(enabled)
+        self._refresh_doc_list_fonts()
+        self.set_status(
+            "已开启列表文字缩放" if enabled else "已关闭列表文字缩放（固定字号）"
+        )
 
     def _apply_buttons_bold(self, bold: bool):
         self._buttons_bold = bold
@@ -2745,9 +2785,15 @@ class App(customtkinter.CTk):
             return self._appearance_color(EMBED_BG_COLOR)
         return self._appearance_color(surface)
 
+    def _doc_list_font_scale(self) -> float:
+        """Scale factor for doc-list canvas text (1.0 = pre-zoom-font-fix sizes)."""
+        if self._doc_list_scale_fonts:
+            return self._widget_scaling_factor()
+        return 1.0
+
     def _doc_tk_font(self, size: int) -> tkfont.Font:
-        """Tk font scaled like CTk widgets (zoom 1.2× → larger doc-list text)."""
-        scale = self._widget_scaling_factor()
+        """Tk font for doc-list cells; optionally follows CTk UI zoom."""
+        scale = self._doc_list_font_scale()
         scaled = max(1, int(round(size * scale)))
         return tkfont.Font(family="SF Pro Text", size=scaled)
 
@@ -2762,7 +2808,7 @@ class App(customtkinter.CTk):
         anchor: str = "w",
     ) -> tuple[tk.Canvas, int]:
         """Plain Canvas text cell — no tk.Label, so macOS long-press has nothing to drag."""
-        scale = self._widget_scaling_factor()
+        scale = self._doc_list_font_scale()
         # Leave a few px so the parent CTkFrame rounded corners stay visible.
         h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
         canvas = tk.Canvas(
@@ -2826,10 +2872,10 @@ class App(customtkinter.CTk):
         canvas.itemconfigure(text_id, **kwargs)
 
     def _refresh_doc_list_fonts(self):
-        """Re-apply scaled fonts/heights after UI zoom changes."""
+        """Re-apply fonts/heights after UI zoom or list-text-scale toggle."""
         if not self._doc_rows:
             return
-        scale = self._widget_scaling_factor()
+        scale = self._doc_list_font_scale()
         h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
         pad_x = int(round(10 * scale))
         mark_w = max(1, int(round(DOC_MARK_COL_WIDTH * scale)))
