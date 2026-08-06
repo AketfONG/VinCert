@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -43,15 +45,101 @@ class AutofillReport:
     filled: int = 0
     uploaded: int = 0
     errors: list[str] | None = None
+    # PDF paths that failed checks (mismatch / 需要确认结果 / missing PDF / upload)
+    # and should be copied to the configured failed-items folder.
+    quarantine_paths: list[str] | None = None
+    cancelled: bool = False
 
     def __post_init__(self) -> None:
         if self.errors is None:
             self.errors = []
+        if self.quarantine_paths is None:
+            self.quarantine_paths = []
+
+
+class AutofillItemError(Exception):
+    """One certificate failed; optionally quarantine its PDF."""
+
+    def __init__(self, message: str, *, quarantine: bool = False):
+        super().__init__(message)
+        self.quarantine = quarantine
+
+
+class AutofillCancelled(Exception):
+    """User requested exit from the autofill run."""
+
+
+class AutofillControl:
+    """Cross-thread pause / resume / exit signals for ``run_mas_autofill``."""
+
+    def __init__(self) -> None:
+        self._pause = threading.Event()
+        self._cancel = threading.Event()
+        self._context = None
+        self._context_lock = threading.Lock()
+
+    def bind_context(self, context) -> None:
+        with self._context_lock:
+            self._context = context
+
+    def clear_context(self) -> None:
+        with self._context_lock:
+            self._context = None
+
+    def pause(self) -> None:
+        self._pause.set()
+
+    def resume(self) -> None:
+        self._pause.clear()
+
+    def is_paused(self) -> bool:
+        return self._pause.is_set()
+
+    def request_exit(self) -> None:
+        """Signal cancel and close the browser to unblock any Playwright wait."""
+        self._cancel.set()
+        self._pause.clear()  # unblock any pause wait
+        with self._context_lock:
+            ctx = self._context
+            self._context = None
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def checkpoint(self, status: StatusFn | None = None) -> None:
+        """Block while paused; raise ``AutofillCancelled`` if exit was requested."""
+        while self._pause.is_set():
+            if self._cancel.is_set():
+                raise AutofillCancelled("用户退出自动填写")
+            time.sleep(0.12)
+        if self._cancel.is_set():
+            raise AutofillCancelled("用户退出自动填写")
+
+
+COMPARE_FIELD_LABELS = {
+    "serial_num": "计量器具编号",
+    "manufacturer": "制造厂",
+}
+
+
+def _norm_compare(value: str | None) -> str:
+    return " ".join((value or "").strip().split())
 
 
 def _status(cb: StatusFn | None, message: str) -> None:
     if cb:
         cb(message)
+
+
+def _click(status: StatusFn | None, locator, label: str, *, timeout: float = 8000):
+    """Click a Playwright locator and report the UI action."""
+    _status(status, f"点击「{label}」")
+    locator.click(timeout=timeout)
 
 
 def _shell(page):
@@ -62,19 +150,33 @@ def _upload_frame(shell):
     return shell.locator(UPLOAD_IFRAME).content_frame
 
 
-def _fill_textbox(frame, name: str, value: str, *, timeout: float = 8000) -> None:
+def _fill_textbox(
+    frame,
+    name: str,
+    value: str,
+    *,
+    timeout: float = 8000,
+    status: StatusFn | None = None,
+) -> None:
     if not value:
         return
     box = frame.get_by_role("textbox", name=name)
-    box.click(timeout=timeout)
+    _click(status, box, name, timeout=timeout)
     box.fill(value, timeout=timeout)
     box.press("Tab")
 
 
-def _select_combobox(frame, name: str, value: str, *, timeout: float = 8000) -> None:
+def _select_combobox(
+    frame,
+    name: str,
+    value: str,
+    *,
+    timeout: float = 8000,
+    status: StatusFn | None = None,
+) -> None:
     if not value:
         return
-    frame.get_by_role("combobox", name=name).click(timeout=timeout)
+    _click(status, frame.get_by_role("combobox", name=name), name, timeout=timeout)
     # Maximo lookup menus surface as menuitem / option / plain text.
     for getter in (
         lambda: frame.get_by_role("menuitem", name=value, exact=True),
@@ -84,7 +186,7 @@ def _select_combobox(frame, name: str, value: str, *, timeout: float = 8000) -> 
         loc = getter()
         try:
             if loc.count() > 0:
-                loc.first.click(timeout=timeout)
+                _click(status, loc.first, value, timeout=timeout)
                 return
         except Exception:  # noqa: BLE001
             continue
@@ -137,7 +239,9 @@ def _already_logged_in(page, *, timeout_ms: int = 3000) -> bool:
         return False
 
 
-def _fill_eams_login_form(page, username: str, password: str) -> None:
+def _fill_eams_login_form(
+    page, username: str, password: str, *, status: StatusFn | None = None
+) -> None:
     """Fill username/password on the MAS auth portal and submit."""
     user_filled = False
     for name in ("用户名", "账号", "Username", "User name", "user"):
@@ -183,7 +287,7 @@ def _fill_eams_login_form(page, username: str, password: str) -> None:
     clicked = False
     for name in ("登录", "登 录", "Sign in", "Login", "提交"):
         try:
-            page.get_by_role("button", name=name).click(timeout=1500)
+            _click(status, page.get_by_role("button", name=name), name, timeout=1500)
             clicked = True
             break
         except Exception:  # noqa: BLE001
@@ -192,7 +296,7 @@ def _fill_eams_login_form(page, username: str, password: str) -> None:
         submit = page.locator('button[type="submit"], input[type="submit"]')
         if submit.count() == 0:
             raise RuntimeError("未找到登录按钮")
-        submit.first.click(timeout=3000)
+        _click(status, submit.first, "提交登录", timeout=3000)
 
 
 def login_eams(
@@ -226,7 +330,7 @@ def login_eams(
         return
 
     _status(status, "正在自动填写登录信息…")
-    _fill_eams_login_form(page, username, password)
+    _fill_eams_login_form(page, username, password, status=status)
 
     deadline_ms = max(login_wait_seconds, 30) * 1000
     _status(status, "等待登录完成…")
@@ -287,11 +391,13 @@ def run_mas_autofill(
     submit_workflow: bool = False,
     login_wait_seconds: int = 300,
     status: StatusFn | None = None,
+    control: AutofillControl | None = None,
 ) -> AutofillReport:
     """
     Drive EAMS 计量器具结果录入 using a persistent Chromium profile.
 
     If username/password are provided, the login form is autofilled when needed.
+    Pass ``control`` to support pause / continue / exit from the UI.
     """
     if not items and not (batch_import and excel_rows):
         raise ValueError("没有可自动填写的条目")
@@ -300,18 +406,26 @@ def run_mas_autofill(
     report = AutofillReport()
     profile = Path(user_data_dir or DEFAULT_USER_DATA_DIR)
     profile.mkdir(parents=True, exist_ok=True)
+    gate = control or AutofillControl()
+
+    def check():
+        gate.checkpoint(status)
 
     with sync_playwright() as p:
-        _status(status, "正在启动浏览器…")
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=headless,
-            slow_mo=slow_mo,
-            viewport={"width": 1400, "height": 900},
-            accept_downloads=True,
-        )
+        context = None
         try:
+            check()
+            _status(status, "正在启动浏览器…")
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile),
+                headless=headless,
+                slow_mo=slow_mo,
+                viewport={"width": 1400, "height": 900},
+                accept_downloads=True,
+            )
+            gate.bind_context(context)
             page = context.pages[0] if context.pages else context.new_page()
+            check()
             if username and password:
                 login_eams(
                     page,
@@ -323,47 +437,94 @@ def run_mas_autofill(
             else:
                 _status(status, "打开 EAMS 主页（如需登录请在浏览器中完成）…")
                 page.goto(EAMS_HOME, wait_until="domcontentloaded")
+            check()
             shell = _wait_for_shell(page, login_wait_seconds=login_wait_seconds, status=status)
 
+            check()
             _status(status, "进入「计量器具结果录入」…")
-            _open_measure_app(shell)
+            _open_measure_app(shell, status=status)
 
             if batch_import and excel_path:
+                check()
                 excel_path = Path(excel_path)
                 if not excel_path.exists():
                     if excel_rows is None or excel_headers is None:
                         raise FileNotFoundError(f"Excel 不存在且未提供数据行：{excel_path}")
                     write_batch_excel(excel_rows, excel_headers, excel_path)
                 _status(status, f"批量导入 Excel：{excel_path.name}")
-                _batch_import_excel(shell, excel_path)
+                _batch_import_excel(shell, excel_path, status=status)
                 report.imported_excel = True
 
             if fill_details or upload_pdf:
+                # PDF upload is compulsory for each approved certificate.
+                upload_pdf = True
                 for i, item in enumerate(items, start=1):
+                    check()
                     serial = (item.fields.serial_num or "").strip()
                     label = serial or item.fields.name or f"#{i}"
+                    pdf = Path(item.pdf_path) if item.pdf_path else None
                     try:
+                        if pdf is None or not pdf.is_file():
+                            raise AutofillItemError(
+                                "缺少对应 PDF，无法上传附件",
+                                quarantine=True,
+                            )
                         _status(status, f"填写第 {i}/{len(items)} 份：{label}")
-                        _open_record_by_serial(shell, serial)
+                        check()
+                        _open_record_by_serial(shell, serial, status=status)
+                        check()
+                        _verify_compare_fields(shell, item.fields, status=status)
+                        check()
+                        if _needs_result_confirm(shell, status=status):
+                            raise AutofillItemError(
+                                "网页勾选了「需要确认结果」，已移出自动填写队列",
+                                quarantine=True,
+                            )
                         if fill_details:
-                            _fill_record_fields(shell, item.fields)
+                            check()
+                            _fill_record_fields(shell, item.fields, status=status)
                             report.filled += 1
-                        if upload_pdf and item.pdf_path and Path(item.pdf_path).exists():
-                            _upload_certificate_pdf(shell, item.pdf_path)
-                            report.uploaded += 1
+                        check()
+                        _upload_certificate_pdf(shell, pdf, status=status)
+                        report.uploaded += 1
                         if submit_workflow:
-                            _submit_workflow(shell)
-                    except Exception as exc:  # noqa: BLE001
+                            check()
+                            _submit_workflow(shell, status=status)
+                    except AutofillCancelled:
+                        raise
+                    except AutofillItemError as exc:
+                        if gate.cancelled():
+                            raise AutofillCancelled("用户退出自动填写") from exc
                         msg = f"{label}: {exc}"
                         report.errors.append(msg)
                         _status(status, f"失败 — {msg}")
+                        if exc.quarantine and item.pdf_path:
+                            report.quarantine_paths.append(item.pdf_path)
+                    except Exception as exc:  # noqa: BLE001
+                        if gate.cancelled():
+                            raise AutofillCancelled("用户退出自动填写") from exc
+                        msg = f"{label}: {exc}"
+                        report.errors.append(msg)
+                        _status(status, f"失败 — {msg}")
+                        if item.pdf_path:
+                            report.quarantine_paths.append(item.pdf_path)
+        except AutofillCancelled as exc:
+            report.cancelled = True
+            _status(status, f"已退出 — {exc}")
+        except Exception as exc:  # noqa: BLE001
+            if gate.cancelled():
+                report.cancelled = True
+                _status(status, "已退出自动填写")
+            else:
+                raise
         finally:
-            # Keep the browser open so the user can review; only close the Playwright
-            # driver handle if headless. For headed mode, leave context running…
-            # Actually persistent context must be closed to flush profile cleanly.
-            # Close after a short pause message.
+            gate.clear_context()
             _status(status, "自动化结束，正在关闭浏览器会话…")
-            context.close()
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     return report
 
@@ -424,91 +585,254 @@ def _wait_for_shell(page, *, login_wait_seconds: int, status: StatusFn | None):
     return shell
 
 
-def _open_measure_app(shell) -> None:
+def _open_measure_app(shell, *, status: StatusFn | None = None) -> None:
     link = shell.get_by_role("link", name="计量器具结果录入", exact=True)
-    link.click()
+    _click(status, link, "计量器具结果录入")
     # App may already be open; menu item is under the app toolbar.
     menu = shell.get_by_role("menuitem", name="批量导入计量结果")
     try:
         menu.wait_for(state="visible", timeout=5000)
     except Exception:
         # Re-click app link if menu not visible yet.
-        link.click()
+        _click(status, link, "计量器具结果录入")
         menu.wait_for(state="visible", timeout=15_000)
 
 
-def _batch_import_excel(shell, excel_path: Path) -> None:
-    shell.get_by_role("menuitem", name="批量导入计量结果").click()
+def _batch_import_excel(
+    shell, excel_path: Path, *, status: StatusFn | None = None
+) -> None:
+    _click(status, shell.get_by_role("menuitem", name="批量导入计量结果"), "批量导入计量结果")
     upload = _upload_frame(shell)
+    _status(status, f"选择文件：{excel_path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(excel_path))
-    shell.get_by_role("button", name="确定").click()
+    _click(status, shell.get_by_role("button", name="确定"), "确定")
     # Import dialog may show progress then need 关闭.
     try:
-        shell.get_by_role("button", name="关闭").click(timeout=30_000)
+        _click(status, shell.get_by_role("button", name="关闭"), "关闭", timeout=30_000)
     except Exception:
         # Some builds only show 确定 again; ignore if already closed.
         pass
 
 
-def _open_record_by_serial(shell, serial: str) -> None:
+def _open_record_by_serial(
+    shell, serial: str, *, status: StatusFn | None = None
+) -> None:
     if not serial:
-        raise RuntimeError("缺少计量器具编号，无法定位网页记录")
+        raise AutofillItemError("缺少计量器具编号，无法定位网页记录", quarantine=True)
     # Prefer exact text match in the result list / table.
     target = shell.get_by_text(serial, exact=True)
     if target.count() == 0:
         # Fallback: contains match (some rows append units/status).
         target = shell.get_by_text(serial)
     if target.count() == 0:
-        raise RuntimeError(f"网页列表中未找到编号：{serial}")
-    target.first.click()
+        raise AutofillItemError(
+            f"网页列表中未找到编号：{serial}",
+            quarantine=True,
+        )
+    _click(status, target.first, serial)
     # Wait for a known detail field.
     shell.get_by_role("combobox", name="检验方式").wait_for(timeout=15_000)
 
 
-def _fill_record_fields(shell, fields: CertificateFields) -> None:
-    if fields.measurement_type:
+def _read_labeled_value(shell, label: str) -> str:
+    """Best-effort read of a Maximo field value by accessible name."""
+    for role in ("textbox", "combobox", "searchbox"):
         try:
-            _select_combobox(shell, "检验方式", fields.measurement_type)
-        except Exception:
-            # Already set by batch import — non-fatal.
+            loc = shell.get_by_role(role, name=label)
+            if loc.count() == 0:
+                continue
+            target = loc.first
+            for reader in (
+                lambda: target.input_value(timeout=1500),
+                lambda: target.get_attribute("value"),
+                lambda: target.inner_text(timeout=1500),
+            ):
+                try:
+                    raw = reader()
+                    if raw is not None and str(raw).strip():
+                        return str(raw).strip()
+                except Exception:  # noqa: BLE001
+                    continue
+        except Exception:  # noqa: BLE001
+            continue
+    try:
+        labeled = shell.get_by_label(label)
+        if labeled.count() > 0:
+            target = labeled.first
+            for reader in (
+                lambda: target.input_value(timeout=1500),
+                lambda: target.get_attribute("value"),
+                lambda: target.inner_text(timeout=1500),
+            ):
+                try:
+                    raw = reader()
+                    if raw is not None and str(raw).strip():
+                        return str(raw).strip()
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _verify_compare_fields(
+    shell, fields: CertificateFields, *, status: StatusFn | None = None
+) -> None:
+    """After open: webpage 比对字段 (excl. 计量器具名称) must match the certificate."""
+    expected = fields.compare_fields()
+    mismatches: list[str] = []
+    for key, label in COMPARE_FIELD_LABELS.items():
+        want = _norm_compare(expected.get(key, ""))
+        if not want:
+            continue
+        got = _norm_compare(_read_labeled_value(shell, label))
+        _status(status, f"比对「{label}」：证书={want or '—'} · 网页={got or '—'}")
+        if not got:
+            mismatches.append(f"{label}（网页为空）")
+        elif got != want and want not in got and got not in want:
+            mismatches.append(f"{label}（证书「{want}」≠ 网页「{got}」）")
+    if mismatches:
+        raise AutofillItemError(
+            "比对字段不一致：" + "；".join(mismatches),
+            quarantine=True,
+        )
+    _status(status, "比对字段一致")
+
+
+def _needs_result_confirm(shell, *, status: StatusFn | None = None) -> bool:
+    """True when the EAMS record has「需要确认结果」checked (any confirm code)."""
+    candidates = []
+    for name in ("需要确认结果", "需要确认"):
+        try:
+            candidates.append(shell.get_by_role("checkbox", name=name))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            candidates.append(shell.get_by_label(name))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            candidates.append(shell.get_by_text(name, exact=True))
+        except Exception:  # noqa: BLE001
             pass
 
-    # 检验结果 often mirrors 合格 when result_info is a short code.
-    result = (fields.result_info or "").strip()
-    if result and ("\n" not in result) and len(result) <= 10:
+    for loc in candidates:
         try:
-            shell.get_by_label("检验结果").get_by_role("img", name="下拉映像").click(timeout=3000)
-            shell.get_by_role("menuitem", name=result, exact=True).click(timeout=3000)
+            if loc.count() == 0:
+                continue
+            node = loc.first
+            for attr in ("aria-checked", "aria-pressed", "aria-selected"):
+                try:
+                    val = (node.get_attribute(attr) or "").strip().lower()
+                    if val in {"true", "1", "mixed"}:
+                        _status(status, "检测到「需要确认结果」已勾选")
+                        return True
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                if node.is_checked():
+                    _status(status, "检测到「需要确认结果」已勾选")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                related = node.locator(
+                    'xpath=ancestor-or-self::*[self::label or self::div][1]'
+                    '//input[@type="checkbox"] | '
+                    'xpath=following::input[@type="checkbox"][1]'
+                )
+                if related.count() > 0 and related.first.is_checked():
+                    _status(status, "检测到「需要确认结果」已勾选")
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _fill_record_fields(
+    shell, fields: CertificateFields, *, status: StatusFn | None = None
+) -> None:
+    """Fill certificate type, check date, result info (and related dates/org)."""
+    if fields.measurement_type:
+        try:
+            _select_combobox(
+                shell, "检验方式", fields.measurement_type, status=status
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise AutofillItemError(
+                f"无法选择检验方式「{fields.measurement_type}」：{exc}",
+                quarantine=True,
+            ) from exc
+    else:
+        _status(status, "证书无检验方式，跳过类型选择")
+
+    if not (fields.measurement_date or "").strip():
+        raise AutofillItemError("缺少本次检测日期", quarantine=True)
+    _fill_textbox(shell, "本次检测日期", fields.measurement_date, status=status)
+
+    if fields.due_date:
+        _fill_textbox(shell, "本次检测有效期至", fields.due_date, status=status)
+    if fields.measurement_unit:
+        _fill_textbox(shell, "检测机构", fields.measurement_unit, status=status)
+
+    result = (fields.result_info or "").strip() or "合格"
+    if "\n" not in result and len(result) <= 10:
+        try:
+            _click(
+                status,
+                shell.get_by_label("检验结果").get_by_role("img", name="下拉映像"),
+                "检验结果",
+                timeout=3000,
+            )
+            _click(
+                status,
+                shell.get_by_role("menuitem", name=result, exact=True),
+                result,
+                timeout=3000,
+            )
         except Exception:
             try:
-                _select_combobox(shell, "检验结果", result)
+                _select_combobox(shell, "检验结果", result, status=status)
             except Exception:
                 pass
 
-    _fill_textbox(shell, "本次检测日期", fields.measurement_date)
-    _fill_textbox(shell, "本次检测有效期至", fields.due_date)
-    _fill_textbox(shell, "检测机构", fields.measurement_unit)
-    _fill_textbox(shell, "计量结果信息", fields.result_info or "合格")
+    _fill_textbox(shell, "计量结果信息", result, status=status)
 
 
-def _upload_certificate_pdf(shell, pdf_path: str | Path) -> None:
+def _upload_certificate_pdf(
+    shell, pdf_path: str | Path, *, status: StatusFn | None = None
+) -> None:
     path = Path(pdf_path)
-    shell.get_by_role("button", name="上传附件").click()
+    if not path.is_file():
+        raise AutofillItemError(f"PDF 不存在：{path}", quarantine=True)
+    _click(status, shell.get_by_role("button", name="上传附件"), "上传附件")
     upload = _upload_frame(shell)
+    _status(status, f"选择附件：{path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(path))
     try:
-        _select_combobox(shell, "类型", "证书")
-    except Exception:
-        # Type may already default to 证书 after selecting file.
-        pass
-    shell.get_by_role("button", name="确定").click()
-    # Wait for upload dialog to settle.
+        _select_combobox(shell, "类型", "证书", status=status)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            current = _read_labeled_value(shell, "类型")
+            if _norm_compare(current) != "证书":
+                raise AutofillItemError(
+                    f"无法选择附件类型「证书」：{exc}",
+                    quarantine=True,
+                ) from exc
+        except AutofillItemError:
+            raise
+        except Exception:
+            pass
+    _click(status, shell.get_by_role("button", name="确定"), "确定")
     try:
         shell.get_by_role("button", name="上传附件").wait_for(state="visible", timeout=15_000)
     except Exception:
         pass
+    _status(status, f"已上传证书附件：{path.name}")
 
 
-def _submit_workflow(shell) -> None:
-    shell.get_by_alt_text("发送工作流").click()
-    shell.get_by_role("button", name="确定").click()
+def _submit_workflow(shell, *, status: StatusFn | None = None) -> None:
+    _click(status, shell.get_by_alt_text("发送工作流"), "发送工作流")
+    _click(status, shell.get_by_role("button", name="确定"), "确定")

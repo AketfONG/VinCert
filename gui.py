@@ -19,6 +19,7 @@ from vincert.models import CertificateFields, ParseResult
 from vincert.pipeline import parse_certificate
 from vincert.folder_import import find_pdfs_in_folder
 from vincert.mas_autofill import (
+    AutofillControl,
     AutofillItem,
     FAILED_ITEMS_DIR,
     load_credentials,
@@ -216,7 +217,7 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.5"
+BUILD_VERSION = "v0.5b"
 BUILD_DATE = "06/08/2026"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
@@ -280,6 +281,11 @@ TOAST_RADIUS = UI_RADIUS + 2  # 2px rounder than shared UI radius
 TOAST_DEFAULT_MS = 5000
 TOAST_SUCCESS_MS = 2000
 TOAST_TICK_MS = 50
+TOAST_STACK_MAX = 8
+TOAST_STACK_GAP = 8
+AUTOFILL_LOG_WIDTH = TOAST_WIDTH
+AUTOFILL_LOG_PAD = TOAST_PAD
+AUTOFILL_LOG_FINISH_MS = 12000
 DOC_ROW_ACTIVE = ("#3b8ed0", "#1f6aa5")
 DOC_ROW_ACTIVE_TEXT = ("#ffffff", "#ffffff")
 # Index numbers at ~50% opacity (emoji marks stay full strength).
@@ -298,6 +304,14 @@ FIELD_FG_COLOR = ("#ffffff", _dark_field_fg)
 FIELD_TEXT_COLOR = _theme_textbox.get("text_color", ("gray10", "#DCE4EE"))
 FIELD_FG_COLOR_DISABLED = ("gray90", "gray22")
 FIELD_TEXT_COLOR_DISABLED = ("gray55", "gray55")
+# Autofill UI lock: mute chrome that `state=disabled` alone does not cover.
+UI_LOCK_BTN_FG = ("#d5dbe0", "#3a3a3a")
+UI_LOCK_BTN_TEXT = ("#8b9298", "#777777")
+UI_LOCK_TILE_FG = ("#eceff1", "#2c2c2c")
+UI_LOCK_BADGE_FG = ("#b0b6bc", "#555555")
+UI_LOCK_LABEL = ("gray55", "gray55")
+UI_LOCK_DOC_ROW = ("#dfe3e7", "#2f2f2f")
+UI_LOCK_DOC_TEXT = ("gray55", "gray55")
 # Match fill so CTkEntry's 1px border stays invisible (avoids a hairline under fields).
 FIELD_BORDER_WIDTH = 1
 
@@ -367,16 +381,19 @@ class App(customtkinter.CTk):
         self._doc_name_tip_path: str | None = None
         self._extract_busy = False
         self._autofill_busy = False
-        self._toast_frame: customtkinter.CTkFrame | None = None
-        self._toast_hide_after_id: str | None = None
+        self._autofill_control: AutofillControl | None = None
+        self._autofill_exit_confirming = False
+        self._autofill_was_paused_before_exit = False
+        self._autofill_disabled_widgets: list = []
+        self._autofill_ui_chrome_locked = False
+        self._toast_host: customtkinter.CTkFrame | None = None
+        self._toasts: list[dict] = []
+        self._toast_seq = 0
         self._toast_tick_after_id: str | None = None
-        self._toast_progress: customtkinter.CTkProgressBar | None = None
-        self._toast_countdown_label: customtkinter.CTkLabel | None = None
-        self._toast_deadline_ms: int = 0
-        self._toast_duration_ms: int = TOAST_DEFAULT_MS
-        self._toast_on_complete = None
-        self._toast_on_undo = None
-        self._toast_settled = False
+        self._autofill_log_frame: customtkinter.CTkFrame | None = None
+        self._autofill_log_text: customtkinter.CTkTextbox | None = None
+        self._autofill_log_status: customtkinter.CTkLabel | None = None
+        self._autofill_log_finish_after_id: str | None = None
         self._pending_quarantine_paths: list[str] = []
         self._ui_zoomed = load_ui_zoomed()
         self._ocr_enabled = load_ocr_enabled()
@@ -506,7 +523,13 @@ class App(customtkinter.CTk):
         return button
 
     def _restyle_primary_action_buttons(self):
-        for name in ("ocr_extract_button", "goto_review_button", "autofill_button"):
+        for name in (
+            "ocr_extract_button",
+            "goto_review_button",
+            "autofill_button",
+            "autofill_pause_button",
+            "autofill_exit_button",
+        ):
             btn = getattr(self, name, None)
             if btn is not None:
                 self._fix_ctk_button_text_vcenter(btn)
@@ -588,6 +611,8 @@ class App(customtkinter.CTk):
             self._bind_step_tile_click(child, key)
 
     def _hover_step_tile(self, key: str, entering: bool):
+        if self._autofill_busy:
+            return
         if key == self._current_step:
             return
         if entering:
@@ -596,6 +621,8 @@ class App(customtkinter.CTk):
             self._apply_tile_style(key, "normal")
 
     def _apply_tile_style(self, key: str, style: str):
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
+            return
         tile = self.step_tiles[key]
         styles = {
             "normal": {
@@ -630,6 +657,8 @@ class App(customtkinter.CTk):
 
     def _update_settings_button(self, active: bool):
         if not hasattr(self, "settings_button"):
+            return
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
             return
         if active:
             self.settings_button.configure(
@@ -930,6 +959,9 @@ class App(customtkinter.CTk):
         self.after_idle(self._sync_active_page_vcenter)
 
     def show_step(self, key: str):
+        if self._autofill_busy and key != self._current_step:
+            self.set_status("自动填写进行中，请先暂停或退出…")
+            return
         self._current_step = key
 
         self._update_step_tiles(key)
@@ -1926,30 +1958,257 @@ class App(customtkinter.CTk):
         """Fixed design-unit width for toasts."""
         return TOAST_WIDTH
 
+    def _ensure_toast_host(self) -> customtkinter.CTkFrame:
+        if self._toast_host is None:
+            host = customtkinter.CTkFrame(self, fg_color="transparent")
+            self._toast_host = host
+            self._place_toast_host()
+        return self._toast_host
+
+    def _toast_host_x(self) -> int:
+        """Right inset for the toast stack; shift left when autofill log is open."""
+        if self._autofill_log_frame is not None:
+            return -(AUTOFILL_LOG_PAD + AUTOFILL_LOG_WIDTH + TOAST_PAD)
+        return -TOAST_PAD
+
+    def _place_toast_host(self):
+        host = self._toast_host
+        if host is None:
+            return
+        # Compact toasts anchor to the top-right (shift left when terminal is open).
+        host.place(
+            relx=1.0,
+            rely=0.0,
+            x=self._toast_host_x(),
+            y=TOAST_PAD,
+            anchor="ne",
+        )
+        try:
+            host.lift()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _relayout_toast_stack(self):
+        host = self._toast_host
+        if host is None:
+            return
+        for entry in self._toasts:
+            try:
+                entry["frame"].pack_forget()
+            except Exception:  # noqa: BLE001
+                pass
+        for i, entry in enumerate(self._toasts):
+            gap = TOAST_STACK_GAP if i < len(self._toasts) - 1 else 0
+            try:
+                entry["frame"].pack(side="top", anchor="e", pady=(0, gap))
+            except Exception:  # noqa: BLE001
+                pass
+        self._place_toast_host()
+
+    def _autofill_log_height(self) -> int:
+        """Terminal occupies roughly the top half of the window."""
+        scale = self._widget_scaling_factor()
+        try:
+            win_h = int(round(self.winfo_height() / scale))
+        except Exception:  # noqa: BLE001
+            win_h = 720
+        half = max(1, (win_h - 2 * AUTOFILL_LOG_PAD) // 2)
+        return max(200, half)
+
+    def _sync_autofill_log_geometry(self, _event=None):
+        frame = self._autofill_log_frame
+        if frame is None:
+            return
+        try:
+            frame.configure(
+                width=AUTOFILL_LOG_WIDTH,
+                height=self._autofill_log_height(),
+            )
+            frame.place(
+                relx=1.0,
+                rely=0.0,
+                x=-AUTOFILL_LOG_PAD,
+                y=AUTOFILL_LOG_PAD,
+                anchor="ne",
+            )
+            frame.lift()
+        except Exception:  # noqa: BLE001
+            pass
+        self._place_toast_host()
+
+    def open_autofill_log(self, *, title: str = "自动填写"):
+        """Show the top-half autofill terminal panel (clears any prior log)."""
+        self.close_autofill_log()
+        accent = SUCCESS_BTN_FG
+        h = self._autofill_log_height()
+        frame = customtkinter.CTkFrame(
+            self,
+            width=AUTOFILL_LOG_WIDTH,
+            height=h,
+            corner_radius=TOAST_RADIUS,
+            fg_color=TOAST_BG,
+            border_width=TOAST_BORDER_WIDTH,
+            border_color=accent,
+        )
+        frame.grid_propagate(False)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+
+        header = customtkinter.CTkFrame(frame, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
+        header.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkLabel(
+            header,
+            text=title,
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_TITLE, weight="bold"),
+            text_color=TOAST_TITLE_COLOR,
+        ).grid(row=0, column=0, sticky="ew")
+
+        status = customtkinter.CTkLabel(
+            header,
+            text="进行中",
+            anchor="e",
+            font=customtkinter.CTkFont(size=FONT_META, weight="bold"),
+            text_color=SUCCESS_BTN_HOVER,
+        )
+        status.grid(row=0, column=1, sticky="e", padx=(8, 0))
+
+        text = customtkinter.CTkTextbox(
+            frame,
+            width=AUTOFILL_LOG_WIDTH - 28,
+            corner_radius=UI_RADIUS,
+            fg_color=("#f4f6f8", "#121212"),
+            text_color=TOAST_MESSAGE_COLOR,
+            border_width=0,
+            font=customtkinter.CTkFont(family="Menlo", size=FONT_META),
+            activate_scrollbars=False,
+            wrap="word",
+        )
+        text.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        text.configure(state="disabled")
+        # Keep view pinned to latest lines; no manual scroll.
+        text.bind("<MouseWheel>", lambda _e: "break")
+        text.bind("<Button-4>", lambda _e: "break")
+        text.bind("<Button-5>", lambda _e: "break")
+        try:
+            inner = getattr(text, "_textbox", None)
+            if inner is not None:
+                inner.bind("<MouseWheel>", lambda _e: "break")
+                inner.bind("<Button-4>", lambda _e: "break")
+                inner.bind("<Button-5>", lambda _e: "break")
+        except Exception:  # noqa: BLE001
+            pass
+
+        self._autofill_log_frame = frame
+        self._autofill_log_text = text
+        self._autofill_log_status = status
+        self._sync_autofill_log_geometry()
+        # Shift any already-visible compact toasts left of the terminal column.
+        self._place_toast_host()
+        if not getattr(self, "_autofill_log_configure_bound", False):
+            self.bind("<Configure>", self._sync_autofill_log_geometry, add="+")
+            self._autofill_log_configure_bound = True
+
+    def append_autofill_log(self, message: str, *, error: bool = False):
+        """Append one substep line to the autofill terminal (opens panel if needed)."""
+        if self._autofill_log_frame is None or self._autofill_log_text is None:
+            self.open_autofill_log()
+        text = self._autofill_log_text
+        if text is None:
+            return
+        line = (message or "").rstrip()
+        if not line:
+            return
+        prefix = "! " if error else "> "
+        try:
+            text.configure(state="normal")
+            text.insert("end", prefix + line + "\n")
+            text.see("end")
+            text.configure(state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+        self.set_status(message)
+        if self._autofill_log_frame is not None:
+            try:
+                self._autofill_log_frame.lift()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def finish_autofill_log(self, *, ok: bool = True, auto_close_ms: int = AUTOFILL_LOG_FINISH_MS):
+        """Mark the autofill terminal done/failed and optionally auto-close later."""
+        if self._autofill_log_status is not None:
+            try:
+                if ok:
+                    self._autofill_log_status.configure(
+                        text="完成",
+                        text_color=SUCCESS_BTN_HOVER,
+                    )
+                    if self._autofill_log_frame is not None:
+                        self._autofill_log_frame.configure(border_color=SUCCESS_BTN_FG)
+                else:
+                    self._autofill_log_status.configure(
+                        text="失败",
+                        text_color=DANGER_BTN_HOVER,
+                    )
+                    if self._autofill_log_frame is not None:
+                        self._autofill_log_frame.configure(border_color=DANGER_BTN_FG)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._autofill_log_finish_after_id is not None:
+            try:
+                self.after_cancel(self._autofill_log_finish_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._autofill_log_finish_after_id = None
+        if auto_close_ms and auto_close_ms > 0:
+            self._autofill_log_finish_after_id = self.after(
+                auto_close_ms, self.close_autofill_log
+            )
+
+    def close_autofill_log(self):
+        if self._autofill_log_finish_after_id is not None:
+            try:
+                self.after_cancel(self._autofill_log_finish_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._autofill_log_finish_after_id = None
+        frame = self._autofill_log_frame
+        self._autofill_log_frame = None
+        self._autofill_log_text = None
+        self._autofill_log_status = None
+        if frame is not None:
+            try:
+                frame.place_forget()
+                frame.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self._place_toast_host()
+
     def show_toast(
         self,
         message: str,
         *,
         title: str = "提醒",
         duration_ms: int = TOAST_DEFAULT_MS,
-        action_text: str = "关闭",
+        action_text: str | None = "关闭",
         undo_text: str | None = None,
         on_undo=None,
         on_complete=None,
         style: str = "danger",
     ):
-        """Show a bottom-right countdown toast with a draining progress bar.
+        """Show a top-right countdown toast; stacks below any already visible.
 
+        Older toasts stay above; each new toast is appended at the bottom.
         Auto-closes when the countdown reaches 0 (runs on_complete if set).
         Primary action dismisses early and also runs on_complete.
         Optional grey undo button runs on_undo instead and skips on_complete.
+        Pass action_text=None (and no undo_text) to hide action buttons.
         style: "danger" (red) or "success" (green).
         """
-        self.hide_toast(run_complete=False)
-
-        self._toast_on_complete = on_complete
-        self._toast_on_undo = on_undo
-        self._toast_settled = False
+        while len(self._toasts) >= TOAST_STACK_MAX:
+            self._dismiss_toast(self._toasts[0], run_complete=False)
 
         if style == "success":
             accent = SUCCESS_BTN_FG
@@ -1961,8 +2220,9 @@ class App(customtkinter.CTk):
             accent_text = DANGER_BTN_TEXT
 
         toast_w = self._toast_target_width()
+        host = self._ensure_toast_host()
         toast = customtkinter.CTkFrame(
-            self,
+            host,
             width=toast_w,
             corner_radius=TOAST_RADIUS,
             fg_color=TOAST_BG,
@@ -1983,6 +2243,7 @@ class App(customtkinter.CTk):
             text_color=TOAST_TITLE_COLOR,
         ).grid(row=0, column=0, sticky="ew")
 
+        duration_ms = max(duration_ms, TOAST_TICK_MS)
         seconds = max(1, int(round(duration_ms / 1000)))
         countdown = customtkinter.CTkLabel(
             header,
@@ -1992,7 +2253,6 @@ class App(customtkinter.CTk):
             text_color=accent_hover,
         )
         countdown.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        self._toast_countdown_label = countdown
 
         customtkinter.CTkLabel(
             toast,
@@ -2004,71 +2264,88 @@ class App(customtkinter.CTk):
             text_color=TOAST_MESSAGE_COLOR,
         ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
 
+        show_actions = bool(undo_text) or action_text is not None
         progress = customtkinter.CTkProgressBar(
             toast,
             height=10,
             fg_color=TOAST_PROGRESS_TRACK,
             progress_color=accent,
         )
-        progress.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
+        progress.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=18,
+            pady=(0, 16 if not show_actions else 12),
+        )
         progress.set(1.0)
-        self._toast_progress = progress
 
-        btn_row = customtkinter.CTkFrame(toast, fg_color="transparent")
-        btn_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 16))
-        if undo_text:
-            btn_row.grid_columnconfigure(0, weight=1)
-            btn_row.grid_columnconfigure(1, weight=1)
-            customtkinter.CTkButton(
-                btn_row,
-                corner_radius=UI_RADIUS,
-                text=undo_text,
-                height=TOAST_BTN_HEIGHT,
-                font=self._button_font(FONT_SECTION),
-                fg_color=SECONDARY_BTN_FG,
-                hover_color=SECONDARY_BTN_HOVER,
-                text_color=SECONDARY_BTN_TEXT,
-                command=self._toast_undo,
-            ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-            customtkinter.CTkButton(
-                btn_row,
-                corner_radius=UI_RADIUS,
-                text=action_text,
-                height=TOAST_BTN_HEIGHT,
-                font=self._button_font(FONT_SECTION),
-                fg_color=accent,
-                hover_color=accent_hover,
-                text_color=accent_text,
-                command=lambda: self.hide_toast(run_complete=True),
-            ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        else:
-            btn_row.grid_columnconfigure(0, weight=1)
-            customtkinter.CTkButton(
-                btn_row,
-                corner_radius=UI_RADIUS,
-                text=action_text,
-                height=TOAST_BTN_HEIGHT,
-                font=self._button_font(FONT_SECTION),
-                fg_color=accent,
-                hover_color=accent_hover,
-                text_color=accent_text,
-                command=lambda: self.hide_toast(run_complete=True),
-            ).grid(row=0, column=0, sticky="ew")
+        self._toast_seq += 1
+        entry = {
+            "id": self._toast_seq,
+            "frame": toast,
+            "progress": progress,
+            "countdown": countdown,
+            "duration_ms": duration_ms,
+            "deadline_ms": int(self.winfo_toplevel().tk.call("clock", "milliseconds"))
+            + duration_ms,
+            "on_complete": on_complete,
+            "on_undo": on_undo,
+            "settled": False,
+        }
 
-        # Layout off-screen first so the first visible paint is already final size.
-        toast.place(x=-10000, y=-10000)
+        if show_actions:
+            btn_row = customtkinter.CTkFrame(toast, fg_color="transparent")
+            btn_row.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 16))
+            if undo_text:
+                btn_row.grid_columnconfigure(0, weight=1)
+                btn_row.grid_columnconfigure(1, weight=1)
+                customtkinter.CTkButton(
+                    btn_row,
+                    corner_radius=UI_RADIUS,
+                    text=undo_text,
+                    height=TOAST_BTN_HEIGHT,
+                    font=self._button_font(FONT_SECTION),
+                    fg_color=SECONDARY_BTN_FG,
+                    hover_color=SECONDARY_BTN_HOVER,
+                    text_color=SECONDARY_BTN_TEXT,
+                    command=lambda e=entry: self._toast_undo(e),
+                ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+                customtkinter.CTkButton(
+                    btn_row,
+                    corner_radius=UI_RADIUS,
+                    text=action_text or "关闭",
+                    height=TOAST_BTN_HEIGHT,
+                    font=self._button_font(FONT_SECTION),
+                    fg_color=accent,
+                    hover_color=accent_hover,
+                    text_color=accent_text,
+                    command=lambda e=entry: self._dismiss_toast(e, run_complete=True),
+                ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+            else:
+                btn_row.grid_columnconfigure(0, weight=1)
+                customtkinter.CTkButton(
+                    btn_row,
+                    corner_radius=UI_RADIUS,
+                    text=action_text,
+                    height=TOAST_BTN_HEIGHT,
+                    font=self._button_font(FONT_SECTION),
+                    fg_color=accent,
+                    hover_color=accent_hover,
+                    text_color=accent_text,
+                    command=lambda e=entry: self._dismiss_toast(e, run_complete=True),
+                ).grid(row=0, column=0, sticky="ew")
+
+        # Size from content before packing into the stack host.
         toast.update_idletasks()
         scale = self._widget_scaling_factor()
         toast_h = max(1, int(round(toast.winfo_reqheight() / scale)))
         toast.configure(width=toast_w, height=toast_h)
         toast.grid_propagate(False)
-        toast.place(relx=1.0, rely=1.0, x=-TOAST_PAD, y=-TOAST_PAD, anchor="se")
-        toast.lift()
-        self._toast_frame = toast
 
-        self._toast_duration_ms = max(duration_ms, TOAST_TICK_MS)
-        self._toast_deadline_ms = int(self.winfo_toplevel().tk.call("clock", "milliseconds")) + self._toast_duration_ms
-        self._toast_tick()
+        self._toasts.append(entry)
+        self._relayout_toast_stack()
+        self._schedule_toast_tick()
 
     def show_success_toast(self, message: str, *, title: str = "OCR提取"):
         self.show_toast(
@@ -2079,64 +2356,92 @@ class App(customtkinter.CTk):
             style="success",
         )
 
-    def _toast_tick(self):
-        if self._toast_frame is None:
+    def _schedule_toast_tick(self):
+        if self._toast_tick_after_id is not None:
             return
-        now = int(self.winfo_toplevel().tk.call("clock", "milliseconds"))
-        remaining = max(0, self._toast_deadline_ms - now)
-        ratio = remaining / self._toast_duration_ms if self._toast_duration_ms else 0
-        if self._toast_progress is not None:
-            self._toast_progress.set(ratio)
-        if self._toast_countdown_label is not None:
-            secs = int((remaining + 999) // 1000)  # ceil seconds
-            self._toast_countdown_label.configure(text=f"{secs}s")
-        if remaining <= 0:
-            self.hide_toast(run_complete=True)
+        if not self._toasts:
             return
         self._toast_tick_after_id = self.after(TOAST_TICK_MS, self._toast_tick)
 
-    def _toast_undo(self):
-        if self._toast_settled:
+    def _toast_tick(self):
+        self._toast_tick_after_id = None
+        if not self._toasts:
             return
-        self._toast_settled = True
-        cb = self._toast_on_undo
-        self._toast_on_complete = None
-        self._toast_on_undo = None
-        self.hide_toast(run_complete=False)
+        now = int(self.winfo_toplevel().tk.call("clock", "milliseconds"))
+        expired = []
+        for entry in self._toasts:
+            remaining = max(0, entry["deadline_ms"] - now)
+            duration = entry["duration_ms"] or 1
+            ratio = remaining / duration
+            try:
+                entry["progress"].set(ratio)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                secs = int((remaining + 999) // 1000)
+                entry["countdown"].configure(text=f"{secs}s")
+            except Exception:  # noqa: BLE001
+                pass
+            if remaining <= 0:
+                expired.append(entry)
+        for entry in expired:
+            self._dismiss_toast(entry, run_complete=True)
+        if self._toasts:
+            self._toast_tick_after_id = self.after(TOAST_TICK_MS, self._toast_tick)
+
+    def _toast_undo(self, entry: dict):
+        if entry.get("settled"):
+            return
+        entry["settled"] = True
+        cb = entry.get("on_undo")
+        entry["on_complete"] = None
+        entry["on_undo"] = None
+        self._dismiss_toast(entry, run_complete=False)
         if cb is not None:
             cb()
 
+    def _dismiss_toast(self, entry: dict, *, run_complete: bool = False):
+        if entry not in self._toasts:
+            return
+        self._toasts.remove(entry)
+        frame = entry.get("frame")
+        if frame is not None:
+            try:
+                frame.pack_forget()
+                frame.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        complete_cb = None
+        if run_complete and not entry.get("settled"):
+            entry["settled"] = True
+            complete_cb = entry.get("on_complete")
+        entry["on_complete"] = None
+        entry["on_undo"] = None
+
+        if self._toasts:
+            self._relayout_toast_stack()
+        elif self._toast_host is not None:
+            try:
+                self._toast_host.place_forget()
+                self._toast_host.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._toast_host = None
+
+        if complete_cb is not None:
+            complete_cb()
+
     def hide_toast(self, *, run_complete: bool = False):
+        """Dismiss all stacked toasts."""
         if self._toast_tick_after_id is not None:
             try:
                 self.after_cancel(self._toast_tick_after_id)
             except Exception:  # noqa: BLE001
                 pass
             self._toast_tick_after_id = None
-        if self._toast_hide_after_id is not None:
-            try:
-                self.after_cancel(self._toast_hide_after_id)
-            except Exception:  # noqa: BLE001
-                pass
-            self._toast_hide_after_id = None
-        self._toast_progress = None
-        self._toast_countdown_label = None
-        if self._toast_frame is not None:
-            try:
-                self._toast_frame.place_forget()
-                self._toast_frame.destroy()
-            except Exception:  # noqa: BLE001
-                pass
-            self._toast_frame = None
-
-        complete_cb = None
-        if run_complete and not self._toast_settled:
-            self._toast_settled = True
-            complete_cb = self._toast_on_complete
-        self._toast_on_complete = None
-        self._toast_on_undo = None
-        if complete_cb is not None:
-            complete_cb()
+        for entry in list(self._toasts):
+            self._dismiss_toast(entry, run_complete=run_complete)
 
     def _apply_min_window_size(self):
         scale = self._widget_scaling_factor()
@@ -2329,6 +2634,12 @@ class App(customtkinter.CTk):
             self._bind_scrollable_mousewheel(self.doc_list_frame, widget)
 
     def _on_scrollable_mousewheel(self, scrollable, event):
+        if (
+            self._autofill_busy
+            and hasattr(self, "doc_list_frame")
+            and scrollable is self.doc_list_frame
+        ):
+            return "break"
         try:
             canvas = scrollable._parent_canvas
         except Exception:  # noqa: BLE001
@@ -2715,9 +3026,10 @@ class App(customtkinter.CTk):
         """Drop a pending fail-folder countdown without copying files."""
         if self._pending_quarantine_paths:
             self._pending_quarantine_paths = []
-        # If the active toast would quarantine on complete, dismiss it safely.
-        if self._toast_on_complete is self._commit_pending_quarantine:
-            self.hide_toast(run_complete=False)
+        # Dismiss only the toast(s) that would quarantine on complete.
+        for entry in list(self._toasts):
+            if entry.get("on_complete") is self._commit_pending_quarantine:
+                self._dismiss_toast(entry, run_complete=False)
 
     def _commit_pending_quarantine(self):
         paths = list(self._pending_quarantine_paths)
@@ -2947,6 +3259,9 @@ class App(customtkinter.CTk):
         self._doc_hover_path = keep
 
     def _show_doc_name_tip(self, path: str):
+        if self._autofill_busy:
+            self._hide_doc_name_tip()
+            return
         row = self._doc_rows.get(path)
         if row is None:
             self._hide_doc_name_tip()
@@ -3040,6 +3355,8 @@ class App(customtkinter.CTk):
                 self._set_doc_canvas_surface(canvas, surface)
 
     def _on_doc_row_press(self, path: str, _event=None):
+        if self._autofill_busy:
+            return "break"
         self._select_document(path)
         return "break"
 
@@ -3073,6 +3390,8 @@ class App(customtkinter.CTk):
         self._hover_doc_row(path, False)
 
     def _set_doc_row_hover(self, path: str, hovering: bool):
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
+            return
         if path == self._selected_path:
             if not hovering and self._doc_hover_path == path:
                 self._doc_hover_path = None
@@ -3092,6 +3411,8 @@ class App(customtkinter.CTk):
             self._doc_hover_path = None
 
     def _hover_doc_row(self, path: str, entering: bool):
+        if self._autofill_busy:
+            return
         if entering:
             if self._doc_name_tip_path and self._doc_name_tip_path != path:
                 self._hide_doc_name_tip()
@@ -3128,6 +3449,15 @@ class App(customtkinter.CTk):
         mark_size = self._doc_mark_font_size(path)
         mark_text = self._doc_leading_label(path, row.get("index", 0))
         name_text = row.get("full_name") or self._doc_name_label(path, row.get("index", 0))
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
+            # Mute selection blue + keep rows non-interactive looking.
+            surface = UI_LOCK_DOC_ROW if selected else "transparent"
+            text = UI_LOCK_DOC_TEXT
+            row["frame"].configure(fg_color=surface)
+            self._set_doc_canvas_text(row["mark"], mark_text, fill=text, size=mark_size)
+            self._set_doc_canvas_text(row["name"], name_text, fill=text, size=FONT_BODY)
+            self._sync_doc_row_surfaces(path, surface)
+            return
         if selected:
             row["frame"].configure(fg_color=DOC_ROW_ACTIVE)
             self._set_doc_canvas_text(row["mark"], mark_text, fill=mark_color, size=mark_size)
@@ -3264,6 +3594,8 @@ class App(customtkinter.CTk):
 
     def _select_document(self, path: str):
         if path not in self._imported_files:
+            return
+        if self._autofill_busy:
             return
         self._hide_doc_name_tip()
         self._clear_doc_row_hovers()
@@ -3524,6 +3856,55 @@ class App(customtkinter.CTk):
         self.autofill_button.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         self._style_primary_action_button(self.autofill_button)
 
+        self.autofill_controls_frame = customtkinter.CTkFrame(
+            footer, fg_color="transparent"
+        )
+        self.autofill_controls_frame.grid_columnconfigure((0, 1), weight=1)
+        self.autofill_pause_button = customtkinter.CTkButton(
+            self.autofill_controls_frame,
+            corner_radius=UI_RADIUS,
+            text="暂停",
+            height=PRIMARY_ACTION_BTN_HEIGHT,
+            round_height_to_even_numbers=False,
+            font=self._button_font(FONT_SECTION),
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            command=self._on_autofill_pause_toggle,
+        )
+        self.autofill_pause_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._style_primary_action_button(self.autofill_pause_button)
+
+        self.autofill_exit_button = customtkinter.CTkButton(
+            self.autofill_controls_frame,
+            corner_radius=UI_RADIUS,
+            text="退出",
+            height=PRIMARY_ACTION_BTN_HEIGHT,
+            round_height_to_even_numbers=False,
+            font=self._button_font(FONT_SECTION),
+            fg_color=DANGER_BTN_FG,
+            hover_color=DANGER_BTN_HOVER,
+            text_color=DANGER_BTN_TEXT,
+            command=self._on_autofill_exit,
+        )
+        self.autofill_exit_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self._style_primary_action_button(self.autofill_exit_button)
+
+        self.toast_test_button = customtkinter.CTkButton(
+            footer,
+            corner_radius=UI_RADIUS,
+            text="测试自动填写 Toast",
+            height=PRIMARY_ACTION_BTN_HEIGHT,
+            round_height_to_even_numbers=False,
+            font=self._button_font(FONT_SECTION),
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            command=self._on_test_toast_stack,
+        )
+        self.toast_test_button.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self._style_primary_action_button(self.toast_test_button)
+
     def _get_field_widget_value(self, widget) -> str:
         if isinstance(widget, customtkinter.CTkTextbox):
             return widget.get("1.0", "end-1c").strip()
@@ -3667,6 +4048,8 @@ class App(customtkinter.CTk):
     def _update_approve_toggle_button(self):
         if not hasattr(self, "approve_toggle_button"):
             return
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
+            return
         path = self._current_cert_path()
         if path is not None and path in self._autofill_queue:
             self.approve_toggle_button.configure(
@@ -3685,6 +4068,8 @@ class App(customtkinter.CTk):
 
     def _update_remove_toggle_button(self):
         if not hasattr(self, "remove_toggle_button"):
+            return
+        if self._autofill_busy or self._autofill_ui_chrome_locked:
             return
         path = self._current_cert_path()
         if path is not None and path in self._removed_paths:
@@ -3706,11 +4091,402 @@ class App(customtkinter.CTk):
         if not hasattr(self, "autofill_button"):
             return
         n = len(self._autofill_queue)
-        self.autofill_button.configure(text=f"导出并自动填写 ({n})")
+        if not self._autofill_busy:
+            self.autofill_button.configure(text=f"导出并自动填写 ({n})")
         if hasattr(self, "export_excel_button"):
             self.export_excel_button.configure(text=f"导出 Excel ({n})")
-        self._refresh_doc_list_marks()
-        self._update_review_cert_status()
+
+    def _show_autofill_run_controls(self):
+        """Swap the autofill CTA for 暂停 / 退出 while a run is active."""
+        if hasattr(self, "autofill_button"):
+            self.autofill_button.grid_remove()
+        if hasattr(self, "autofill_controls_frame"):
+            self.autofill_pause_button.configure(
+                text="暂停",
+                state="normal",
+                command=self._on_autofill_pause_toggle,
+            )
+            self.autofill_exit_button.configure(
+                text="退出",
+                state="normal",
+                command=self._on_autofill_exit,
+            )
+            self.autofill_controls_frame.grid(
+                row=2, column=0, sticky="ew", pady=(10, 0)
+            )
+        self._lock_ui_for_autofill()
+
+    def _restore_autofill_button(self):
+        """Restore the original autofill CTA after a run finishes or exits."""
+        self._unlock_ui_after_autofill()
+        self._autofill_control = None
+        self._autofill_exit_confirming = False
+        self._autofill_was_paused_before_exit = False
+        if hasattr(self, "autofill_controls_frame"):
+            self.autofill_controls_frame.grid_remove()
+        if hasattr(self, "autofill_pause_button"):
+            try:
+                self.autofill_pause_button.configure(
+                    text="暂停",
+                    state="normal",
+                    command=self._on_autofill_pause_toggle,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "autofill_exit_button"):
+            try:
+                self.autofill_exit_button.configure(
+                    text="退出",
+                    state="normal",
+                    command=self._on_autofill_exit,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "autofill_button"):
+            self.autofill_button.configure(state="normal")
+            self.autofill_button.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(state="normal")
+        self._update_autofill_button()
+
+    def _autofill_interactive_types(self) -> tuple:
+        types = [
+            customtkinter.CTkButton,
+            customtkinter.CTkEntry,
+            customtkinter.CTkTextbox,
+            customtkinter.CTkSwitch,
+            customtkinter.CTkCheckBox,
+            customtkinter.CTkSlider,
+            customtkinter.CTkComboBox,
+            customtkinter.CTkOptionMenu,
+            customtkinter.CTkSegmentedButton,
+        ]
+        return tuple(types)
+
+    def _widget_config_snapshot(self, widget, keys: tuple[str, ...]) -> dict:
+        snap: dict = {}
+        for key in keys:
+            try:
+                snap[key] = widget.cget(key)
+            except Exception:  # noqa: BLE001
+                pass
+        return snap
+
+    def _set_widget_tree_cursor(self, widget, cursor: str):
+        try:
+            widget.configure(cursor=cursor)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            children = widget.winfo_children()
+        except Exception:  # noqa: BLE001
+            return
+        for child in children:
+            self._set_widget_tree_cursor(child, cursor)
+
+    def _lock_step_tiles_chrome(self):
+        """Mute module tiles (fill, outline, badge, label) while autofill runs."""
+        for key, tile in getattr(self, "step_tiles", {}).items():
+            try:
+                tile.configure(
+                    fg_color=UI_LOCK_TILE_FG,
+                    border_color=UI_LOCK_TILE_FG,
+                    border_width=0,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            for child in tile.winfo_children():
+                try:
+                    if isinstance(child, customtkinter.CTkFrame):
+                        child.configure(fg_color=UI_LOCK_BADGE_FG)
+                        for sub in child.winfo_children():
+                            if isinstance(sub, customtkinter.CTkLabel):
+                                sub.configure(text_color=("#ffffff", "#ffffff"))
+                    elif isinstance(child, customtkinter.CTkLabel):
+                        child.configure(text_color=UI_LOCK_LABEL)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._set_widget_tree_cursor(tile, "")
+
+    def _unlock_step_tiles_chrome(self):
+        for key, tile in getattr(self, "step_tiles", {}).items():
+            for child in tile.winfo_children():
+                try:
+                    if isinstance(child, customtkinter.CTkFrame):
+                        child.configure(fg_color=ACTIVE_OUTLINE)
+                        for sub in child.winfo_children():
+                            if isinstance(sub, customtkinter.CTkLabel):
+                                sub.configure(text_color=("#ffffff", "#ffffff"))
+                    elif isinstance(child, customtkinter.CTkLabel):
+                        child.configure(text_color=SECONDARY_BTN_TEXT)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._set_widget_tree_cursor(tile, "hand2")
+        self._update_step_tiles(self._current_step)
+
+    def _keep_autofill_run_controls_active(self):
+        """Pause/Exit must stay full-color and clickable during the UI lock."""
+        if hasattr(self, "autofill_pause_button"):
+            try:
+                self.autofill_pause_button.configure(
+                    state="normal",
+                    fg_color=SECONDARY_BTN_FG,
+                    hover_color=SECONDARY_BTN_HOVER,
+                    text_color=SECONDARY_BTN_TEXT,
+                    border_width=0,
+                )
+                self._style_primary_action_button(self.autofill_pause_button)
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "autofill_exit_button"):
+            try:
+                self.autofill_exit_button.configure(
+                    state="normal",
+                    fg_color=DANGER_BTN_FG,
+                    hover_color=DANGER_BTN_HOVER,
+                    text_color=DANGER_BTN_TEXT,
+                    border_width=0,
+                )
+                self._style_primary_action_button(self.autofill_exit_button)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _lock_ui_for_autofill(self):
+        """Grey out / disable interactables; keep 暂停 / 退出 enabled."""
+        self._unlock_ui_after_autofill(reapply_intent=False)
+        try:
+            self.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
+
+        allow = set()
+        for name in ("autofill_pause_button", "autofill_exit_button"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                allow.add(widget)
+
+        # Same locked look as validated / removed certificates.
+        self._set_review_fields_locked(True)
+
+        field_widgets = set()
+        if hasattr(self, "field_entries"):
+            field_widgets = set(self.field_entries.values())
+
+        disabled: list = []
+        interactive = self._autofill_interactive_types()
+        button_keys = (
+            "state",
+            "fg_color",
+            "hover_color",
+            "text_color",
+            "border_color",
+            "border_width",
+        )
+        plain_keys = ("state",)
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                walk(child)
+            if widget in allow or widget in field_widgets:
+                return
+            if not isinstance(widget, interactive):
+                return
+            try:
+                current = str(widget.cget("state"))
+            except Exception:  # noqa: BLE001
+                current = "normal"
+            if current == "disabled":
+                # Still force-grey colored buttons that were already disabled
+                # with a vivid fg_color (批准 / 移除 after style refresh).
+                if not isinstance(widget, customtkinter.CTkButton):
+                    return
+            try:
+                if isinstance(widget, customtkinter.CTkButton):
+                    snap = self._widget_config_snapshot(widget, button_keys)
+                    widget.configure(
+                        state="disabled",
+                        fg_color=UI_LOCK_BTN_FG,
+                        hover_color=UI_LOCK_BTN_FG,
+                        text_color=UI_LOCK_BTN_TEXT,
+                        border_width=0,
+                    )
+                else:
+                    snap = self._widget_config_snapshot(widget, plain_keys)
+                    widget.configure(state="disabled")
+                disabled.append((widget, snap))
+            except Exception:  # noqa: BLE001
+                pass
+
+        walk(self)
+        self._autofill_disabled_widgets = disabled
+
+        self._autofill_ui_chrome_locked = True
+        self._lock_step_tiles_chrome()
+        self._hide_doc_name_tip()
+        self._clear_doc_row_hovers()
+        self._highlight_selected_doc()
+        if hasattr(self, "doc_list_frame"):
+            try:
+                self.doc_list_frame._scrollbar.grid_remove()
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_widget_tree_cursor(self.doc_list_frame, "")
+
+        self._keep_autofill_run_controls_active()
+
+    def _unlock_ui_after_autofill(self, *, reapply_intent: bool = True):
+        for item in self._autofill_disabled_widgets:
+            if isinstance(item, tuple):
+                widget, snap = item
+            else:
+                widget, snap = item, {"state": "normal"}
+            try:
+                if widget.winfo_exists() and snap:
+                    widget.configure(**snap)
+            except Exception:  # noqa: BLE001
+                pass
+        self._autofill_disabled_widgets = []
+
+        was_chrome_locked = self._autofill_ui_chrome_locked
+        self._autofill_ui_chrome_locked = False
+        if was_chrome_locked:
+            self._unlock_step_tiles_chrome()
+            if hasattr(self, "doc_list_frame"):
+                self._set_widget_tree_cursor(self.doc_list_frame, "hand2")
+            self._highlight_selected_doc()
+            self._schedule_doc_list_scrollbar_sync()
+
+        if not reapply_intent:
+            return
+
+        # Re-apply intentional disabled states / colors.
+        try:
+            self._update_review_fields_state()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._update_extract_ocr_ui()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._update_review_cert_status()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._update_settings_button(self._current_step == "settings")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._restyle_primary_action_buttons()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_autofill_pause_toggle(self):
+        control = self._autofill_control
+        if control is None or not self._autofill_busy:
+            return
+        if control.is_paused():
+            control.resume()
+            try:
+                self.autofill_pause_button.configure(text="暂停", state="normal")
+            except Exception:  # noqa: BLE001
+                pass
+            self.append_autofill_log("已继续自动填写")
+            self.set_status("自动填写已继续")
+        else:
+            control.pause()
+            try:
+                self.autofill_pause_button.configure(text="继续", state="normal")
+            except Exception:  # noqa: BLE001
+                pass
+            self.append_autofill_log("已暂停自动填写")
+            self.set_status("自动填写已暂停")
+
+    def _on_autofill_exit(self):
+        """Pause first, then ask for confirmation via toast before actually exiting."""
+        control = self._autofill_control
+        if control is None or not self._autofill_busy:
+            return
+        if control.cancelled():
+            return
+        if self._autofill_exit_confirming:
+            return
+
+        self._autofill_was_paused_before_exit = control.is_paused()
+        if not control.is_paused():
+            control.pause()
+            try:
+                self.autofill_pause_button.configure(text="继续")
+            except Exception:  # noqa: BLE001
+                pass
+            self.append_autofill_log("已暂停（等待确认退出）")
+
+        self._autofill_exit_confirming = True
+        self.set_status("确认是否退出自动填写…")
+        self.show_toast(
+            "自动填写已暂停。确认退出将结束本次填写；取消则继续。",
+            title="退出自动填写",
+            action_text="确认退出",
+            undo_text="取消",
+            on_undo=self._cancel_autofill_exit,
+            on_complete=self._confirm_autofill_exit,
+            duration_ms=TOAST_DEFAULT_MS,
+            style="danger",
+        )
+
+    def _cancel_autofill_exit(self):
+        """User declined exit — resume unless they were already paused."""
+        self._autofill_exit_confirming = False
+        control = self._autofill_control
+        if control is None or not self._autofill_busy or control.cancelled():
+            return
+        if self._autofill_was_paused_before_exit:
+            try:
+                self.autofill_pause_button.configure(text="继续")
+            except Exception:  # noqa: BLE001
+                pass
+            self.append_autofill_log("已取消退出，保持暂停")
+            self.set_status("自动填写已暂停")
+            return
+        control.resume()
+        try:
+            self.autofill_pause_button.configure(text="暂停")
+        except Exception:  # noqa: BLE001
+            pass
+        self.append_autofill_log("已取消退出，继续自动填写")
+        self.set_status("自动填写已继续")
+
+    def _confirm_autofill_exit(self):
+        """Confirmed exit (button or toast countdown)."""
+        self._autofill_exit_confirming = False
+        control = self._autofill_control
+        if control is None or not self._autofill_busy:
+            return
+        if control.cancelled():
+            return
+        control.request_exit()
+        try:
+            self.autofill_pause_button.configure(state="disabled")
+            self.autofill_exit_button.configure(text="退出中…", state="disabled")
+        except Exception:  # noqa: BLE001
+            pass
+        self.append_autofill_log("正在退出自动填写…", error=True)
+        self.set_status("正在退出自动填写…")
+        # Safety net: if the worker never returns, restore controls anyway.
+        self.after(8000, self._autofill_exit_watchdog)
+
+    def _autofill_exit_watchdog(self):
+        if not self._autofill_busy:
+            return
+        control = self._autofill_control
+        if control is None or not control.cancelled():
+            return
+        self.append_autofill_log("退出超时，已强制恢复按钮", error=True)
+        self._autofill_busy = False
+        self._autofill_exit_confirming = False
+        self._restore_autofill_button()
+        self.finish_autofill_log(ok=False)
+        self.show_toast("自动填写退出超时，已恢复界面。", title="导出并自动填写")
 
     def _save_fields_before_navigate(self):
         if (
@@ -3760,6 +4536,9 @@ class App(customtkinter.CTk):
         self.show_step(target)
 
     def _on_open_settings(self):
+        if self._autofill_busy:
+            self.set_status("自动填写进行中，请先暂停或退出…")
+            return
         if self._current_step != "settings":
             self._step_before_settings = self._current_step
         self.show_step("settings")
@@ -3842,6 +4621,7 @@ class App(customtkinter.CTk):
                 self._load_approve_fields_for_current()
                 return
         self._update_review_cert_status()
+        self._refresh_doc_list_marks()
 
     def _on_toggle_remove_entry(self):
         path = self._current_cert_path()
@@ -3853,6 +4633,7 @@ class App(customtkinter.CTk):
             self._removed_paths.discard(path)
             self._update_autofill_button()
             self._load_approve_fields_for_current()
+            self._refresh_doc_list_marks()
             name = Path(path).name
             msg = f"已撤销移除 · {name}"
             self.set_status(msg)
@@ -3867,6 +4648,7 @@ class App(customtkinter.CTk):
             self._autofill_queue.remove(path)
         self._update_autofill_button()
         self._update_review_cert_status()
+        self._refresh_doc_list_marks()
         name = Path(path).name
         msg = f"已移出核对队列 · {name}"
         self.set_status(msg)
@@ -3919,10 +4701,14 @@ class App(customtkinter.CTk):
             return
 
         self._autofill_busy = True
-        self.autofill_button.configure(state="disabled")
-        if hasattr(self, "export_excel_button"):
-            self.export_excel_button.configure(state="disabled")
+        self._autofill_control = AutofillControl()
+        self._show_autofill_run_controls()
+        export_msg = f"已导出 {len(excel_rows)} 份到 exports/{excel_path.name}"
+        start_msg = f"开始自动填写 {len(items)} 份…"
         self.set_status(f"自动填写开始：{len(items)} 份 → {excel_path.name}")
+        self.show_success_toast(export_msg, title="导出 Excel")
+        self.show_success_toast(start_msg, title="自动填写")
+        self.open_autofill_log()
 
         username, password = self._eams_credentials()
         if not username or not password:
@@ -3932,6 +4718,8 @@ class App(customtkinter.CTk):
                 save_credentials(username, password)
             except Exception:  # noqa: BLE001
                 pass
+
+        control = self._autofill_control
 
         def worker():
             try:
@@ -3944,9 +4732,10 @@ class App(customtkinter.CTk):
                     password=password,
                     batch_import=True,
                     fill_details=True,
-                    upload_pdf=True,
+                    upload_pdf=True,  # compulsory: corresponding PDF always uploaded
                     submit_workflow=False,
                     status=lambda msg: self.after(0, lambda m=msg: self._on_autofill_progress(m)),
+                    control=control,
                 )
                 self.after(0, lambda: self._on_autofill_done(report, excel_path))
             except Exception as exc:  # noqa: BLE001
@@ -3954,39 +4743,145 @@ class App(customtkinter.CTk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_autofill_progress(self, message: str):
-        self.set_status(message)
+    def _on_autofill_progress(self, message: str, *, duration_ms: int | None = None):
+        del duration_ms  # Kept for call-site compat; lines live in the terminal panel.
+        self.append_autofill_log(
+            message,
+            error=message.startswith("失败"),
+        )
+
+    def _on_test_toast_stack(self):
+        """Replay the real export + autofill click/status sequence in the terminal panel."""
+        excel_name = "vincert_batch_demo.xlsx"
+        serial = "DEMO-001"
+        pdf_name = "demo_cert.pdf"
+        # Same order as _on_master_autofill + run_mas_autofill button clicks / status.
+        steps = [
+            f"已导出 1 份到 exports/{excel_name}",
+            "开始自动填写 1 份…",
+            "正在启动浏览器…",
+            "打开 EAMS…",
+            "正在自动填写登录信息…",
+            "点击「登录」",
+            "等待登录完成…",
+            "EAMS 登录成功",
+            "进入「计量器具结果录入」…",
+            "点击「计量器具结果录入」",
+            f"批量导入 Excel：{excel_name}",
+            "点击「批量导入计量结果」",
+            f"选择文件：{excel_name}",
+            "点击「确定」",
+            "点击「关闭」",
+            f"填写第 1/1 份：{serial}",
+            f"点击「{serial}」",
+            "比对「计量器具编号」：证书=DEMO-001 · 网页=DEMO-001",
+            "比对「制造厂」：证书=Demo厂 · 网页=Demo厂",
+            "比对字段一致",
+            "点击「检验方式」",
+            "点击「检定」",
+            "点击「本次检测日期」",
+            "点击「计量结果信息」",
+            "点击「上传附件」",
+            f"选择附件：{pdf_name}",
+            "点击「类型」",
+            "点击「证书」",
+            "点击「确定」",
+            f"已上传证书附件：{pdf_name}",
+            "自动化结束，正在关闭浏览器会话…",
+            f"自动填写完成 · {excel_name} · 导入Excel 是 · 填写 1 · 附件 1",
+        ]
+        gap_ms = 1200
+        export_msg = steps[0]
+        start_msg = steps[1]
+        self.show_success_toast(export_msg, title="导出 Excel")
+        self.show_success_toast(start_msg, title="自动填写")
+        self.open_autofill_log()
+        for i, message in enumerate(steps[2:]):
+            delay = (i + 1) * gap_ms
+            is_last = i == len(steps[2:]) - 1
+
+            def fire(msg=message, last=is_last):
+                self._on_autofill_progress(msg)
+                if last:
+                    self.finish_autofill_log(ok=True)
+
+            self.after(delay, fire)
+        self.set_status("已开始自动填写 Toast 流程测试")
 
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
-        if hasattr(self, "autofill_button"):
-            self.autofill_button.configure(state="normal")
-        if hasattr(self, "export_excel_button"):
-            self.export_excel_button.configure(state="normal")
+        self._restore_autofill_button()
+
+        quarantine = [
+            p
+            for p in (report.quarantine_paths or [])
+            if p in self._imported_files or p in self._autofill_queue
+        ]
+        # Unique while preserving order.
+        seen: set[str] = set()
+        quarantine_unique = []
+        for path in quarantine:
+            if path in seen:
+                continue
+            seen.add(path)
+            quarantine_unique.append(path)
+        moved = 0
+        if quarantine_unique:
+            moved = self._quarantine_failed_paths(quarantine_unique)
+            self._rebuild_doc_list()
+            self._update_cert_nav_labels()
+            self._update_autofill_button()
+            if self._imported_files:
+                select = (
+                    self._selected_path
+                    if self._selected_path in self._imported_files
+                    else self._imported_files[0]
+                )
+                self._select_document(select)
+            else:
+                self._selected_path = None
+                if hasattr(self, "field_entries"):
+                    self._clear_approve_fields()
+
         err_n = len(report.errors or [])
+        cancelled = bool(getattr(report, "cancelled", False))
         excel_note = f" · {excel_path.name}" if excel_path else ""
         summary = (
             f"自动填写完成{excel_note}"
             f" · 导入Excel {'是' if report.imported_excel else '否'}"
             f" · 填写 {report.filled} · 附件 {report.uploaded}"
         )
+        if cancelled:
+            summary = (
+                f"自动填写已退出{excel_note}"
+                f" · 填写 {report.filled} · 附件 {report.uploaded}"
+            )
+        if moved:
+            summary += f" · 移出失败 {moved} → {self._failed_items_dir_short()}/"
         if err_n:
             summary += f" · 失败 {err_n}"
             if report.errors:
                 summary += f"：{report.errors[0]}"
         self.set_status(summary)
-        if err_n:
-            self.show_toast(summary, title="导出并自动填写")
+        self.append_autofill_log(summary, error=err_n > 0 or cancelled or moved > 0)
+        self.finish_autofill_log(ok=err_n == 0 and moved == 0 and not cancelled)
+        if cancelled:
+            self.show_toast(
+                summary,
+                title="导出并自动填写",
+                duration_ms=TOAST_SUCCESS_MS,
+            )
+        elif err_n == 0 and moved == 0:
+            self.show_success_toast("Successfully done", title="自动填写")
         else:
-            self.show_success_toast(summary, title="导出并自动填写")
+            self.show_toast(summary, title="导出并自动填写")
 
     def _on_autofill_fail(self, message: str):
         self._autofill_busy = False
-        if hasattr(self, "autofill_button"):
-            self.autofill_button.configure(state="normal")
-        if hasattr(self, "export_excel_button"):
-            self.export_excel_button.configure(state="normal")
+        self._restore_autofill_button()
         self.set_status(f"自动填写失败：{message}")
+        self.append_autofill_log(f"自动填写失败：{message}", error=True)
+        self.finish_autofill_log(ok=False)
         self.show_toast(f"自动填写失败：{message}", title="导出并自动填写")
 
     def _export_rows(self) -> list[list[str]]:
@@ -4033,6 +4928,13 @@ class App(customtkinter.CTk):
         self.show_success_toast(msg, title="导出 Excel")
 
     def _on_close(self):
+        if self._autofill_busy:
+            self.show_toast(
+                "自动填写进行中，请先退出后再关闭窗口。",
+                title="自动填写",
+                duration_ms=TOAST_SUCCESS_MS,
+            )
+            return
         self.destroy()
 
 
