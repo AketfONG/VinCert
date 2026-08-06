@@ -204,8 +204,8 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.4"
-BUILD_DATE = "05/08/2026"
+BUILD_VERSION = "v0.4.1"
+BUILD_DATE = "06/08/2026"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
 FONT_BRAND = 22
@@ -1846,6 +1846,7 @@ class App(customtkinter.CTk):
         self.after(40, self._restyle_primary_action_buttons)
         if hasattr(self, "doc_list_frame"):
             self.after(40, self._schedule_doc_list_scrollbar_sync)
+            self.after(40, self._refresh_doc_list_fonts)
         self._schedule_active_page_vcenter(force=True)
 
     def _nudge_window_geometry_after_scale(self):
@@ -2745,7 +2746,10 @@ class App(customtkinter.CTk):
         return self._appearance_color(surface)
 
     def _doc_tk_font(self, size: int) -> tkfont.Font:
-        return tkfont.Font(family="SF Pro Text", size=size)
+        """Tk font scaled like CTk widgets (zoom 1.2× → larger doc-list text)."""
+        scale = self._widget_scaling_factor()
+        scaled = max(1, int(round(size * scale)))
+        return tkfont.Font(family="SF Pro Text", size=scaled)
 
     def _make_doc_text_canvas(
         self,
@@ -2758,8 +2762,9 @@ class App(customtkinter.CTk):
         anchor: str = "w",
     ) -> tuple[tk.Canvas, int]:
         """Plain Canvas text cell — no tk.Label, so macOS long-press has nothing to drag."""
+        scale = self._widget_scaling_factor()
         # Leave a few px so the parent CTkFrame rounded corners stay visible.
-        h = max(18, DOC_ROW_HEIGHT - 8)
+        h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
         canvas = tk.Canvas(
             parent,
             height=h,
@@ -2770,10 +2775,11 @@ class App(customtkinter.CTk):
             bg=self._doc_row_surface_bg("transparent"),
         )
         if width is not None:
-            canvas.configure(width=max(1, width))
+            canvas.configure(width=max(1, int(round(width * scale))))
         fill_color = self._appearance_color(fill)
         font = self._doc_tk_font(size)
-        x = (width // 2) if (width is not None and anchor == "center") else 10
+        pad_x = int(round(10 * scale)) if anchor != "center" else 0
+        x = (int(round(width * scale)) // 2) if (width is not None and anchor == "center") else pad_x
         text_id = canvas.create_text(
             x,
             h // 2,
@@ -2785,6 +2791,8 @@ class App(customtkinter.CTk):
         canvas._vincert_text_id = text_id
         canvas._vincert_anchor = anchor
         canvas._vincert_font = font
+        canvas._vincert_design_size = size
+        canvas._vincert_pad_x = pad_x
 
         def _on_configure(event, c=canvas, tid=text_id, anc=anchor):
             if event.width <= 1 or event.height <= 1:
@@ -2792,7 +2800,7 @@ class App(customtkinter.CTk):
             if anc == "center":
                 c.coords(tid, event.width / 2, event.height / 2)
             else:
-                c.coords(tid, 10, event.height / 2)
+                c.coords(tid, getattr(c, "_vincert_pad_x", 10), event.height / 2)
 
         canvas.bind("<Configure>", _on_configure, add="+")
         return canvas, text_id
@@ -2811,10 +2819,37 @@ class App(customtkinter.CTk):
         fill_color = self._appearance_color(fill)
         kwargs = {"text": text, "fill": fill_color}
         if size is not None:
+            canvas._vincert_design_size = size
             font = self._doc_tk_font(size)
             canvas._vincert_font = font
             kwargs["font"] = font
         canvas.itemconfigure(text_id, **kwargs)
+
+    def _refresh_doc_list_fonts(self):
+        """Re-apply scaled fonts/heights after UI zoom changes."""
+        if not self._doc_rows:
+            return
+        scale = self._widget_scaling_factor()
+        h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
+        pad_x = int(round(10 * scale))
+        mark_w = max(1, int(round(DOC_MARK_COL_WIDTH * scale)))
+        for path, row in self._doc_rows.items():
+            mark = row.get("mark")
+            name = row.get("name")
+            if mark is not None:
+                try:
+                    mark.configure(height=h, width=mark_w)
+                    mark._vincert_pad_x = 0
+                except Exception:  # noqa: BLE001
+                    pass
+            if name is not None:
+                try:
+                    name.configure(height=h)
+                    name._vincert_pad_x = pad_x
+                except Exception:  # noqa: BLE001
+                    pass
+        self._highlight_selected_doc()
+        self._schedule_doc_list_scrollbar_sync()
 
     def _set_doc_canvas_surface(self, canvas: tk.Canvas, surface) -> None:
         try:
