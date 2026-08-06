@@ -11,7 +11,9 @@ import sys
 import threading
 
 import customtkinter
+import tkinter as tk
 from tkinter import filedialog
+from tkinter import font as tkfont
 
 from vincert.models import CertificateFields, ParseResult
 from vincert.pipeline import parse_certificate
@@ -46,6 +48,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "ocr_enabled": True,
         "buttons_bold": True,
         "content_centering": True,
+        "status_dots": False,
         "failed_items_dir": str(DEFAULT_FAILED_ITEMS_DIR),
         "testing_mode": False,
         "demo_folder": "",
@@ -67,6 +70,8 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["buttons_bold"] = bool(data["buttons_bold"])
     if "content_centering" in data:
         out["content_centering"] = bool(data["content_centering"])
+    if "status_dots" in data:
+        out["status_dots"] = bool(data["status_dots"])
     if "failed_items_dir" in data and data["failed_items_dir"]:
         out["failed_items_dir"] = str(data["failed_items_dir"])
     if "testing_mode" in data:
@@ -121,6 +126,15 @@ def load_content_centering(path: Path | None = None) -> bool:
 
 def save_content_centering(enabled: bool, path: Path | None = None) -> Path:
     return save_ui_settings(content_centering=bool(enabled))
+
+
+def load_status_dots(path: Path | None = None) -> bool:
+    """Return True when approved/removed status uses red/green dots."""
+    return bool(load_ui_settings(path).get("status_dots", False))
+
+
+def save_status_dots(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(status_dots=bool(enabled))
 
 
 def load_failed_items_dir(path: Path | None = None) -> Path:
@@ -190,8 +204,8 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.4"
-BUILD_DATE = "05/08/2026"
+BUILD_VERSION = "v0.4.1"
+BUILD_DATE = "06/08/2026"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
 FONT_BRAND = 22
@@ -213,14 +227,26 @@ STEPS = [
 _theme = customtkinter.ThemeManager.theme
 APP_BG_COLOR = _theme["CTk"]["fg_color"]
 _theme_frame = _theme["CTkFrame"]
-EMBED_BG_COLOR = _theme_frame["fg_color"]
+_frame_fg = _theme_frame["fg_color"]
+_frame_top = _theme_frame["top_fg_color"]
+_dark_frame_fg = _frame_fg[1] if isinstance(_frame_fg, (tuple, list)) else _frame_fg
+_dark_frame_top = _frame_top[1] if isinstance(_frame_top, (tuple, list)) else _frame_top
+_theme_textbox = _theme.get("CTkTextbox", {})
+_textbox_fg = _theme_textbox.get("fg_color", ("#F9F9FA", "#1D1E1E"))
+if isinstance(_textbox_fg, (tuple, list)):
+    _dark_field_fg = _textbox_fg[1]
+else:
+    _dark_field_fg = _textbox_fg
+# Light mode: white surfaces for sidebar modules, doc panel, and fields.
+EMBED_BG_COLOR = ("#ffffff", _dark_frame_fg)
 ACTIVE_OUTLINE = ("#3b8ed0", "#1f6aa5")
-TILE_BG_NORMAL = _theme_frame["fg_color"]
-TILE_BG_HOVER = _theme_frame["top_fg_color"]
-TILE_BG_ACTIVE = ("gray72", "gray26")
+TILE_BG_NORMAL = ("#ffffff", _dark_frame_fg)
+TILE_BG_HOVER = ("#eef1f4", _dark_frame_top)
+TILE_BG_ACTIVE = ("#e3f0fa", "#343638")  # light blue wash / softer dark fill
 SECONDARY_BTN_FG = ("#c9d1d9", "#3d444b")
 SECONDARY_BTN_HOVER = ("#dde4eb", "#556068")
 SECONDARY_BTN_TEXT = ("gray10", "gray90")
+OUTLINE_BTN_HOVER = ("gray70", "gray30")
 PRIMARY_BTN_FG = ("#3B8ED0", "#1F6AA5")
 PRIMARY_BTN_HOVER = ("#5BA3DB", "#2E83C4")
 PRIMARY_BTN_TEXT = ("#DCE4EE", "#DCE4EE")
@@ -230,7 +256,10 @@ SUCCESS_BTN_TEXT = ("#ffffff", "#ffffff")
 DANGER_BTN_FG = ("#c0392b", "#c0392b")
 DANGER_BTN_HOVER = ("#e74c3c", "#e74c3c")
 DANGER_BTN_TEXT = ("#ffffff", "#ffffff")
-TOAST_BG = ("#2b2b2b", "#1a1a1a")
+TOAST_BG = ("#ffffff", "#1a1a1a")
+TOAST_TITLE_COLOR = ("gray10", "#ffffff")
+TOAST_MESSAGE_COLOR = ("gray30", "#f0f0f0")
+TOAST_PROGRESS_TRACK = ("#e5e5e5", "#2a2a2a")
 TOAST_WIDTH = 360  # compact fixed toast; do not stretch to ops column
 TOAST_PAD = 12
 TOAST_BTN_HEIGHT = 40
@@ -244,11 +273,16 @@ DOC_ROW_ACTIVE_TEXT = ("#ffffff", "#ffffff")
 # Index numbers at ~50% opacity (emoji marks stay full strength).
 DOC_MARK_NUMBER_COLOR = ("gray50", "gray50")
 DOC_MARK_NUMBER_ACTIVE = ("#9dc6e7", "#9fb5d2")  # white blended ~50% onto selected blue
+DOC_STATUS_DOT = "●"
+DOC_STATUS_DOT_OK = ("#2d8a4e", "#38a460")
+DOC_STATUS_DOT_BAD = ("#c0392b", "#e74c3c")
+DOC_STATUS_DOT_SIZE = FONT_BODY + 6
 DOC_ROW_HEIGHT = 36
 DOC_MARK_COL_WIDTH = 32
+DOC_NAME_TIP_PADX = 8
+DOC_NAME_TIP_PADY = 4
 RESULT_INFO_HEIGHT = 128  # ~4 taller entry rows
-_theme_textbox = _theme.get("CTkTextbox", {})
-FIELD_FG_COLOR = _theme_textbox.get("fg_color", ("#F9F9FA", "#1D1E1E"))
+FIELD_FG_COLOR = ("#ffffff", _dark_field_fg)
 FIELD_TEXT_COLOR = _theme_textbox.get("text_color", ("gray10", "#DCE4EE"))
 FIELD_FG_COLOR_DISABLED = ("gray90", "gray22")
 FIELD_TEXT_COLOR_DISABLED = ("gray55", "gray55")
@@ -316,6 +350,9 @@ class App(customtkinter.CTk):
         self._source_folder: str | None = None
         self._selected_path: str | None = None
         self._doc_rows: dict[str, dict] = {}
+        self._doc_hover_path: str | None = None
+        self._doc_name_tip: customtkinter.CTkFrame | None = None
+        self._doc_name_tip_path: str | None = None
         self._extract_busy = False
         self._autofill_busy = False
         self._toast_frame: customtkinter.CTkFrame | None = None
@@ -333,6 +370,7 @@ class App(customtkinter.CTk):
         self._ocr_enabled = load_ocr_enabled()
         self._buttons_bold = load_buttons_bold()
         self._content_centering = load_content_centering()
+        self._status_dots = load_status_dots()
         self._failed_items_dir = load_failed_items_dir()
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
@@ -723,8 +761,8 @@ class App(customtkinter.CTk):
             text="清空",
             height=SMALL_BTN_HEIGHT,
             corner_radius=UI_RADIUS,
-            fg_color=SECONDARY_BTN_FG,
-            hover_color=SECONDARY_BTN_HOVER,
+            fg_color=(SECONDARY_BTN_HOVER[0], SECONDARY_BTN_FG[1]),
+            hover_color=(SECONDARY_BTN_FG[0], SECONDARY_BTN_HOVER[1]),
             text_color=SECONDARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._clear_extract,
@@ -929,19 +967,115 @@ class App(customtkinter.CTk):
         self._sync_pinned_page_vcenter(frame)
 
     def _measure_scrollable_inner_height(self, scrollable) -> int:
-        """Pixel height of scrollable inner content (bbox; no y-reset)."""
+        """Pixel height of scrollable inner content (window offset ignored)."""
+        try:
+            # reqheight is independent of canvas y-offset (avoids measure flicker).
+            need = int(scrollable.winfo_reqheight())
+            if need > 1:
+                return need
+        except Exception:  # noqa: BLE001
+            pass
         try:
             canvas = scrollable._parent_canvas
+            window_id = getattr(scrollable, "_create_window_id", None)
+            if window_id is not None:
+                canvas.coords(window_id, 0, 0)
             scrollable.update_idletasks()
             bbox = canvas.bbox("all")
             if bbox is None:
-                return max(int(scrollable.winfo_reqheight()), 1)
+                return 1
             return max(1, int(bbox[3] - bbox[1]))
         except Exception:  # noqa: BLE001
+            return 1
+
+    def _settings_content_fits(self, avail: int, need: int) -> bool:
+        return need <= avail + 1
+
+    def _apply_settings_fits_chrome(
+        self,
+        content,
+        *,
+        center: bool,
+        avail: int,
+        need: int,
+    ) -> None:
+        """Hide scrollbar + lock scrollregion when settings content fits.
+
+        CTkScrollableFrame's Configure handler sets scrollregion=bbox("all").
+        After small→fullscreen, a leftover y-offset bbox makes the thumb sit in
+        the middle of the content. Use a canvas-sized scrollregion instead.
+        """
+        canvas = content._parent_canvas
+        scrollbar = content._scrollbar
+        window_id = getattr(content, "_create_window_id", None)
+        try:
+            scrollbar.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+        y_off = max(0, (avail - need) // 2) if center else 0
+        if window_id is not None:
             try:
-                return max(int(scrollable.winfo_reqheight()), 1)
+                cur = canvas.coords(window_id)
             except Exception:  # noqa: BLE001
-                return 1
+                cur = None
+            want = [0.0, float(y_off)]
+            if cur is None or len(cur) < 2 or abs(cur[0] - want[0]) > 0.5 or abs(cur[1] - want[1]) > 0.5:
+                canvas.coords(window_id, 0, y_off)
+        content.update_idletasks()
+        cw = max(int(canvas.winfo_width()), 1)
+        ch = max(int(canvas.winfo_height()), avail, 1)
+        try:
+            current_region = canvas.cget("scrollregion")
+        except Exception:  # noqa: BLE001
+            current_region = ""
+        desired = f"0 0 {cw} {ch}"
+        # Avoid redundant configure calls that retrigger CTk Configure.
+        if str(current_region).replace(",", " ") != desired:
+            canvas.configure(scrollregion=(0, 0, cw, ch))
+        canvas.yview_moveto(0)
+
+    def _repair_settings_scroll_after_resize(self, _event=None):
+        """Idle repair for settings after window grow / fullscreen (no tight loop)."""
+        if getattr(self, "_current_step", None) != "settings":
+            return
+        frame = getattr(self, "step_views", {}).get("settings")
+        if frame is None:
+            return
+        meta = getattr(frame, "_vcenter_meta", None)
+        if not meta or not meta.get("scrollable"):
+            return
+        content = meta.get("content")
+        middle = meta.get("middle")
+        if content is None or middle is None:
+            return
+        try:
+            if not frame.winfo_ismapped():
+                return
+            avail = max(int(middle.winfo_height()), 1)
+            if avail < 48:
+                return
+            need = self._measure_scrollable_inner_height(content)
+            if not self._settings_content_fits(avail, need):
+                return
+            center = bool(self._content_centering)
+            meta["centered"] = center
+            self._apply_settings_fits_chrome(
+                content, center=center, avail=avail, need=need
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _schedule_settings_scroll_repair(self, _event=None):
+        after_id = getattr(self, "_settings_scroll_repair_after", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:  # noqa: BLE001
+                pass
+        # Debounced: catches CTk's scrollregion=bbox overwrite after fullscreen.
+        self._settings_scroll_repair_after = self.after(
+            80, self._repair_settings_scroll_after_resize
+        )
 
     def _sync_settings_scroll_vcenter(self, parent: customtkinter.CTkFrame):
         """Settings: fill the page; center via canvas offset when no bar needed.
@@ -974,41 +1108,30 @@ class App(customtkinter.CTk):
                 return
 
             need = self._measure_scrollable_inner_height(content)
-            center = bool(self._content_centering) and need <= avail + 1
+            fits = self._settings_content_fits(avail, need)
+            center = bool(self._content_centering) and fits
             sig = (avail, need, center, bool(self._content_centering))
             if sig == meta.get("layout_sig"):
+                # Same layout math, but small→fullscreen can leave a mapped bar
+                # or a corrupted scrollregion — repair fits chrome only.
+                if fits:
+                    self._apply_settings_fits_chrome(
+                        content, center=center, avail=avail, need=need
+                    )
                 return
             meta["layout_sig"] = sig
             meta["centered"] = center
 
             canvas = content._parent_canvas
-            scrollbar = content._scrollbar
             window_id = getattr(content, "_create_window_id", None)
 
-            if center:
-                scrollbar.grid_remove()
-                y_off = max(0, (avail - need) // 2)
-                if window_id is not None:
-                    canvas.coords(window_id, 0, y_off)
-                content.update_idletasks()
-                bbox = canvas.bbox("all")
-                if bbox is not None:
-                    _x1, _y1, x2, y2 = bbox
-                    canvas.configure(
-                        scrollregion=(
-                            0,
-                            0,
-                            max(0, x2),
-                            max(avail, y_off + need),
-                        )
-                    )
-                canvas.yview_moveto(0)
+            if fits:
+                self._apply_settings_fits_chrome(
+                    content, center=center, avail=avail, need=need
+                )
+                self._schedule_settings_scroll_repair()
             else:
-                # Top-align (overflow, or centering disabled).
-                if need <= avail + 1:
-                    scrollbar.grid_remove()
-                else:
-                    content._create_grid()
+                # Overflow: top-align and show scrollbar.
                 if window_id is not None:
                     canvas.coords(window_id, 0, 0)
                 content.update_idletasks()
@@ -1018,6 +1141,7 @@ class App(customtkinter.CTk):
                     canvas.configure(
                         scrollregion=(0, 0, max(0, x2), max(0, y2 - _y1))
                     )
+                content._create_grid()
                 canvas.yview_moveto(0)
         except Exception:  # noqa: BLE001
             pass
@@ -1169,6 +1293,14 @@ class App(customtkinter.CTk):
         self.settings_scroll.grid_columnconfigure(0, weight=1)
         meta["content"] = self.settings_scroll
         meta["scrollable"] = True
+        # After small→fullscreen, CTk overwrites scrollregion with an offset bbox.
+        # Debounced repair only — not a tight Configure loop.
+        self.settings_scroll.bind(
+            "<Configure>", self._schedule_settings_scroll_repair, add="+"
+        )
+        self.settings_scroll._parent_canvas.bind(
+            "<Configure>", self._schedule_settings_scroll_repair, add="+"
+        )
 
         content = self.settings_scroll
         self._bind_scrollable_mousewheel(self.settings_scroll, self.settings_scroll)
@@ -1246,21 +1378,8 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
         ).grid(row=7, column=0, sticky="ew", pady=(24, 8))
 
-        # Full-width descriptions (avoid 2-col collision), then switches.
-        self._track_content_wrap(
-            customtkinter.CTkLabel(
-                content,
-                text="放大后字体与控件更大；切换后立即生效。关闭 OCR 后改为移出未解析/失败证书，并隐藏进度条。关闭按钮加粗后所有按钮使用常规字重。关闭内容居中后各页内容顶对齐。",
-                anchor="w",
-                font=customtkinter.CTkFont(size=FONT_BODY),
-                text_color="gray60",
-                wraplength=CONTENT_WRAP,
-                justify="left",
-            )
-        ).grid(row=8, column=0, sticky="ew", pady=(0, 8))
-
         switches_row = customtkinter.CTkFrame(content, fg_color="transparent")
-        switches_row.grid(row=9, column=0, sticky="ew", pady=(0, 16))
+        switches_row.grid(row=8, column=0, sticky="ew", pady=(0, 16))
         switches_row.grid_columnconfigure((0, 1), weight=1, uniform="settings_switches")
 
         self.ui_zoom_switch = customtkinter.CTkSwitch(
@@ -1312,6 +1431,18 @@ class App(customtkinter.CTk):
         self.content_centering_switch.grid(
             row=1, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
         )
+
+        self.status_dots_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="图标样式",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._status_dots:
+            self.status_dots_switch.select()
+        else:
+            self.status_dots_switch.deselect()
+        self.status_dots_switch.configure(command=self._on_status_dots_toggle)
+        self.status_dots_switch.grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(10, 0))
 
         customtkinter.CTkLabel(
             content,
@@ -1589,11 +1720,20 @@ class App(customtkinter.CTk):
     def _on_content_centering_toggle(self):
         self._apply_content_centering(bool(self.content_centering_switch.get()))
 
+    def _on_status_dots_toggle(self):
+        self._apply_status_dots(bool(self.status_dots_switch.get()))
+
     def _apply_content_centering(self, enabled: bool):
         self._content_centering = enabled
         save_content_centering(enabled)
         self._schedule_active_page_vcenter(force=True)
         self.set_status("已开启内容居中" if enabled else "已关闭内容居中")
+
+    def _apply_status_dots(self, enabled: bool):
+        self._status_dots = enabled
+        save_status_dots(enabled)
+        self._refresh_doc_list_marks()
+        self.set_status("已使用圆点图标" if enabled else "已使用表情图标")
 
     def _apply_buttons_bold(self, bold: bool):
         self._buttons_bold = bold
@@ -1706,6 +1846,7 @@ class App(customtkinter.CTk):
         self.after(40, self._restyle_primary_action_buttons)
         if hasattr(self, "doc_list_frame"):
             self.after(40, self._schedule_doc_list_scrollbar_sync)
+            self.after(40, self._refresh_doc_list_fonts)
         self._schedule_active_page_vcenter(force=True)
 
     def _nudge_window_geometry_after_scale(self):
@@ -1799,7 +1940,7 @@ class App(customtkinter.CTk):
             text=title,
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_TITLE, weight="bold"),
-            text_color=("#ffffff", "#ffffff"),
+            text_color=TOAST_TITLE_COLOR,
         ).grid(row=0, column=0, sticky="ew")
 
         seconds = max(1, int(round(duration_ms / 1000)))
@@ -1820,12 +1961,13 @@ class App(customtkinter.CTk):
             justify="left",
             wraplength=max(120, toast_w - 36),
             font=customtkinter.CTkFont(size=FONT_ENTRY),
-            text_color=("#f0f0f0", "#f0f0f0"),
+            text_color=TOAST_MESSAGE_COLOR,
         ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 12))
 
         progress = customtkinter.CTkProgressBar(
             toast,
             height=10,
+            fg_color=TOAST_PROGRESS_TRACK,
             progress_color=accent,
         )
         progress.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
@@ -2566,12 +2708,21 @@ class App(customtkinter.CTk):
         self.set_status(f"OCR 失败：{message}")
         self.show_toast(f"OCR 失败：{message}", title="OCR提取")
 
-    def _doc_status_mark(self, path: str) -> str:
+    def _doc_status_kind(self, path: str) -> str:
+        """Return 'bad', 'ok', or '' for document list status indicators."""
         if path in self._removed_paths:
-            return "❌"
+            return "bad"
         if path in self._autofill_queue:
-            return "✅"
+            return "ok"
         return ""
+
+    def _doc_status_mark(self, path: str) -> str:
+        kind = self._doc_status_kind(path)
+        if not kind:
+            return ""
+        if self._status_dots:
+            return DOC_STATUS_DOT
+        return "❌" if kind == "bad" else "✅"
 
     def _doc_leading_label(self, path: str, index: int) -> str:
         """Left column: status emoji overrides the index number when present."""
@@ -2581,8 +2732,275 @@ class App(customtkinter.CTk):
     def _doc_name_label(self, path: str, index: int) -> str:
         return Path(path).name
 
+    def _appearance_color(self, color) -> str:
+        """Resolve a CTk (light, dark) color tuple for the current mode."""
+        if isinstance(color, (tuple, list)) and len(color) >= 2:
+            mode = customtkinter.get_appearance_mode()
+            return color[1] if str(mode).lower() == "dark" else color[0]
+        return str(color)
+
+    def _doc_row_surface_bg(self, surface) -> str:
+        """Solid bg for canvas cells — never leave system default (black/white flash)."""
+        if surface is None or surface == "transparent":
+            return self._appearance_color(EMBED_BG_COLOR)
+        return self._appearance_color(surface)
+
+    def _doc_tk_font(self, size: int) -> tkfont.Font:
+        """Tk font scaled like CTk widgets (zoom 1.2× → larger doc-list text)."""
+        scale = self._widget_scaling_factor()
+        scaled = max(1, int(round(size * scale)))
+        return tkfont.Font(family="SF Pro Text", size=scaled)
+
+    def _make_doc_text_canvas(
+        self,
+        parent,
+        *,
+        text: str,
+        fill,
+        size: int,
+        width: int | None = None,
+        anchor: str = "w",
+    ) -> tuple[tk.Canvas, int]:
+        """Plain Canvas text cell — no tk.Label, so macOS long-press has nothing to drag."""
+        scale = self._widget_scaling_factor()
+        # Leave a few px so the parent CTkFrame rounded corners stay visible.
+        h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
+        canvas = tk.Canvas(
+            parent,
+            height=h,
+            highlightthickness=0,
+            bd=0,
+            relief="flat",
+            cursor="hand2",
+            bg=self._doc_row_surface_bg("transparent"),
+        )
+        if width is not None:
+            canvas.configure(width=max(1, int(round(width * scale))))
+        fill_color = self._appearance_color(fill)
+        font = self._doc_tk_font(size)
+        pad_x = int(round(10 * scale)) if anchor != "center" else 0
+        x = (int(round(width * scale)) // 2) if (width is not None and anchor == "center") else pad_x
+        text_id = canvas.create_text(
+            x,
+            h // 2,
+            text=text,
+            fill=fill_color,
+            font=font,
+            anchor="center" if anchor == "center" else "w",
+        )
+        canvas._vincert_text_id = text_id
+        canvas._vincert_anchor = anchor
+        canvas._vincert_font = font
+        canvas._vincert_design_size = size
+        canvas._vincert_pad_x = pad_x
+
+        def _on_configure(event, c=canvas, tid=text_id, anc=anchor):
+            if event.width <= 1 or event.height <= 1:
+                return
+            if anc == "center":
+                c.coords(tid, event.width / 2, event.height / 2)
+            else:
+                c.coords(tid, getattr(c, "_vincert_pad_x", 10), event.height / 2)
+
+        canvas.bind("<Configure>", _on_configure, add="+")
+        return canvas, text_id
+
+    def _set_doc_canvas_text(
+        self,
+        canvas: tk.Canvas,
+        text: str,
+        *,
+        fill,
+        size: int | None = None,
+    ) -> None:
+        text_id = getattr(canvas, "_vincert_text_id", None)
+        if text_id is None:
+            return
+        fill_color = self._appearance_color(fill)
+        kwargs = {"text": text, "fill": fill_color}
+        if size is not None:
+            canvas._vincert_design_size = size
+            font = self._doc_tk_font(size)
+            canvas._vincert_font = font
+            kwargs["font"] = font
+        canvas.itemconfigure(text_id, **kwargs)
+
+    def _refresh_doc_list_fonts(self):
+        """Re-apply scaled fonts/heights after UI zoom changes."""
+        if not self._doc_rows:
+            return
+        scale = self._widget_scaling_factor()
+        h = max(18, int(round((DOC_ROW_HEIGHT - 8) * scale)))
+        pad_x = int(round(10 * scale))
+        mark_w = max(1, int(round(DOC_MARK_COL_WIDTH * scale)))
+        for path, row in self._doc_rows.items():
+            mark = row.get("mark")
+            name = row.get("name")
+            if mark is not None:
+                try:
+                    mark.configure(height=h, width=mark_w)
+                    mark._vincert_pad_x = 0
+                except Exception:  # noqa: BLE001
+                    pass
+            if name is not None:
+                try:
+                    name.configure(height=h)
+                    name._vincert_pad_x = pad_x
+                except Exception:  # noqa: BLE001
+                    pass
+        self._highlight_selected_doc()
+        self._schedule_doc_list_scrollbar_sync()
+
+    def _set_doc_canvas_surface(self, canvas: tk.Canvas, surface) -> None:
+        try:
+            canvas.configure(bg=self._doc_row_surface_bg(surface))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _is_doc_name_truncated(self, row: dict) -> bool:
+        """True when the visible name canvas width crops the full filename."""
+        try:
+            canvas = row["name"]
+            canvas.update_idletasks()
+            visible = int(canvas.winfo_width())
+            if visible <= 1:
+                return False
+            font = getattr(canvas, "_vincert_font", None)
+            text = row.get("full_name") or ""
+            if font is not None:
+                needed = int(font.measure(text))
+            else:
+                bbox = canvas.bbox(row["name_id"])
+                needed = int(bbox[2] - bbox[0]) if bbox else 0
+            return needed > visible - 4
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _hide_doc_name_tip(self):
+        tip = self._doc_name_tip
+        self._doc_name_tip = None
+        self._doc_name_tip_path = None
+        if tip is None:
+            return
+        try:
+            tip.place_forget()
+            tip.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _clear_doc_row_hovers(self, *, keep: str | None = None):
+        """Clear sticky hover washes; optionally keep one path hovered."""
+        for path, row in self._doc_rows.items():
+            if path == keep or path == self._selected_path:
+                continue
+            try:
+                row["frame"].configure(fg_color="transparent")
+                self._sync_doc_row_surfaces(path, "transparent")
+            except Exception:  # noqa: BLE001
+                pass
+        self._doc_hover_path = keep
+
+    def _show_doc_name_tip(self, path: str):
+        row = self._doc_rows.get(path)
+        if row is None:
+            self._hide_doc_name_tip()
+            return
+        name_canvas = row["name"]
+        full_name = row.get("full_name") or self._doc_name_label(path, row.get("index", 0))
+        if not self._is_doc_name_truncated(row):
+            if self._doc_name_tip_path == path:
+                self._hide_doc_name_tip()
+            return
+        if self._doc_name_tip_path == path and self._doc_name_tip is not None:
+            return
+
+        self._hide_doc_name_tip()
+        selected = path == self._selected_path
+        tip = customtkinter.CTkFrame(
+            self,
+            corner_radius=UI_RADIUS,
+            fg_color=DOC_ROW_ACTIVE if selected else TOAST_BG,
+            border_width=0 if selected else TOAST_BORDER_WIDTH,
+            border_color=ACTIVE_OUTLINE,
+        )
+        label = customtkinter.CTkLabel(
+            tip,
+            text=full_name,
+            anchor="w",
+            justify="left",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+            text_color=DOC_ROW_ACTIVE_TEXT if selected else TOAST_TITLE_COLOR,
+            fg_color="transparent",
+        )
+        label.pack(padx=DOC_NAME_TIP_PADX, pady=DOC_NAME_TIP_PADY)
+
+        tip.bind("<Leave>", lambda _e, p=path: self._on_doc_name_tip_leave(p))
+        label.bind("<Leave>", lambda _e, p=path: self._on_doc_name_tip_leave(p))
+        tip.bind("<ButtonPress-1>", lambda _e, p=path: self._on_doc_row_press(p))
+        label.bind("<ButtonPress-1>", lambda _e, p=path: self._on_doc_row_press(p))
+
+        tip.update_idletasks()
+        scale = self._widget_scaling_factor()
+        tip_w = max(1, int(round(tip.winfo_reqwidth() / scale)))
+        tip_h = max(1, int(round(tip.winfo_reqheight() / scale)))
+        tip.configure(width=tip_w, height=tip_h)
+
+        root_x = self.winfo_rootx()
+        root_y = self.winfo_rooty()
+        x = int(round((name_canvas.winfo_rootx() - root_x) / scale))
+        y = int(round((name_canvas.winfo_rooty() - root_y) / scale))
+        win_w = max(1, int(round(self.winfo_width() / scale)))
+        win_h = max(1, int(round(self.winfo_height() / scale)))
+        x = max(DOC_SIDEBAR_MARGIN, min(x, win_w - tip_w - DOC_SIDEBAR_MARGIN))
+        y = max(DOC_SIDEBAR_MARGIN, min(y, win_h - tip_h - DOC_SIDEBAR_MARGIN))
+
+        tip.place(x=x, y=y, anchor="nw")
+        tip.lift()
+        self._doc_name_tip = tip
+        self._doc_name_tip_path = path
+        self._set_doc_row_hover(path, False)
+
+    def _on_doc_name_tip_leave(self, path: str):
+        row = self._doc_rows.get(path)
+        if row is not None:
+            frame = row["frame"]
+            try:
+                under = frame.winfo_containing(
+                    frame.winfo_pointerx(), frame.winfo_pointery()
+                )
+            except Exception:  # noqa: BLE001
+                under = None
+            if under is not None and self._is_descendant(under, frame):
+                return
+        tip = self._doc_name_tip
+        if tip is not None:
+            try:
+                under = tip.winfo_containing(tip.winfo_pointerx(), tip.winfo_pointery())
+            except Exception:  # noqa: BLE001
+                under = None
+            if under is not None and self._is_descendant(under, tip):
+                return
+        if self._doc_name_tip_path == path:
+            self._hide_doc_name_tip()
+        self._clear_doc_row_hovers()
+
+    def _sync_doc_row_surfaces(self, path: str, surface) -> None:
+        row = self._doc_rows.get(path)
+        if row is None:
+            return
+        for key in ("mark", "name"):
+            canvas = row.get(key)
+            if canvas is not None:
+                self._set_doc_canvas_surface(canvas, surface)
+
+    def _on_doc_row_press(self, path: str, _event=None):
+        self._select_document(path)
+        return "break"
+
     def _bind_doc_row_interactions(self, widget, path: str):
-        widget.bind("<Button-1>", lambda _e, p=path: self._select_document(p))
+        widget.bind("<ButtonPress-1>", lambda _e, p=path: self._on_doc_row_press(p))
+        widget.bind("<B1-Motion>", lambda _e: "break")
+        widget.bind("<ButtonRelease-1>", lambda _e: "break")
         widget.bind("<Enter>", lambda _e, p=path: self._hover_doc_row(p, True))
         widget.bind("<Leave>", lambda e, p=path: self._on_doc_row_leave(e, p))
         try:
@@ -2598,40 +3016,90 @@ class App(customtkinter.CTk):
             return
         frame = row["frame"]
         under = frame.winfo_containing(event.x_root, event.y_root)
-        if under is None or not self._is_descendant(under, frame):
-            self._hover_doc_row(path, False)
+        if under is not None and self._is_descendant(under, frame):
+            return
+        tip = self._doc_name_tip
+        if tip is not None and self._doc_name_tip_path == path:
+            tip_under = tip.winfo_containing(event.x_root, event.y_root)
+            if tip_under is not None and self._is_descendant(tip_under, tip):
+                self._set_doc_row_hover(path, False)
+                return
+        self._hover_doc_row(path, False)
 
-    def _hover_doc_row(self, path: str, entering: bool):
+    def _set_doc_row_hover(self, path: str, hovering: bool):
         if path == self._selected_path:
+            if not hovering and self._doc_hover_path == path:
+                self._doc_hover_path = None
             return
         row = self._doc_rows.get(path)
         if row is None:
             return
-        row["frame"].configure(
-            fg_color=TILE_BG_HOVER if entering else "transparent"
-        )
+        if hovering:
+            self._clear_doc_row_hovers(keep=path)
+            row["frame"].configure(fg_color=TILE_BG_HOVER)
+            self._sync_doc_row_surfaces(path, TILE_BG_HOVER)
+            self._doc_hover_path = path
+            return
+        row["frame"].configure(fg_color="transparent")
+        self._sync_doc_row_surfaces(path, "transparent")
+        if self._doc_hover_path == path:
+            self._doc_hover_path = None
+
+    def _hover_doc_row(self, path: str, entering: bool):
+        if entering:
+            if self._doc_name_tip_path and self._doc_name_tip_path != path:
+                self._hide_doc_name_tip()
+            self._clear_doc_row_hovers(keep=path)
+            self._show_doc_name_tip(path)
+            if self._doc_name_tip_path == path:
+                self._set_doc_row_hover(path, False)
+            else:
+                self._set_doc_row_hover(path, True)
+            return
+        if self._doc_name_tip_path == path:
+            self._hide_doc_name_tip()
+        self._set_doc_row_hover(path, False)
+        if self._doc_hover_path is None:
+            self._clear_doc_row_hovers()
 
     def _doc_mark_text_color(self, path: str, *, selected: bool):
-        """Numbers are muted (~50% opacity); status emoji stay full strength."""
-        if self._doc_status_mark(path):
+        """Numbers are muted (~50% opacity); status marks stay full strength."""
+        kind = self._doc_status_kind(path)
+        if kind and self._status_dots:
+            return DOC_STATUS_DOT_OK if kind == "ok" else DOC_STATUS_DOT_BAD
+        if kind:
             return DOC_ROW_ACTIVE_TEXT if selected else ("gray10", "gray90")
         return DOC_MARK_NUMBER_ACTIVE if selected else DOC_MARK_NUMBER_COLOR
+
+    def _doc_mark_font_size(self, path: str) -> int:
+        return DOC_STATUS_DOT_SIZE if (self._status_dots and self._doc_status_kind(path)) else FONT_BODY
 
     def _style_doc_row(self, path: str, *, selected: bool):
         row = self._doc_rows.get(path)
         if row is None:
             return
         mark_color = self._doc_mark_text_color(path, selected=selected)
+        mark_size = self._doc_mark_font_size(path)
+        mark_text = self._doc_leading_label(path, row.get("index", 0))
+        name_text = row.get("full_name") or self._doc_name_label(path, row.get("index", 0))
         if selected:
             row["frame"].configure(fg_color=DOC_ROW_ACTIVE)
-            row["mark"].configure(text_color=mark_color)
-            row["name"].configure(text_color=DOC_ROW_ACTIVE_TEXT)
+            self._set_doc_canvas_text(row["mark"], mark_text, fill=mark_color, size=mark_size)
+            self._set_doc_canvas_text(
+                row["name"], name_text, fill=DOC_ROW_ACTIVE_TEXT, size=FONT_BODY
+            )
+            self._sync_doc_row_surfaces(path, DOC_ROW_ACTIVE)
         else:
             row["frame"].configure(fg_color="transparent")
-            row["mark"].configure(text_color=mark_color)
-            row["name"].configure(text_color=("gray10", "gray90"))
+            self._set_doc_canvas_text(row["mark"], mark_text, fill=mark_color, size=mark_size)
+            self._set_doc_canvas_text(
+                row["name"], name_text, fill=("gray10", "gray90"), size=FONT_BODY
+            )
+            self._sync_doc_row_surfaces(path, "transparent")
 
     def _rebuild_doc_list(self):
+        self._hide_doc_name_tip()
+        self._doc_hover_path = None
         for child in self.doc_list_frame.winfo_children():
             child.destroy()
         self._doc_rows.clear()
@@ -2684,31 +3152,34 @@ class App(customtkinter.CTk):
                 frame.grid_columnconfigure(1, weight=1)
                 frame.grid_rowconfigure(0, weight=1)
 
-                mark = customtkinter.CTkLabel(
+                full_name = self._doc_name_label(path, index)
+                mark, mark_id = self._make_doc_text_canvas(
                     frame,
                     text=self._doc_leading_label(path, index),
+                    fill=self._doc_mark_text_color(path, selected=False),
+                    size=self._doc_mark_font_size(path),
                     width=DOC_MARK_COL_WIDTH,
                     anchor="center",
-                    font=customtkinter.CTkFont(size=FONT_BODY),
-                    text_color=self._doc_mark_text_color(path, selected=False),
-                    fg_color="transparent",
                 )
+                # Inset so CTkFrame corner_radius remains visible on hover/select.
                 mark.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=4)
 
-                name = customtkinter.CTkLabel(
+                name, name_id = self._make_doc_text_canvas(
                     frame,
-                    text=self._doc_name_label(path, index),
+                    text=full_name,
+                    fill=("gray10", "gray90"),
+                    size=FONT_BODY,
                     anchor="w",
-                    font=customtkinter.CTkFont(size=FONT_BODY),
-                    text_color=("gray10", "gray90"),
-                    fg_color="transparent",
                 )
                 name.grid(row=0, column=1, sticky="nsew", padx=(4, 10), pady=4)
 
                 self._doc_rows[path] = {
                     "frame": frame,
                     "mark": mark,
+                    "mark_id": mark_id,
                     "name": name,
+                    "name_id": name_id,
+                    "full_name": full_name,
                     "index": index,
                 }
                 self._bind_doc_row_interactions(frame, path)
@@ -2736,8 +3207,8 @@ class App(customtkinter.CTk):
             row = self._doc_rows.get(path)
             if row is None:
                 continue
-            row["mark"].configure(text=self._doc_leading_label(path, i))
-            row["name"].configure(text=self._doc_name_label(path, i))
+            full_name = self._doc_name_label(path, i)
+            row["full_name"] = full_name
             row["index"] = i
         self._highlight_selected_doc()
 
@@ -2748,6 +3219,8 @@ class App(customtkinter.CTk):
     def _select_document(self, path: str):
         if path not in self._imported_files:
             return
+        self._hide_doc_name_tip()
+        self._clear_doc_row_hovers()
         # From settings, resume the step that was open before settings.
         self._leave_settings_if_open()
         if self._selected_path and self._selected_path != path:
@@ -2835,7 +3308,16 @@ class App(customtkinter.CTk):
                 self._reset_ctk_entry(entry)
 
         if result.errors:
-            self.extract_errors_label.configure(text="⚠ " + "\n".join(result.errors))
+            # Some parse failures are actionable via OCR; hide that specific hint to reduce noise.
+            filtered_errors = [
+                e for e in result.errors if "封面无嵌入文本" not in str(e)
+            ]
+            if filtered_errors:
+                self.extract_errors_label.configure(
+                    text="⚠ " + "\n".join(filtered_errors)
+                )
+            else:
+                self.extract_errors_label.configure(text="")
         else:
             self.extract_errors_label.configure(text="")
 
@@ -2966,6 +3448,21 @@ class App(customtkinter.CTk):
         self.remove_toggle_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
         self._style_primary_action_button(self.remove_toggle_button)
 
+        self.export_excel_button = customtkinter.CTkButton(
+            footer,
+            corner_radius=UI_RADIUS,
+            text="导出 Excel (0)",
+            height=PRIMARY_ACTION_BTN_HEIGHT,
+            round_height_to_even_numbers=False,
+            font=self._button_font(FONT_SECTION),
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            command=self._on_export_excel,
+        )
+        self.export_excel_button.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self._style_primary_action_button(self.export_excel_button)
+
         self.autofill_button = customtkinter.CTkButton(
             footer,
             corner_radius=UI_RADIUS,
@@ -2978,7 +3475,7 @@ class App(customtkinter.CTk):
             text_color=PRIMARY_BTN_TEXT,
             command=self._on_master_autofill,
         )
-        self.autofill_button.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.autofill_button.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         self._style_primary_action_button(self.autofill_button)
 
     def _get_field_widget_value(self, widget) -> str:
@@ -3164,6 +3661,8 @@ class App(customtkinter.CTk):
             return
         n = len(self._autofill_queue)
         self.autofill_button.configure(text=f"导出并自动填写 ({n})")
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(text=f"导出 Excel ({n})")
         self._refresh_doc_list_marks()
         self._update_review_cert_status()
 
@@ -3375,6 +3874,8 @@ class App(customtkinter.CTk):
 
         self._autofill_busy = True
         self.autofill_button.configure(state="disabled")
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(state="disabled")
         self.set_status(f"自动填写开始：{len(items)} 份 → {excel_path.name}")
 
         username, password = self._eams_credentials()
@@ -3414,6 +3915,8 @@ class App(customtkinter.CTk):
         self._autofill_busy = False
         if hasattr(self, "autofill_button"):
             self.autofill_button.configure(state="normal")
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(state="normal")
         err_n = len(report.errors or [])
         excel_note = f" · {excel_path.name}" if excel_path else ""
         summary = (
@@ -3435,6 +3938,8 @@ class App(customtkinter.CTk):
         self._autofill_busy = False
         if hasattr(self, "autofill_button"):
             self.autofill_button.configure(state="normal")
+        if hasattr(self, "export_excel_button"):
+            self.export_excel_button.configure(state="normal")
         self.set_status(f"自动填写失败：{message}")
         self.show_toast(f"自动填写失败：{message}", title="导出并自动填写")
 
@@ -3447,6 +3952,39 @@ class App(customtkinter.CTk):
             fields = result.fields
             rows.append([getattr(fields, key, "") or "" for key, _label in EXPORT_COLUMNS])
         return rows
+
+    def _on_export_excel(self):
+        """Save approved queue Excel into project exports/ (no autofill)."""
+        self._cancel_pending_quarantine()
+        self._save_fields_before_navigate()
+        if self._autofill_busy:
+            self.set_status("自动填写进行中，请稍候再导出…")
+            return
+        rows = self._export_rows()
+        if not rows:
+            self.set_status("导出 Excel：队列为空")
+            self.show_toast(
+                "请先批准至少一份证书。",
+                title="导出 Excel",
+                duration_ms=TOAST_SUCCESS_MS,
+            )
+            return
+
+        target = next_export_path()
+        try:
+            write_batch_excel(
+                rows,
+                [label for _key, label in EXPORT_COLUMNS],
+                target,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"导出 Excel 失败：{exc}")
+            self.show_toast(f"导出失败：{exc}", title="导出 Excel")
+            return
+
+        msg = f"已导出 {len(rows)} 份到 exports/{target.name}"
+        self.set_status(msg)
+        self.show_success_toast(msg, title="导出 Excel")
 
     def _on_close(self):
         self.destroy()
