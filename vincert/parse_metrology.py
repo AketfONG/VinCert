@@ -9,17 +9,18 @@ from .models import CertificateFields
 # Labels that mark the start of a field value block on 天溯-style certificates.
 LABEL_ALIASES: dict[str, tuple[str, ...]] = {
     "certificate_no": ("校准证书编号", "检定证书编号", "证书编号"),
-    "client_name": ("客户名称", "送检单位", "委托单位", "委托者"),
-    "name": ("计量器具名称", "仪器名称", "器具名称"),
+    "client_name": ("客户名称", "送检单位", "委托单位", "委托者", "委托方"),
+    "name": ("计量器具名称", "仪器/样品名称", "仪器名称", "样品名称", "器具名称"),
     "model": ("型号/规格", "型号规格", "型号：", "型号"),
     "manufacturer": ("制造厂商", "制造单位", "制造厂"),
     "serial_num": ("出厂编号", "计量器具编号", "器具编号"),
-    "management_no": ("管理编号",),
+    "management_no": ("管理编号", "管理号"),
     "receipt_date": ("接收日期", "受样日期"),
     "measurement_date": ("校准日期", "检定日期", "本次检测日期", "检测日期"),
     "due_date": (
         "建议下次校准日期",
         "建议下次检定日期",
+        "建议再校日期",
         "有效期至",
         "本次检测有效期至",
         "检测有效期至",
@@ -56,16 +57,28 @@ ISSUER_FINGERPRINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
             r"锦龙大道\s*2\s*号",
         ),
     ),
+    (
+        "广州力赛计量检测有限公司",
+        (
+            r"广州力赛计量检测有限公司",
+            r"lisaitest\.com",
+            r"cal@lisaitest\.com",
+            r"GUANGZHOU LISAI METROLOGY",
+            r"\bCNAS\s*L7127\b",
+        ),
+    ),
 )
 
 # English / bilingual lines that sit between Chinese labels and values.
 SKIP_LINE_RE = re.compile(
     r"^(?:"
-    r"Client Name|Address|Description|Model/?Type|Model/?\s*Specif\w*|Manufacturer|"
+    r"Client(?:\s+Name)?|Address|Description|Model/?Type|Model/?\s*Specif\w*|Manufacturer|"
     r"Manuf\s*acturer|Name of Instrument|No\.?\s*of instrument|Instrument accuracy|"
-    r"Serial Number|Management No\.?|Date of Receipt|Calibration Date|Date f\w* calibration|"
-    r"Due Date|Issue Date|Issue date|Certi.icate No\.?|Calibration certif\w*.*|"
-    r"Contact inf\w*|Approv\w* by|Checked by|Calibrated by|Customer|"
+    r"Serial(?:\s+Number|\s*No\.?)|Management No\.?|Asset No\.?|"
+    r"Date of Receipt|Date of Calibration|Calibration Date|Date f\w* calibration|"
+    r"Due Date|Issued?\s*Date|Certi.icate No\.?|Calibration certif\w*.*|"
+    r"Contact(?:\s+Info|\s+inf\w*)?|Approv\w* by|Inspected by|Checked by|Calibrated by|"
+    r"Customer|Conclusion|"
     r"Page|of|Year|Month|Day|Tel\.?|Fax|PostCode|Inquire line|Complaints line|"
     r"Name|Model|Number|Location|"
     r"第\s*\d+\s*页|共\s*\d+\s*页"
@@ -79,7 +92,7 @@ DATE_TOKEN_RE = re.compile(
 DATE_ISO_RE = re.compile(r"(?P<y>\d{4})[-/.](?P<m>\d{1,2})[-/.](?P<d>\d{1,2})")
 
 _UNIT_HINTS = ("有限公司", "股份有限公司", "研究院", "研究所", "检测中心", "计量院", "测试中心")
-_UNIT_SKIP = ("送检", "委托", "客户", "制造单位", "制造厂", "制造厂商")
+_UNIT_SKIP = ("送检", "委托", "客户", "制造单位", "制造厂", "制造厂商", "委托方")
 
 
 def normalize_spaced_cjk(text: str) -> str:
@@ -129,7 +142,8 @@ def _join_vertical_cjk_chars(lines: list[str]) -> list[str]:
 def _is_noise(line: str) -> bool:
     if SKIP_LINE_RE.match(line):
         return True
-    if re.fullmatch(r"[/—\-–]+", line):
+    # Empty / placeholder values used by some labs (e.g. 力赛)
+    if re.fullmatch(r"[/／—\-–]+", line):
         return True
     # Bilingual English label phrases (not short manufacturer names like Druck/Leipai)
     if (
@@ -222,10 +236,14 @@ def _all_stop_labels() -> set[str]:
     labels.update(
         {
             "地址",
+            "联络信息",
+            "结果",
             "批准:",
             "批准：",
             "核验:",
             "核验：",
+            "审核:",
+            "审核：",
             "校准:",
             "校准：",
             "检定:",
