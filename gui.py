@@ -3056,6 +3056,13 @@ class App(customtkinter.CTk):
             and scrollable is self.doc_list_frame
         ):
             return "break"
+        if (
+            hasattr(self, "doc_list_frame")
+            and scrollable is self.doc_list_frame
+            and self._doc_name_tip is not None
+        ):
+            # Tip overlays the list and would block / drift while rows move.
+            self._hide_doc_name_tip()
         try:
             canvas = scrollable._parent_canvas
         except Exception:  # noqa: BLE001
@@ -3083,6 +3090,9 @@ class App(customtkinter.CTk):
     def _on_doc_list_mousewheel(self, event):
         if not hasattr(self, "doc_list_frame"):
             return
+        # Overlay would otherwise stay pinned while rows move under it.
+        if self._doc_name_tip is not None:
+            self._hide_doc_name_tip()
         return self._on_scrollable_mousewheel(self.doc_list_frame, event)
 
     def _update_scrollable_scrollbar(
@@ -3750,6 +3760,9 @@ class App(customtkinter.CTk):
         label.bind("<Leave>", lambda _e, p=path: self._on_doc_name_tip_leave(p))
         tip.bind("<ButtonPress-1>", lambda _e, p=path: self._on_doc_row_press(p))
         label.bind("<ButtonPress-1>", lambda _e, p=path: self._on_doc_row_press(p))
+        # Tip sits above the list — forward wheel so scrolling still works.
+        self._bind_doc_list_mousewheel(tip)
+        self._bind_doc_list_mousewheel(label)
 
         tip.update_idletasks()
         scale = self._widget_scaling_factor()
