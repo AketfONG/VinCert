@@ -28,6 +28,7 @@ from vincert.mas_autofill import (
     save_credentials,
     write_batch_excel,
 )
+from vincert.pdf_preview import PdfPreviewController
 
 customtkinter.set_appearance_mode("System")
 customtkinter.set_default_color_theme("blue")
@@ -405,6 +406,11 @@ class App(customtkinter.CTk):
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
         self._content_wrap_labels: list[customtkinter.CTkLabel] = []
+        self._pdf_preview_layout_active = False
+        self._pdf_preview = PdfPreviewController(
+            on_closed=lambda: self.after(0, self._on_pdf_preview_closed),
+            status=lambda msg: self.after(0, lambda m=msg: self.set_status(m)),
+        )
 
         self.grid_rowconfigure(0, weight=1)
         self._apply_layout_column_minsizes()
@@ -415,7 +421,7 @@ class App(customtkinter.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.show_step("extract")
         self._update_extract_ocr_ui()
-        self.after_idle(self._maybe_autoload_demo_folder)
+        self.after_idle(self._bootstrap_window_layout)
 
     def _widget_scaling_factor(self) -> float:
         if hasattr(self, "controls_inner"):
@@ -434,6 +440,112 @@ class App(customtkinter.CTk):
         self.grid_columnconfigure(
             1, weight=1, minsize=int(MAIN_MIN_WIDTH * scale)
         )
+
+    def _bootstrap_window_layout(self):
+        """Fullscreen on launch; demo autoload may then snap for a PDF preview."""
+        self._apply_window_fullscreen()
+        self._maybe_autoload_demo_folder()
+
+    def _screen_work_area(self) -> tuple[int, int, int, int]:
+        """Return (x, y, width, height) for the usable desktop area."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class RECT(ctypes.Structure):
+                    _fields_ = [
+                        ("left", wintypes.LONG),
+                        ("top", wintypes.LONG),
+                        ("right", wintypes.LONG),
+                        ("bottom", wintypes.LONG),
+                    ]
+
+                rect = RECT()
+                SPI_GETWORKAREA = 0x0030
+                if ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
+                ):
+                    return (
+                        int(rect.left),
+                        int(rect.top),
+                        int(rect.right - rect.left),
+                        int(rect.bottom - rect.top),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+        self.update_idletasks()
+        return 0, 0, int(self.winfo_screenwidth()), int(self.winfo_screenheight())
+
+    def _apply_window_fullscreen(self):
+        """Maximize / fill the screen when no PDF preview is open."""
+        self._pdf_preview_layout_active = False
+        try:
+            if sys.platform == "darwin":
+                try:
+                    self.attributes("-fullscreen", False)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.state("normal")
+        except Exception:  # noqa: BLE001
+            pass
+        self.update_idletasks()
+        if sys.platform == "win32":
+            try:
+                self.state("zoomed")
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        x, y, w, h = self._screen_work_area()
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        if sys.platform == "darwin":
+            try:
+                self.state("zoomed")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _snap_app_left_half(self):
+        """Place VinCert on the left half of the work area."""
+        x, y, w, h = self._screen_work_area()
+        half = max(640, w // 2)
+        try:
+            if sys.platform == "darwin":
+                self.attributes("-fullscreen", False)
+            self.state("normal")
+        except Exception:  # noqa: BLE001
+            pass
+        self.update_idletasks()
+        self.geometry(f"{half}x{h}+{x}+{y}")
+        self._pdf_preview_layout_active = True
+
+    def _pdf_preview_bounds_right(self) -> tuple[int, int, int, int]:
+        x, y, w, h = self._screen_work_area()
+        half = max(640, w // 2)
+        return (x + half, y, max(400, w - half), h)
+
+    def _sync_pdf_preview(self):
+        """Open/update PDF preview when a file is selected; otherwise fullscreen."""
+        path = self._selected_path
+        if path and Path(path).is_file():
+            self._snap_app_left_half()
+            self._pdf_preview.show(path, self._pdf_preview_bounds_right())
+            return
+        if self._pdf_preview.is_open:
+            self._pdf_preview.close()
+        else:
+            self._apply_window_fullscreen()
+
+    def _on_pdf_preview_closed(self):
+        """Restore fullscreen when the Chromium preview window is closed."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if self._pdf_preview.is_open:
+            return
+        if self._pdf_preview_layout_active:
+            self._apply_window_fullscreen()
 
     def _track_content_wrap(self, label: customtkinter.CTkLabel) -> customtkinter.CTkLabel:
         self._content_wrap_labels.append(label)
@@ -2738,6 +2850,7 @@ class App(customtkinter.CTk):
         if hasattr(self, "field_entries"):
             self._clear_approve_fields()
         self._update_autofill_button()
+        self._sync_pdf_preview()
         self.set_status("已清空提取列表")
 
     def _load_folder(self, folder: str):
@@ -2766,6 +2879,8 @@ class App(customtkinter.CTk):
         self._update_cert_nav_labels()
 
         if not paths:
+            self._selected_path = None
+            self._sync_pdf_preview()
             self.set_status("文件夹中没有 PDF")
             return
 
@@ -2991,6 +3106,7 @@ class App(customtkinter.CTk):
         else:
             self._selected_path = None
             self._clear_extract_fields_display()
+            self._sync_pdf_preview()
 
         if hasattr(self, "ocr_progress"):
             self.ocr_progress.set(1 if total else 0)
@@ -3048,6 +3164,7 @@ class App(customtkinter.CTk):
         else:
             self._selected_path = None
             self._clear_extract_fields_display()
+            self._sync_pdf_preview()
         msg = f"失败 {moved} 份已移出队列 · 已复制到 {self._failed_items_dir_short()}/"
         self.set_status(msg)
         self.show_success_toast(msg)
@@ -3610,6 +3727,7 @@ class App(customtkinter.CTk):
         if self._current_step == "review" and hasattr(self, "field_entries"):
             self._load_approve_fields_for_current()
             self._update_review_cert_status()
+        self._sync_pdf_preview()
 
     def _save_extract_fields_to_result(self):
         path = self._selected_path
@@ -4842,6 +4960,7 @@ class App(customtkinter.CTk):
                 self._selected_path = None
                 if hasattr(self, "field_entries"):
                     self._clear_approve_fields()
+                self._sync_pdf_preview()
 
         err_n = len(report.errors or [])
         cancelled = bool(getattr(report, "cancelled", False))
@@ -4935,6 +5054,10 @@ class App(customtkinter.CTk):
                 duration_ms=TOAST_SUCCESS_MS,
             )
             return
+        try:
+            self._pdf_preview.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         self.destroy()
 
 
