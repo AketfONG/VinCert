@@ -12,10 +12,10 @@ from typing import Callable
 from .models import CertificateFields
 
 EAMS_HOME = (
-    "https://eams.manage.mas.mtr.bj.cn/maximo/oslc/graphite/"
+    "https://eams.manage.masuat.mtr.bj.cn/maximo/oslc/graphite/"
     "manage-shell/index.html#/main"
 )
-EAMS_LOGIN_URL = "https://auth.mas.mtr.bj.cn/login/"
+EAMS_LOGIN_URL = "https://auth.masuat.mtr.bj.cn/login/"
 # Keep alias for older call sites.
 MAS_HOME = EAMS_HOME
 SHELL_IFRAME = "#manage-shell_Iframe"
