@@ -40,6 +40,8 @@ UAT_USER_DATA_DIR = PROJECT_ROOT / "mas_browser_data_uat"
 CREDENTIALS_PATH = PROJECT_ROOT / "eams_credentials.json"
 EXPORTS_DIR = PROJECT_ROOT / "exports"
 FAILED_ITEMS_DIR = PROJECT_ROOT / "failed_items"
+# How long autofill may wait for login / shell to appear (manual login OK).
+DEFAULT_LOGIN_WAIT_SECONDS = 3600  # 1 hour
 
 StatusFn = Callable[[str], None]
 
@@ -124,17 +126,27 @@ class AutofillControl:
         self._context = None
         self._browser = None
         self._browser_pid: int | None = None
+        self._user_data_dir: Path | None = None
         self._context_lock = threading.Lock()
 
-    def bind_context(self, context) -> None:
+    def bind_context(self, context, *, user_data_dir: Path | None = None) -> None:
         with self._context_lock:
             self._context = context
+            if user_data_dir is not None:
+                self._user_data_dir = Path(user_data_dir)
             browser = None
             pid = None
             try:
                 browser = getattr(context, "browser", None)
             except Exception:  # noqa: BLE001
                 browser = None
+            # Persistent contexts often expose browser=None; dig into impl / pages.
+            if browser is None:
+                try:
+                    impl = getattr(context, "_impl_obj", None)
+                    browser = getattr(impl, "_browser", None) or getattr(impl, "browser", None)
+                except Exception:  # noqa: BLE001
+                    browser = None
             if browser is not None:
                 try:
                     proc = getattr(browser, "process", None)
@@ -168,6 +180,7 @@ class AutofillControl:
             ctx = self._context
             browser = self._browser
             pid = self._browser_pid
+            profile = self._user_data_dir
             self._context = None
             self._browser = None
             self._browser_pid = None
@@ -194,6 +207,9 @@ class AutofillControl:
                 pass
             if pid:
                 _kill_process(pid)
+            # Persistent-context Chromium often has no exposed PID — kill by profile path.
+            if profile is not None:
+                _kill_chromium_for_profile(profile)
 
         threading.Thread(
             target=_force_close,
@@ -234,6 +250,57 @@ def _kill_process(pid: int) -> None:
             )
         except Exception:  # noqa: BLE001
             pass
+    else:
+        try:
+            import os
+            import signal
+
+            os.kill(pid, signal.SIGKILL)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _kill_chromium_for_profile(user_data_dir: Path) -> None:
+    """Kill Chromium processes whose command line includes this user-data-dir."""
+    marker = str(Path(user_data_dir).resolve())
+    if not marker:
+        return
+    try:
+        import subprocess
+    except Exception:  # noqa: BLE001
+        return
+
+    if sys.platform == "win32":
+        # Escape single quotes for PowerShell single-quoted string.
+        safe = marker.replace("'", "''")
+        script = (
+            "$m = '{0}'; "
+            "Get-CimInstance Win32_Process | "
+            "Where-Object {{ "
+            "  $_.Name -match '^(chrome|chromium|msedge)\\.exe$' -and "
+            "  $_.CommandLine -and ($_.CommandLine -like ('*' + $m + '*')) "
+            "}} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        ).format(safe)
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                check=False,
+                capture_output=True,
+                timeout=8,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    try:
+        subprocess.run(
+            ["pkill", "-f", marker],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 COMPARE_FIELD_LABELS = {
@@ -419,45 +486,99 @@ def login_eams(
     username: str,
     password: str,
     *,
-    login_wait_seconds: int = 120,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
     status: StatusFn | None = None,
     env: EamsEnvironment | None = None,
+    control: AutofillControl | None = None,
 ) -> None:
-    """Open EAMS and autofill credentials when a login form is shown."""
+    """Open EAMS and autofill credentials when a login form is shown.
+
+    Waits are sliced so pause/exit can interrupt (avoids multi-minute hangs on UAT).
+    """
     username = (username or "").strip()
     password = password or ""
     if not username or not password:
         raise ValueError("请先在设置中填写 EAMS 用户名和密码")
 
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
     target = env or resolve_eams_environment(testing=False)
+    check()
     _status(status, f"打开 EAMS（{target.label}）…")
     page.goto(target.home, wait_until="domcontentloaded")
-    if _already_logged_in(page, timeout_ms=5000):
+    check()
+    if _already_logged_in(page, timeout_ms=3000):
         _status(status, "已检测到登录会话")
         return
 
     # Prefer dedicated auth portal; fall back to whatever redirect landed on.
     try:
+        check()
         page.goto(target.login, wait_until="domcontentloaded")
     except Exception:  # noqa: BLE001
         pass
 
-    if _already_logged_in(page, timeout_ms=2000):
+    check()
+    if _already_logged_in(page, timeout_ms=1500):
         _status(status, "已检测到登录会话")
         return
 
     _status(status, "正在自动填写登录信息…")
+    check()
     _fill_eams_login_form(page, username, password, status=status)
+    check()
 
-    deadline_ms = max(login_wait_seconds, 30) * 1000
+    deadline = time.time() + max(login_wait_seconds, 30)
     _status(status, "等待登录完成…")
+    navigated_home = False
+    while True:
+        check()
+        # Shell iframe means login already landed in Maximo.
+        try:
+            page.wait_for_selector(SHELL_IFRAME, timeout=2000)
+            _status(status, f"EAMS 登录成功（{target.label}）")
+            return
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if control is not None and control.cancelled():
+                raise AutofillCancelled("用户退出自动填写") from exc
+
+        check()
+        # Brief URL wait — never block the full login timeout in one call.
+        try:
+            page.wait_for_url(target.post_login_url_glob, timeout=1500)
+            if not navigated_home:
+                check()
+                page.goto(target.home, wait_until="domcontentloaded")
+                navigated_home = True
+            continue
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if control is not None and control.cancelled():
+                raise AutofillCancelled("用户退出自动填写") from exc
+
+        if time.time() >= deadline:
+            break
+
+    check()
+    # Last attempt: open home and require shell, still with a short timeout.
     try:
-        page.wait_for_url(target.post_login_url_glob, timeout=deadline_ms)
-    except Exception:  # noqa: BLE001
-        pass
-    page.goto(target.home, wait_until="domcontentloaded")
-    page.wait_for_selector(SHELL_IFRAME, timeout=deadline_ms)
-    _status(status, f"EAMS 登录成功（{target.label}）")
+        page.goto(target.home, wait_until="domcontentloaded")
+        page.wait_for_selector(SHELL_IFRAME, timeout=8000)
+        _status(status, f"EAMS 登录成功（{target.label}）")
+        return
+    except AutofillCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if control is not None and control.cancelled():
+            raise AutofillCancelled("用户退出自动填写") from exc
+        raise TimeoutError(
+            f"登录超时（{target.label}）：未进入 EAMS 主界面。请确认账号密码或在浏览器中手动登录后重试。"
+        ) from exc
 
 
 def next_export_path(prefix: str = "vincert_batch") -> Path:
@@ -548,7 +669,7 @@ def run_mas_autofill(
     fill_details: bool = True,
     upload_pdf: bool = True,
     submit_workflow: bool = False,
-    login_wait_seconds: int = 300,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
     status: StatusFn | None = None,
     control: AutofillControl | None = None,
     testing: bool = False,
@@ -607,7 +728,7 @@ def run_mas_autofill(
                 accept_downloads=True,
                 args=launch_args or None,
             )
-            gate.bind_context(context)
+            gate.bind_context(context, user_data_dir=profile)
             page = context.pages[0] if context.pages else context.new_page()
             if window_bounds is not None:
                 try:
@@ -624,6 +745,7 @@ def run_mas_autofill(
                     login_wait_seconds=login_wait_seconds,
                     status=status,
                     env=env,
+                    control=gate,
                 )
             else:
                 _status(status, f"打开 EAMS 主页（{env.label}；如需登录请在浏览器中完成）…")
@@ -739,7 +861,7 @@ def open_eams_login_session(
     password: str,
     *,
     user_data_dir: Path | None = None,
-    login_wait_seconds: int = 180,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
     status: StatusFn | None = None,
     testing: bool = False,
 ) -> None:
@@ -790,14 +912,15 @@ def _wait_for_shell(
         try:
             page.wait_for_selector(SHELL_IFRAME, timeout=slice_ms)
             break
-        except Exception:
+        except Exception as exc:
+            if control is not None and control.cancelled():
+                raise AutofillCancelled("用户退出自动填写") from exc
             waited += slice_ms
             if waited >= min(20_000, deadline_ms) and not prompted:
                 _status(status, "未检测到已登录会话，请在浏览器中登录…")
                 prompted = True
             if waited >= deadline_ms:
-                page.wait_for_selector(SHELL_IFRAME, timeout=slice_ms)
-                break
+                raise TimeoutError("等待 EAMS 主界面超时") from exc
 
     shell = _shell(page)
     # Prefer the measure-entry link; fall back to any shell content.

@@ -52,7 +52,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "ocr_enabled": False,
         "buttons_bold": True,
         "content_centering": True,
-        "status_dots": False,
+        "status_dots": True,
         "doc_list_scale_fonts": True,
         "failed_items_dir": str(DEFAULT_FAILED_ITEMS_DIR),
         "testing_mode": False,
@@ -144,7 +144,7 @@ def save_content_centering(enabled: bool, path: Path | None = None) -> Path:
 
 def load_status_dots(path: Path | None = None) -> bool:
     """Return True when approved/removed status uses red/green dots."""
-    return bool(load_ui_settings(path).get("status_dots", False))
+    return bool(load_ui_settings(path).get("status_dots", True))
 
 
 def save_status_dots(enabled: bool, path: Path | None = None) -> Path:
@@ -373,8 +373,8 @@ EXPORT_COLUMNS = [
 ]
 
 
-WINDOW_MIN_HEIGHT_NORMAL = 780  # design units × 1.0 scale
-WINDOW_MIN_HEIGHT_ZOOMED = 760  # design units × 1.2 scale — tune separately from normal
+WINDOW_MIN_HEIGHT_NORMAL = 830  # design units × 1.0 scale
+WINDOW_MIN_HEIGHT_ZOOMED = 820  # design units × 1.2 scale — tune separately from normal
 WINDOW_MIN_WIDTH = DOC_SIDEBAR_WIDTH + MAIN_MIN_WIDTH
 
 
@@ -745,6 +745,14 @@ class App(customtkinter.CTk):
         path = self._selected_path
         if path and Path(path).is_file():
             if self._autofill_busy:
+                return
+            if self._pdf_preview.is_open:
+                # Keep the same Chromium window — only navigate to the new file:// URL.
+                if not self._pdf_preview_layout_active:
+                    self._snap_app_left_half()
+                self.update_idletasks()
+                bounds = self._pdf_preview_bounds_remaining()
+                self._pdf_preview.show(path, bounds)
                 return
             bounds = self._prepare_side_browser_layout()
             self._pdf_preview.show(path, bounds)
@@ -3033,11 +3041,12 @@ class App(customtkinter.CTk):
                 return -delta * speed
             return int(-delta * max(2, speed // 2))
         if sys.platform.startswith("win"):
+            # Windows path uses fraction-of-view scrolling in _on_scrollable_mousewheel.
             delta = int(getattr(event, "delta", 0) or 0)
             notches = int(delta / 120) if delta else 0
             if notches == 0 and delta:
                 notches = 1 if delta > 0 else -1
-            return -notches * speed
+            return -notches
         return (-speed) if getattr(event, "num", 0) == 4 else speed
 
     def _on_scrollable_mousewheel(self, scrollable, event):
@@ -3053,6 +3062,19 @@ class App(customtkinter.CTk):
             return
         if canvas.yview() == (0.0, 1.0):
             return
+        if sys.platform.startswith("win"):
+            # Unit scrolling is tiny on Win32/CTk; move ~half the visible page per notch.
+            delta = int(getattr(event, "delta", 0) or 0)
+            notches = int(delta / 120) if delta else 0
+            if notches == 0 and delta:
+                notches = 1 if delta > 0 else -1
+            if notches:
+                first, last = canvas.yview()
+                view = max(float(last) - float(first), 0.08)
+                canvas.yview_moveto(
+                    max(0.0, min(1.0, float(first) - notches * view * 0.55))
+                )
+            return "break"
         steps = self._mousewheel_scroll_steps(event)
         if steps:
             canvas.yview_scroll(steps, "units")
@@ -4320,21 +4342,6 @@ class App(customtkinter.CTk):
         self.autofill_exit_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._style_primary_action_button(self.autofill_exit_button)
 
-        self.toast_test_button = customtkinter.CTkButton(
-            footer,
-            corner_radius=UI_RADIUS,
-            text="测试自动填写 Toast",
-            height=PRIMARY_ACTION_BTN_HEIGHT,
-            round_height_to_even_numbers=False,
-            font=self._button_font(FONT_SECTION),
-            fg_color=SECONDARY_BTN_FG,
-            hover_color=SECONDARY_BTN_HOVER,
-            text_color=SECONDARY_BTN_TEXT,
-            command=self._on_test_toast_stack,
-        )
-        self.toast_test_button.grid(row=3, column=0, sticky="ew", pady=(10, 0))
-        self._style_primary_action_button(self.toast_test_button)
-
     def _get_field_widget_value(self, widget) -> str:
         if isinstance(widget, customtkinter.CTkTextbox):
             return widget.get("1.0", "end-1c").strip()
@@ -4833,13 +4840,15 @@ class App(customtkinter.CTk):
             self.set_status("自动填写已暂停")
 
     def _on_autofill_exit(self):
-        """Pause first, then ask for confirmation via toast before actually exiting."""
+        """Pause first, then ask for confirmation; second click exits immediately."""
         control = self._autofill_control
         if control is None or not self._autofill_busy:
             return
         if control.cancelled():
             return
+        # Second click (or click while toast is up) → exit now, no more waiting.
         if self._autofill_exit_confirming:
+            self._confirm_autofill_exit()
             return
 
         self._autofill_was_paused_before_exit = control.is_paused()
@@ -4852,12 +4861,16 @@ class App(customtkinter.CTk):
             self.append_autofill_log("已暂停（等待确认退出）")
 
         self._autofill_exit_confirming = True
-        self.set_status("10 秒后将退出自动填写（可取消）…")
-        self.append_autofill_log("退出倒计时 10 秒 — 确认退出或等待结束；点取消可继续")
+        try:
+            self.autofill_exit_button.configure(text="立即退出", state="normal")
+        except Exception:  # noqa: BLE001
+            pass
+        self.set_status("再点一次「立即退出」可马上结束；或等待 10 秒自动退出")
+        self.append_autofill_log("退出确认 — 再点「立即退出」马上结束；点取消可继续")
         self.show_toast(
-            "自动填写已暂停。\n10 秒后将退出本次填写。\n点「确认退出」立即结束，点「取消」继续填写。",
+            "自动填写已暂停。\n再点「立即退出」马上结束。\n点「取消」继续填写；10 秒后也会自动退出。",
             title="退出自动填写",
-            action_text="确认退出",
+            action_text="立即退出",
             undo_text="取消",
             on_undo=self._cancel_autofill_exit,
             on_complete=self._confirm_autofill_exit,
@@ -4871,6 +4884,10 @@ class App(customtkinter.CTk):
         control = self._autofill_control
         if control is None or not self._autofill_busy or control.cancelled():
             return
+        try:
+            self.autofill_exit_button.configure(text="退出", state="normal")
+        except Exception:  # noqa: BLE001
+            pass
         if self._autofill_was_paused_before_exit:
             try:
                 self.autofill_pause_button.configure(text="继续")
@@ -4888,12 +4905,16 @@ class App(customtkinter.CTk):
         self.set_status("自动填写已继续")
 
     def _confirm_autofill_exit(self):
-        """Confirmed exit (button or toast countdown)."""
+        """Confirmed exit (button, second click, or toast countdown)."""
+        if not self._autofill_busy:
+            return
         self._autofill_exit_confirming = False
         control = self._autofill_control
-        if control is None or not self._autofill_busy:
+        if control is None:
             return
         if control.cancelled():
+            # Already exiting — still tear down UI/terminal.
+            self.close_autofill_log()
             return
         control.request_exit()
         try:
@@ -4903,8 +4924,11 @@ class App(customtkinter.CTk):
             pass
         self.append_autofill_log("正在退出自动填写…", error=True)
         self.set_status("正在退出自动填写…")
+        # Close the terminal immediately — don't leave it hanging after kill.
+        self.close_autofill_log()
+        self._restore_layout_after_browser_session()
         # Safety net: if the worker never returns, restore controls anyway.
-        self.after(8000, self._autofill_exit_watchdog)
+        self.after(2500, self._autofill_exit_watchdog)
 
     def _autofill_exit_watchdog(self):
         if not self._autofill_busy:
@@ -4912,12 +4936,13 @@ class App(customtkinter.CTk):
         control = self._autofill_control
         if control is None or not control.cancelled():
             return
-        self.append_autofill_log("退出超时，已强制恢复按钮", error=True)
         self._autofill_busy = False
         self._autofill_exit_confirming = False
+        self.close_autofill_log()
         self._restore_autofill_button()
-        self.finish_autofill_log(ok=False)
-        self.show_toast("自动填写退出超时，已恢复界面。", title="导出并自动填写")
+        self._restore_layout_after_browser_session()
+        self.set_status("已强制退出自动填写")
+        self.show_toast("已强制退出自动填写。", title="导出并自动填写", duration_ms=TOAST_SUCCESS_MS)
 
     def _save_fields_before_navigate(self):
         if (
@@ -5214,64 +5239,6 @@ class App(customtkinter.CTk):
             error=message.startswith("失败"),
         )
 
-    def _on_test_toast_stack(self):
-        """Replay the real export + autofill click/status sequence in the terminal panel."""
-        excel_name = "vincert_batch_demo.xlsx"
-        serial = "DEMO-001"
-        pdf_name = "demo_cert.pdf"
-        # Same order as _on_master_autofill + run_mas_autofill button clicks / status.
-        steps = [
-            f"已导出 1 份到 exports/{excel_name}",
-            "开始自动填写 1 份…",
-            "正在启动浏览器…",
-            "打开 EAMS…",
-            "正在自动填写登录信息…",
-            "点击「登录」",
-            "等待登录完成…",
-            "EAMS 登录成功",
-            "进入「计量器具结果录入」…",
-            "点击「计量器具结果录入」",
-            f"批量导入 Excel：{excel_name}",
-            "点击「批量导入计量结果」",
-            f"选择文件：{excel_name}",
-            "点击「确定」",
-            "点击「关闭」",
-            f"填写第 1/1 份：{serial}",
-            f"点击「{serial}」",
-            "比对「计量器具编号」：证书=DEMO-001 · 网页=DEMO-001",
-            "比对「制造厂」：证书=Demo厂 · 网页=Demo厂",
-            "比对字段一致",
-            "点击「检验方式」",
-            "点击「检定」",
-            "点击「本次检测日期」",
-            "点击「计量结果信息」",
-            "点击「上传附件」",
-            f"选择附件：{pdf_name}",
-            "点击「类型」",
-            "点击「证书」",
-            "点击「确定」",
-            f"已上传证书附件：{pdf_name}",
-            "自动化结束，正在关闭浏览器会话…",
-            f"自动填写完成 · {excel_name} · 导入Excel 是 · 填写 1 · 附件 1",
-        ]
-        gap_ms = 1200
-        export_msg = steps[0]
-        start_msg = steps[1]
-        self.show_success_toast(export_msg, title="导出 Excel")
-        self.show_success_toast(start_msg, title="自动填写")
-        self.open_autofill_log()
-        for i, message in enumerate(steps[2:]):
-            delay = (i + 1) * gap_ms
-            is_last = i == len(steps[2:]) - 1
-
-            def fire(msg=message, last=is_last):
-                self._on_autofill_progress(msg)
-                if last:
-                    self.finish_autofill_log(ok=True)
-
-            self.after(delay, fire)
-        self.set_status("已开始自动填写 Toast 流程测试")
-
     def _restore_layout_after_browser_session(self):
         """After autofill browser closes, restore PDF preview or fullscreen."""
         if self._selected_path and Path(self._selected_path).is_file():
@@ -5336,18 +5303,21 @@ class App(customtkinter.CTk):
             if report.errors:
                 summary += f"：{report.errors[0]}"
         self.set_status(summary)
-        self.append_autofill_log(summary, error=err_n > 0 or cancelled or moved > 0)
-        self.finish_autofill_log(ok=err_n == 0 and moved == 0 and not cancelled)
         if cancelled:
+            # Exit already closed the terminal; don't reopen via append.
+            self.close_autofill_log()
             self.show_toast(
                 summary,
                 title="导出并自动填写",
                 duration_ms=TOAST_SUCCESS_MS,
             )
-        elif err_n == 0 and moved == 0:
-            self.show_success_toast("Successfully done", title="自动填写")
         else:
-            self.show_toast(summary, title="导出并自动填写")
+            self.append_autofill_log(summary, error=err_n > 0 or moved > 0)
+            self.finish_autofill_log(ok=err_n == 0 and moved == 0)
+            if err_n == 0 and moved == 0:
+                self.show_success_toast("Successfully done", title="自动填写")
+            else:
+                self.show_toast(summary, title="导出并自动填写")
 
     def _on_autofill_fail(self, message: str):
         self._autofill_busy = False
@@ -5355,7 +5325,7 @@ class App(customtkinter.CTk):
         self._restore_layout_after_browser_session()
         self.set_status(f"自动填写失败：{message}")
         self.append_autofill_log(f"自动填写失败：{message}", error=True)
-        self.finish_autofill_log(ok=False)
+        self.finish_autofill_log(ok=False, auto_close_ms=4000)
         self.show_toast(f"自动填写失败：{message}", title="导出并自动填写")
 
     def _export_rows(self) -> list[list[str]]:
