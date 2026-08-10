@@ -491,6 +491,48 @@ def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> 
     return path
 
 
+def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
+    """Place the Chromium window in the given screen rect via CDP."""
+    left, top, width, height = bounds
+    width = max(400, int(width))
+    height = max(400, int(height))
+    session = page.context.new_cdp_session(page)
+    info = session.send("Browser.getWindowForTarget")
+    session.send(
+        "Browser.setWindowBounds",
+        {
+            "windowId": info["windowId"],
+            "bounds": {
+                "left": int(left),
+                "top": int(top),
+                "width": width,
+                "height": height,
+                "windowState": "normal",
+            },
+        },
+    )
+
+
+def _step_pause(
+    gate: AutofillControl,
+    seconds: float,
+    *,
+    status: StatusFn | None = None,
+) -> None:
+    """Wait between major autofill steps while still honoring pause/exit."""
+    if seconds <= 0:
+        gate.checkpoint(status)
+        return
+    gate.checkpoint(status)
+    deadline = time.time() + float(seconds)
+    while True:
+        gate.checkpoint(status)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.12, remaining))
+
+
 def run_mas_autofill(
     items: list[AutofillItem],
     *,
@@ -501,7 +543,7 @@ def run_mas_autofill(
     username: str = "",
     password: str = "",
     headless: bool = False,
-    slow_mo: int = 200,
+    slow_mo: int = 100,
     batch_import: bool = True,
     fill_details: bool = True,
     upload_pdf: bool = True,
@@ -510,6 +552,8 @@ def run_mas_autofill(
     status: StatusFn | None = None,
     control: AutofillControl | None = None,
     testing: bool = False,
+    window_bounds: tuple[int, int, int, int] | None = None,
+    step_delay_sec: float = 1.0,
 ) -> AutofillReport:
     """
     Drive EAMS 计量器具结果录入 using a persistent Chromium profile.
@@ -517,6 +561,8 @@ def run_mas_autofill(
     If username/password are provided, the login form is autofilled when needed.
     Pass ``control`` to support pause / continue / exit from the UI.
     Set ``testing=True`` to use the UAT hosts and a separate browser profile.
+    ``window_bounds`` snaps the browser like the PDF preview (left=app, right=browser).
+    ``step_delay_sec`` pauses between major automation steps (default 1s).
     """
     if not items and not (batch_import and excel_rows):
         raise ValueError("没有可自动填写的条目")
@@ -527,9 +573,25 @@ def run_mas_autofill(
     profile = Path(user_data_dir or env.user_data_dir)
     profile.mkdir(parents=True, exist_ok=True)
     gate = control or AutofillControl()
+    delay = max(0.0, float(step_delay_sec))
 
     def check():
         gate.checkpoint(status)
+
+    def pause_step(label: str | None = None):
+        if label:
+            _status(status, label)
+        _step_pause(gate, delay, status=status)
+
+    launch_args: list[str] = []
+    if window_bounds is not None:
+        left, top, width, height = window_bounds
+        launch_args.extend(
+            [
+                f"--window-position={int(left)},{int(top)}",
+                f"--window-size={max(400, int(width))},{max(400, int(height))}",
+            ]
+        )
 
     with sync_playwright() as p:
         context = None
@@ -543,10 +605,17 @@ def run_mas_autofill(
                 # Follow the real OS window size (avoids fixed 1400×900 letterboxing).
                 no_viewport=True,
                 accept_downloads=True,
+                args=launch_args or None,
             )
             gate.bind_context(context)
             page = context.pages[0] if context.pages else context.new_page()
+            if window_bounds is not None:
+                try:
+                    _set_browser_window_bounds(page, window_bounds)
+                except Exception:  # noqa: BLE001
+                    pass
             check()
+            pause_step()
             if username and password:
                 login_eams(
                     page,
@@ -560,6 +629,7 @@ def run_mas_autofill(
                 _status(status, f"打开 EAMS 主页（{env.label}；如需登录请在浏览器中完成）…")
                 page.goto(env.home, wait_until="domcontentloaded")
             check()
+            pause_step()
             shell = _wait_for_shell(
                 page,
                 login_wait_seconds=login_wait_seconds,
@@ -568,11 +638,13 @@ def run_mas_autofill(
             )
 
             check()
+            pause_step()
             _status(status, "进入「计量器具结果录入」…")
             _open_measure_app(shell, status=status)
 
             if batch_import and excel_path:
                 check()
+                pause_step()
                 excel_path = Path(excel_path)
                 if not excel_path.exists():
                     if excel_rows is None or excel_headers is None:
@@ -587,6 +659,7 @@ def run_mas_autofill(
                 upload_pdf = True
                 for i, item in enumerate(items, start=1):
                     check()
+                    pause_step()
                     serial = (item.fields.serial_num or "").strip()
                     label = serial or item.fields.name or f"#{i}"
                     pdf = Path(item.pdf_path) if item.pdf_path else None
@@ -598,8 +671,10 @@ def run_mas_autofill(
                             )
                         _status(status, f"填写第 {i}/{len(items)} 份：{label}")
                         check()
+                        pause_step()
                         _open_record_by_serial(shell, serial, status=status)
                         check()
+                        pause_step()
                         _verify_compare_fields(shell, item.fields, status=status)
                         check()
                         if _needs_result_confirm(shell, status=status):
@@ -609,13 +684,16 @@ def run_mas_autofill(
                             )
                         if fill_details:
                             check()
+                            pause_step()
                             _fill_record_fields(shell, item.fields, status=status)
                             report.filled += 1
                         check()
+                        pause_step()
                         _upload_certificate_pdf(shell, pdf, status=status)
                         report.uploaded += 1
                         if submit_workflow:
                             check()
+                            pause_step()
                             _submit_workflow(shell, status=status)
                     except AutofillCancelled:
                         raise

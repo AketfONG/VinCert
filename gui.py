@@ -37,6 +37,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 UI_SETTINGS_PATH = PROJECT_ROOT / "ui_settings.json"
 UI_SCALE_NORMAL = 1.0
 UI_SCALE_ZOOMED = 1.2
+DEFAULT_AUTOFILL_STEP_DELAY_SEC = 1.0
+AUTOFILL_EXIT_WARN_MS = 10_000
 
 
 DEFAULT_FAILED_ITEMS_DIR = FAILED_ITEMS_DIR.resolve()
@@ -55,6 +57,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "failed_items_dir": str(DEFAULT_FAILED_ITEMS_DIR),
         "testing_mode": False,
         "demo_folder": "",
+        "autofill_step_delay_sec": DEFAULT_AUTOFILL_STEP_DELAY_SEC,
     }
     if not settings_path.exists():
         return dict(defaults)
@@ -83,6 +86,12 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["testing_mode"] = bool(data["testing_mode"])
     if "demo_folder" in data and data["demo_folder"]:
         out["demo_folder"] = str(data["demo_folder"])
+    if "autofill_step_delay_sec" in data:
+        try:
+            delay = float(data["autofill_step_delay_sec"])
+            out["autofill_step_delay_sec"] = max(0.0, min(30.0, delay))
+        except (TypeError, ValueError):
+            pass
     return out
 
 
@@ -189,6 +198,23 @@ def save_demo_folder(folder: str | Path | None, path: Path | None = None) -> str
         except Exception:  # noqa: BLE001
             pass
     save_ui_settings(demo_folder=value)
+    return value
+
+
+def load_autofill_step_delay_sec(path: Path | None = None) -> float:
+    """Seconds to pause between autofill steps (default 1.0)."""
+    raw = load_ui_settings(path).get(
+        "autofill_step_delay_sec", DEFAULT_AUTOFILL_STEP_DELAY_SEC
+    )
+    try:
+        return max(0.0, min(30.0, float(raw)))
+    except (TypeError, ValueError):
+        return DEFAULT_AUTOFILL_STEP_DELAY_SEC
+
+
+def save_autofill_step_delay_sec(seconds: float, path: Path | None = None) -> float:
+    value = max(0.0, min(30.0, float(seconds)))
+    save_ui_settings(autofill_step_delay_sec=value)
     return value
 
 
@@ -405,8 +431,11 @@ class App(customtkinter.CTk):
         self._failed_items_dir = load_failed_items_dir()
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
+        self._autofill_step_delay_sec = load_autofill_step_delay_sec()
         self._content_wrap_labels: list[customtkinter.CTkLabel] = []
         self._pdf_preview_layout_active = False
+        # Ignore the next preview-closed callback (intentional close before re-snap).
+        self._pdf_preview_suppress_restore = False
         self._pdf_preview = PdfPreviewController(
             on_closed=lambda: self.after(0, self._on_pdf_preview_closed),
             status=lambda msg: self.after(0, lambda m=msg: self.set_status(m)),
@@ -476,7 +505,7 @@ class App(customtkinter.CTk):
                 user32 = ctypes.windll.user32
                 # Prefer the monitor that contains this window (multi-monitor safe).
                 try:
-                    hwnd = int(self.winfo_id())
+                    hwnd = self._win_toplevel_hwnd() or int(self.winfo_id())
                     MONITOR_DEFAULTTONEAREST = 2
                     monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
                     info = MONITORINFO()
@@ -510,46 +539,160 @@ class App(customtkinter.CTk):
         # macOS / fallback: full screen size (Dock may still overlap slightly).
         return 0, 0, int(self.winfo_screenwidth()), int(self.winfo_screenheight())
 
-    def _apply_window_fullscreen(self):
-        """Maximize / fill the screen when no PDF preview is open."""
-        self._pdf_preview_layout_active = False
+    def _win_toplevel_hwnd(self) -> int | None:
+        """Return the Win32 HWND for this Tk toplevel (outer frame), if available."""
+        if sys.platform != "win32":
+            return None
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            GA_ROOT = 2
+            # Prefer the OS root window; winfo_id() alone is often an inner child.
+            try:
+                child = int(self.winfo_id())
+                root = int(user32.GetAncestor(child, GA_ROOT) or 0)
+                if root:
+                    return root
+            except Exception:  # noqa: BLE001
+                pass
+            # wm_frame() may be "0x...." — use base 0 so the prefix parses.
+            try:
+                frame = str(self.wm_frame()).strip()
+                if frame:
+                    return int(frame, 0)
+            except Exception:  # noqa: BLE001
+                pass
+            return int(self.winfo_id())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _set_app_bounds(self, left: int, top: int, width: int, height: int) -> None:
+        """Place VinCert exactly in a screen rect (respects Windows work area).
+
+        On Windows, Win32 SetWindowPos sizes the *outer* frame to the work area.
+        Tk ``geometry`` sizes the *client* area, which would push the title bar /
+        borders into the taskbar — never use that for fullscreen/snap on win32.
+        """
+        left, top = int(left), int(top)
+        width, height = max(400, int(width)), max(400, int(height))
         try:
             if sys.platform == "darwin":
                 try:
                     self.attributes("-fullscreen", False)
                 except Exception:  # noqa: BLE001
                     pass
+            # Never use state('zoomed') — it ignores the taskbar on some DPI setups.
             self.state("normal")
         except Exception:  # noqa: BLE001
             pass
         self.update_idletasks()
+
         if sys.platform == "win32":
-            try:
-                self.state("zoomed")
-                return
-            except Exception:  # noqa: BLE001
-                pass
+            hwnd = self._win_toplevel_hwnd()
+            if hwnd:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    user32 = ctypes.windll.user32
+                    # SWP_NOZORDER | SWP_SHOWWINDOW — exact outer-frame placement.
+                    SWP_NOZORDER = 0x0004
+                    SWP_SHOWWINDOW = 0x0040
+                    user32.SetWindowPos(
+                        wintypes.HWND(hwnd),
+                        wintypes.HWND(0),
+                        left,
+                        top,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_SHOWWINDOW,
+                    )
+                    self.update_idletasks()
+
+                    # Clamp if DPI / DWM still pushed us past the work rect.
+                    class RECT(ctypes.Structure):
+                        _fields_ = [
+                            ("left", wintypes.LONG),
+                            ("top", wintypes.LONG),
+                            ("right", wintypes.LONG),
+                            ("bottom", wintypes.LONG),
+                        ]
+
+                    rect = RECT()
+                    if user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+                        work_x, work_y, work_w, work_h = self._screen_work_area()
+                        work_right = work_x + work_w
+                        work_bottom = work_y + work_h
+                        over_x = max(0, int(rect.right) - work_right)
+                        over_y = max(0, int(rect.bottom) - work_bottom)
+                        if over_x or over_y or int(rect.left) < work_x or int(rect.top) < work_y:
+                            user32.SetWindowPos(
+                                wintypes.HWND(hwnd),
+                                wintypes.HWND(0),
+                                work_x if int(rect.left) < work_x else left,
+                                work_y if int(rect.top) < work_y else top,
+                                max(400, width - over_x),
+                                max(400, height - over_y),
+                                SWP_NOZORDER | SWP_SHOWWINDOW,
+                            )
+                            self.update_idletasks()
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # Non-Windows (or Win32 API unavailable): Tk geometry is best-effort.
+        self.geometry(f"{width}x{height}+{left}+{top}")
+        self.update_idletasks()
+
+    def _apply_window_fullscreen(self):
+        """Fill the monitor work area when no side browser is open (taskbar-safe)."""
+        self._pdf_preview_layout_active = False
         x, y, w, h = self._screen_work_area()
-        self.geometry(f"{w}x{h}+{x}+{y}")
-        if sys.platform == "darwin":
-            try:
-                self.state("zoomed")
-            except Exception:  # noqa: BLE001
-                pass
+        # Always use explicit work-area bounds so Windows taskbar is respected
+        # (state('zoomed') can still overlap the bottom nav bar with DPI quirks).
+        self._set_app_bounds(x, y, w, h)
+        # CTk/Tk may fight the first placement during bootstrap — re-assert.
+        self.after(50, lambda: self._reassert_work_area_bounds(full=True))
+        self.after(200, lambda: self._reassert_work_area_bounds(full=True))
+
+    def _reassert_work_area_bounds(self, *, full: bool) -> None:
+        """Re-apply snap/fullscreen if layout flags still match (taskbar-safe)."""
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        if full and self._pdf_preview_layout_active:
+            return
+        if not full and not self._pdf_preview_layout_active:
+            return
+        x, y, w, h = self._screen_work_area()
+        if full:
+            self._set_app_bounds(x, y, w, h)
+        else:
+            half = max(640, w // 2)
+            self._set_app_bounds(x, y, half, h)
 
     def _snap_app_left_half(self):
-        """Place VinCert on the left half of the work area."""
+        """Place VinCert on the left half of the work area (taskbar-safe)."""
         x, y, w, h = self._screen_work_area()
         half = max(640, w // 2)
-        try:
-            if sys.platform == "darwin":
-                self.attributes("-fullscreen", False)
-            self.state("normal")
-        except Exception:  # noqa: BLE001
-            pass
-        self.update_idletasks()
-        self.geometry(f"{half}x{h}+{x}+{y}")
+        self._set_app_bounds(x, y, half, h)
         self._pdf_preview_layout_active = True
+        self.after(50, lambda: self._reassert_work_area_bounds(full=False))
+        self.after(200, lambda: self._reassert_work_area_bounds(full=False))
+
+    def _prepare_side_browser_layout(self) -> tuple[int, int, int, int]:
+        """Snap VinCert left and return remaining bounds for a browser window."""
+        # Autofill / preview share one side-by-side layout.
+        if self._pdf_preview.is_open:
+            # Closing triggers on_closed asynchronously — don't expand to fullscreen.
+            self._pdf_preview_suppress_restore = True
+            self._pdf_preview.close()
+        self._snap_app_left_half()
+        self.update_idletasks()
+        return self._pdf_preview_bounds_remaining()
 
     def _pdf_preview_bounds_remaining(self) -> tuple[int, int, int, int]:
         """Size the browser to the unused work-area space beside VinCert.
@@ -601,15 +744,15 @@ class App(customtkinter.CTk):
         """Open/update PDF preview when a file is selected; otherwise fullscreen."""
         path = self._selected_path
         if path and Path(path).is_file():
-            self._snap_app_left_half()
-            # Let Tk apply geometry before measuring the remaining region.
-            self.update_idletasks()
-            self._pdf_preview.show(path, self._pdf_preview_bounds_remaining())
+            if self._autofill_busy:
+                return
+            bounds = self._prepare_side_browser_layout()
+            self._pdf_preview.show(path, bounds)
             return
         if self._pdf_preview.is_open:
             self._pdf_preview.close()
-        else:
-            self._apply_window_fullscreen()
+        # No side browser — fill the work area immediately (don't wait on close callback).
+        self._apply_window_fullscreen()
 
     def _on_pdf_preview_closed(self):
         """Restore fullscreen when the Chromium preview window is closed."""
@@ -618,10 +761,15 @@ class App(customtkinter.CTk):
                 return
         except Exception:  # noqa: BLE001
             return
+        if self._pdf_preview_suppress_restore:
+            self._pdf_preview_suppress_restore = False
+            return
+        if self._autofill_busy:
+            return
         if self._pdf_preview.is_open:
             return
-        if self._pdf_preview_layout_active:
-            self._apply_window_fullscreen()
+        # User closed the preview (or it died) — expand VinCert to the work area.
+        self._apply_window_fullscreen()
 
     def _track_content_wrap(self, label: customtkinter.CTkLabel) -> customtkinter.CTkLabel:
         self._content_wrap_labels.append(label)
@@ -1606,6 +1754,49 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(
             content,
+            text="自动填写",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=4, column=0, sticky="ew", pady=(24, 8))
+
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text="每个自动化步骤之间的等待时间（秒）。默认 1 秒。",
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=5, column=0, sticky="ew", pady=(0, 8))
+
+        delay_row = customtkinter.CTkFrame(content, fg_color="transparent")
+        delay_row.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        delay_row.grid_columnconfigure(0, weight=1)
+        customtkinter.CTkLabel(delay_row, text="步骤间隔（秒）", anchor="w").grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        self.autofill_step_delay_entry = self._make_field_entry(
+            delay_row, placeholder="1.0"
+        )
+        self.autofill_step_delay_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        self.autofill_step_delay_entry.insert(0, f"{self._autofill_step_delay_sec:g}")
+        customtkinter.CTkButton(
+            delay_row,
+            corner_radius=UI_RADIUS,
+            text="保存",
+            width=88,
+            height=40,
+            fg_color=PRIMARY_BTN_FG,
+            hover_color=PRIMARY_BTN_HOVER,
+            text_color=PRIMARY_BTN_TEXT,
+            font=self._button_font(FONT_BUTTON),
+            command=self._save_autofill_step_delay,
+        ).grid(row=1, column=1, sticky="e")
+
+        customtkinter.CTkLabel(
+            content,
             text="界面与功能",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
@@ -2120,18 +2311,18 @@ class App(customtkinter.CTk):
     def _nudge_window_geometry_after_scale(self):
         """Force Tk/CTk to refill the window after scale-down (clears black bars)."""
         try:
+            # Prefer re-applying work-area snap (never state('zoomed') — taskbar).
+            if self._pdf_preview_layout_active:
+                self._snap_app_left_half()
+                return
+            if sys.platform == "win32":
+                self._apply_window_fullscreen()
+                return
             width = int(self.winfo_width())
             height = int(self.winfo_height())
             if width <= 1 or height <= 1:
                 return
-            state = str(self.state())
-            if state == "zoomed":
-                # Windows maximized: toggle to force a full relayout.
-                self.state("normal")
-                self.update_idletasks()
-                self.state("zoomed")
-                return
-            # Normal / macOS fullscreen space: 1px nudge clears letterboxing.
+            # macOS / other: 1px nudge clears letterboxing.
             self.geometry(f"{width}x{height + 1}")
             self.update_idletasks()
             self.geometry(f"{width}x{height}")
@@ -2829,6 +3020,26 @@ class App(customtkinter.CTk):
         if hasattr(self, "doc_list_frame"):
             self._bind_scrollable_mousewheel(self.doc_list_frame, widget)
 
+    def _mousewheel_scroll_steps(self, event) -> int:
+        """Canvas yview units for one wheel/trackpad event (tuned for usable speed)."""
+        # Default Tk/CTk is ~1 unit per notch — feels like a crawl on long lists.
+        speed = 5
+        if sys.platform == "darwin":
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return 0
+            # Trackpad often sends ±1; multiply. Larger deltas (mouse) scale less.
+            if abs(delta) <= 1:
+                return -delta * speed
+            return int(-delta * max(2, speed // 2))
+        if sys.platform.startswith("win"):
+            delta = int(getattr(event, "delta", 0) or 0)
+            notches = int(delta / 120) if delta else 0
+            if notches == 0 and delta:
+                notches = 1 if delta > 0 else -1
+            return -notches * speed
+        return (-speed) if getattr(event, "num", 0) == 4 else speed
+
     def _on_scrollable_mousewheel(self, scrollable, event):
         if (
             self._autofill_busy
@@ -2842,12 +3053,9 @@ class App(customtkinter.CTk):
             return
         if canvas.yview() == (0.0, 1.0):
             return
-        if sys.platform == "darwin":
-            canvas.yview_scroll(int(-1 * event.delta), "units")
-        elif sys.platform.startswith("win"):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        else:
-            canvas.yview_scroll(-1 if getattr(event, "num", 0) == 4 else 1, "units")
+        steps = self._mousewheel_scroll_steps(event)
+        if steps:
+            canvas.yview_scroll(steps, "units")
         return "break"
 
     def _on_doc_list_mousewheel(self, event):
@@ -3304,6 +3512,17 @@ class App(customtkinter.CTk):
             return self._widget_scaling_factor()
         return 1.0
 
+    def _doc_list_ctk_font_size(self, size: int) -> int:
+        """CTk design-unit size so rendered text matches doc-list canvas fonts.
+
+        CTk multiplies font size by widget scaling; doc-list canvas text applies
+        scaling only when the list-text switch is on.
+        """
+        if self._doc_list_scale_fonts:
+            return max(1, int(size))
+        scale = self._widget_scaling_factor()
+        return max(1, int(round(size / scale)))
+
     def _doc_tk_font(self, size: int) -> tkfont.Font:
         """Tk font for doc-list cells; optionally follows CTk UI zoom."""
         scale = self._doc_list_font_scale()
@@ -3409,6 +3628,15 @@ class App(customtkinter.CTk):
                     pass
         self._highlight_selected_doc()
         self._schedule_doc_list_scrollbar_sync()
+        self._refresh_doc_name_tip_font()
+
+    def _refresh_doc_name_tip_font(self):
+        """Rebuild an open name hover tip so it follows the list text-size switch."""
+        path = self._doc_name_tip_path
+        if path is None or self._doc_name_tip is None:
+            return
+        self._hide_doc_name_tip()
+        self._show_doc_name_tip(path)
 
     def _set_doc_canvas_surface(self, canvas: tk.Canvas, surface) -> None:
         try:
@@ -3490,7 +3718,7 @@ class App(customtkinter.CTk):
             text=full_name,
             anchor="w",
             justify="left",
-            font=customtkinter.CTkFont(size=FONT_BODY),
+            font=customtkinter.CTkFont(size=self._doc_list_ctk_font_size(FONT_BODY)),
             text_color=DOC_ROW_ACTIVE_TEXT if selected else TOAST_TITLE_COLOR,
             fg_color="transparent",
         )
@@ -4624,15 +4852,16 @@ class App(customtkinter.CTk):
             self.append_autofill_log("已暂停（等待确认退出）")
 
         self._autofill_exit_confirming = True
-        self.set_status("确认是否退出自动填写…")
+        self.set_status("10 秒后将退出自动填写（可取消）…")
+        self.append_autofill_log("退出倒计时 10 秒 — 确认退出或等待结束；点取消可继续")
         self.show_toast(
-            "自动填写已暂停。确认退出将结束本次填写；取消则继续。",
+            "自动填写已暂停。\n10 秒后将退出本次填写。\n点「确认退出」立即结束，点「取消」继续填写。",
             title="退出自动填写",
             action_text="确认退出",
             undo_text="取消",
             on_undo=self._cancel_autofill_exit,
             on_complete=self._confirm_autofill_exit,
-            duration_ms=TOAST_DEFAULT_MS,
+            duration_ms=AUTOFILL_EXIT_WARN_MS,
             style="danger",
         )
 
@@ -4767,6 +4996,30 @@ class App(customtkinter.CTk):
             return
         self.set_status("EAMS 登录信息已保存")
         self.show_success_toast("登录信息已保存。", title="EAMS 登录")
+
+    def _save_autofill_step_delay(self):
+        raw = ""
+        if hasattr(self, "autofill_step_delay_entry"):
+            raw = self.autofill_step_delay_entry.get().strip()
+        if not raw:
+            raw = str(DEFAULT_AUTOFILL_STEP_DELAY_SEC)
+        try:
+            value = float(raw)
+        except ValueError:
+            self.set_status("步骤间隔必须是数字（秒）")
+            self.show_toast(
+                "请输入有效的秒数，例如 1 或 1.5。",
+                title="自动填写",
+                duration_ms=TOAST_SUCCESS_MS,
+            )
+            return
+        self._autofill_step_delay_sec = save_autofill_step_delay_sec(value)
+        if hasattr(self, "autofill_step_delay_entry"):
+            self.autofill_step_delay_entry.delete(0, "end")
+            self.autofill_step_delay_entry.insert(0, f"{self._autofill_step_delay_sec:g}")
+        msg = f"步骤间隔已设为 {self._autofill_step_delay_sec:g} 秒"
+        self.set_status(msg)
+        self.show_success_toast(msg, title="自动填写")
 
     def _cert_nav_text(self) -> str:
         total = len(self._imported_files)
@@ -4905,12 +5158,18 @@ class App(customtkinter.CTk):
         self._autofill_busy = True
         self._autofill_control = AutofillControl()
         self._show_autofill_run_controls()
+        browser_bounds = self._prepare_side_browser_layout()
+        step_delay = float(self._autofill_step_delay_sec)
         export_msg = f"已导出 {len(excel_rows)} 份到 exports/{excel_path.name}"
         start_msg = f"开始自动填写 {len(items)} 份…"
         self.set_status(f"自动填写开始：{len(items)} 份 → {excel_path.name}")
         self.show_success_toast(export_msg, title="导出 Excel")
         self.show_success_toast(start_msg, title="自动填写")
         self.open_autofill_log()
+        self.append_autofill_log(
+            f"浏览器侧栏布局 · 步骤间隔 {step_delay:g}s · "
+            f"{'测试环境' if self._testing_mode else '正式环境'}"
+        )
 
         username, password = self._eams_credentials()
         if not username or not password:
@@ -4939,6 +5198,8 @@ class App(customtkinter.CTk):
                     status=lambda msg: self.after(0, lambda m=msg: self._on_autofill_progress(m)),
                     control=control,
                     testing=bool(self._testing_mode),
+                    window_bounds=browser_bounds,
+                    step_delay_sec=step_delay,
                 )
                 self.after(0, lambda: self._on_autofill_done(report, excel_path))
             except Exception as exc:  # noqa: BLE001
@@ -5011,9 +5272,17 @@ class App(customtkinter.CTk):
             self.after(delay, fire)
         self.set_status("已开始自动填写 Toast 流程测试")
 
+    def _restore_layout_after_browser_session(self):
+        """After autofill browser closes, restore PDF preview or fullscreen."""
+        if self._selected_path and Path(self._selected_path).is_file():
+            self._sync_pdf_preview()
+        else:
+            self._apply_window_fullscreen()
+
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
         self._restore_autofill_button()
+        self._restore_layout_after_browser_session()
 
         quarantine = [
             p
@@ -5083,6 +5352,7 @@ class App(customtkinter.CTk):
     def _on_autofill_fail(self, message: str):
         self._autofill_busy = False
         self._restore_autofill_button()
+        self._restore_layout_after_browser_session()
         self.set_status(f"自动填写失败：{message}")
         self.append_autofill_log(f"自动填写失败：{message}", error=True)
         self.finish_autofill_log(ok=False)
