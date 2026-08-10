@@ -47,7 +47,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
     settings_path = Path(path or UI_SETTINGS_PATH)
     defaults = {
         "ui_zoomed": True,
-        "ocr_enabled": True,
+        "ocr_enabled": False,
         "buttons_bold": True,
         "content_centering": True,
         "status_dots": False,
@@ -107,8 +107,8 @@ def save_ui_zoomed(zoomed: bool, path: Path | None = None) -> Path:
 
 
 def load_ocr_enabled(path: Path | None = None) -> bool:
-    """Return True when OCR extraction is enabled (default: on)."""
-    return bool(load_ui_settings(path).get("ocr_enabled", True))
+    """Return True when OCR extraction is enabled (default: off)."""
+    return bool(load_ui_settings(path).get("ocr_enabled", False))
 
 
 def save_ocr_enabled(enabled: bool, path: Path | None = None) -> Path:
@@ -447,7 +447,11 @@ class App(customtkinter.CTk):
         self._maybe_autoload_demo_folder()
 
     def _screen_work_area(self) -> tuple[int, int, int, int]:
-        """Return (x, y, width, height) for the usable desktop area."""
+        """Return (x, y, width, height) for the usable desktop area.
+
+        On Windows this uses the monitor work rect (excludes the taskbar /
+        bottom navigation bar). Falls back to full screen metrics elsewhere.
+        """
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -461,9 +465,36 @@ class App(customtkinter.CTk):
                         ("bottom", wintypes.LONG),
                     ]
 
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", RECT),
+                        ("rcWork", RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    ]
+
+                user32 = ctypes.windll.user32
+                # Prefer the monitor that contains this window (multi-monitor safe).
+                try:
+                    hwnd = int(self.winfo_id())
+                    MONITOR_DEFAULTTONEAREST = 2
+                    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                    info = MONITORINFO()
+                    info.cbSize = ctypes.sizeof(MONITORINFO)
+                    if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                        work = info.rcWork
+                        return (
+                            int(work.left),
+                            int(work.top),
+                            int(work.right - work.left),
+                            int(work.bottom - work.top),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
+
                 rect = RECT()
                 SPI_GETWORKAREA = 0x0030
-                if ctypes.windll.user32.SystemParametersInfoW(
+                if user32.SystemParametersInfoW(
                     SPI_GETWORKAREA, 0, ctypes.byref(rect), 0
                 ):
                     return (
@@ -474,7 +505,9 @@ class App(customtkinter.CTk):
                     )
             except Exception:  # noqa: BLE001
                 pass
+
         self.update_idletasks()
+        # macOS / fallback: full screen size (Dock may still overlap slightly).
         return 0, 0, int(self.winfo_screenwidth()), int(self.winfo_screenheight())
 
     def _apply_window_fullscreen(self):
@@ -518,17 +551,60 @@ class App(customtkinter.CTk):
         self.geometry(f"{half}x{h}+{x}+{y}")
         self._pdf_preview_layout_active = True
 
-    def _pdf_preview_bounds_right(self) -> tuple[int, int, int, int]:
-        x, y, w, h = self._screen_work_area()
-        half = max(640, w // 2)
-        return (x + half, y, max(400, w - half), h)
+    def _pdf_preview_bounds_remaining(self) -> tuple[int, int, int, int]:
+        """Size the browser to the unused work-area space beside VinCert.
+
+        Uses the live gui.py window geometry so the preview gets whatever
+        remains (typically to the right), not a hard-coded half split.
+        """
+        self.update_idletasks()
+        work_x, work_y, work_w, work_h = self._screen_work_area()
+        work_right = work_x + work_w
+        work_bottom = work_y + work_h
+
+        app_left = int(self.winfo_rootx())
+        app_top = int(self.winfo_rooty())
+        app_width = max(int(self.winfo_width()), 1)
+        app_height = max(int(self.winfo_height()), 1)
+        app_right = app_left + app_width
+        app_bottom = app_top + app_height
+
+        # Prefer the strip to the right of the app within the work area.
+        right_width = work_right - app_right
+        if right_width >= 400:
+            left = max(app_right, work_x)
+            top = work_y
+            width = work_right - left
+            height = work_h
+            return (left, top, max(400, width), max(400, height))
+
+        # Prefer the strip to the left of the app.
+        left_width = app_left - work_x
+        if left_width >= 400:
+            return (work_x, work_y, max(400, left_width), max(400, work_h))
+
+        # Prefer space below the app (unusual, but better than overlapping).
+        below = work_bottom - app_bottom
+        if below >= 300:
+            return (
+                work_x,
+                max(app_bottom, work_y),
+                max(400, work_w),
+                max(300, below),
+            )
+
+        # Last resort: right half of the work area.
+        half = max(400, work_w // 2)
+        return (work_x + work_w - half, work_y, half, max(400, work_h))
 
     def _sync_pdf_preview(self):
         """Open/update PDF preview when a file is selected; otherwise fullscreen."""
         path = self._selected_path
         if path and Path(path).is_file():
             self._snap_app_left_half()
-            self._pdf_preview.show(path, self._pdf_preview_bounds_right())
+            # Let Tk apply geometry before measuring the remaining region.
+            self.update_idletasks()
+            self._pdf_preview.show(path, self._pdf_preview_bounds_remaining())
             return
         if self._pdf_preview.is_open:
             self._pdf_preview.close()
@@ -1687,7 +1763,10 @@ class App(customtkinter.CTk):
         self._track_content_wrap(
             customtkinter.CTkLabel(
                 content,
-                text="开启后，启动应用时会自动加载演示证书文件夹。",
+                text=(
+                    "开启后使用 EAMS 测试环境（UAT）自动填写，"
+                    "并在启动时自动加载演示证书文件夹。"
+                ),
                 anchor="w",
                 font=customtkinter.CTkFont(size=FONT_BODY),
                 text_color="gray60",
@@ -1697,7 +1776,7 @@ class App(customtkinter.CTk):
         ).grid(row=15, column=0, sticky="ew", pady=(0, 6))
         self.testing_mode_switch = customtkinter.CTkSwitch(
             content,
-            text="启用测试模式",
+            text="启用测试模式（EAMS UAT）",
             font=customtkinter.CTkFont(size=FONT_BODY),
         )
         if self._testing_mode:
@@ -1781,17 +1860,22 @@ class App(customtkinter.CTk):
         self._testing_mode = enabled
         save_testing_mode(enabled)
         if enabled:
+            env_note = "EAMS 测试环境（auth.masuat.apps.ocpuat）"
             if self._demo_folder and Path(self._demo_folder).is_dir():
-                self.set_status(f"测试模式已开启 · 启动时加载：{self._demo_folder}")
+                self.set_status(f"测试模式已开启 · {env_note} · 启动时加载：{self._demo_folder}")
             else:
-                self.set_status("测试模式已开启 · 请先选择演示证书文件夹")
+                self.set_status(f"测试模式已开启 · {env_note} · 请先选择演示证书文件夹")
                 self.show_toast(
-                    "请先选择演示证书文件夹，下次启动才会自动加载。",
+                    "已切换到 EAMS 测试环境。\n请先选择演示证书文件夹，下次启动才会自动加载。",
                     title="测试模式",
                     duration_ms=TOAST_SUCCESS_MS,
                 )
         else:
-            self.set_status("测试模式已关闭")
+            self.set_status("测试模式已关闭 · 使用 EAMS 正式环境")
+            self.show_success_toast(
+                "已切换到 EAMS 正式环境。",
+                title="测试模式",
+            )
 
     def _pick_demo_folder(self):
         initial = self._demo_folder if self._demo_folder and Path(self._demo_folder).is_dir() else None
@@ -4854,6 +4938,7 @@ class App(customtkinter.CTk):
                     submit_workflow=False,
                     status=lambda msg: self.after(0, lambda m=msg: self._on_autofill_progress(m)),
                     control=control,
+                    testing=bool(self._testing_mode),
                 )
                 self.after(0, lambda: self._on_autofill_done(report, excel_path))
             except Exception as exc:  # noqa: BLE001

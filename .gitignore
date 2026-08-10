@@ -226,6 +226,7 @@ __marimo__/
 
 # VinCert / Playwright — local runtime data (do not commit contents)
 mas_browser_data/
+mas_browser_data_uat/
 eams_credentials.json
 ui_settings.json
 exports/*

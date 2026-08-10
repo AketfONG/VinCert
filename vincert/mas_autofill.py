@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -11,12 +12,23 @@ from typing import Callable
 
 from .models import CertificateFields
 
-EAMS_HOME = (
-    "https://eams.manage.masuat.mtr.bj.cn/maximo/oslc/graphite/"
+# Production (正式环境)
+EAMS_HOME_PROD = (
+    "https://eams.manage.mas.mtr.bj.cn/maximo/oslc/graphite/"
     "manage-shell/index.html#/main"
 )
-EAMS_LOGIN_URL = "https://auth.masuat.mtr.bj.cn/login/"
-# Keep alias for older call sites.
+EAMS_LOGIN_PROD = "https://auth.mas.mtr.bj.cn/login/"
+
+# UAT / testing (测试环境) — same Maximo flow, different hosts
+EAMS_HOME_UAT = (
+    "https://eams.manage.masuat.apps.ocpuat.mtr.bj.cn/maximo/oslc/graphite/"
+    "manage-shell/index.html#/main"
+)
+EAMS_LOGIN_UAT = "https://auth.masuat.apps.ocpuat.mtr.bj.cn/login/"
+
+# Back-compat aliases (default = production)
+EAMS_HOME = EAMS_HOME_PROD
+EAMS_LOGIN_URL = EAMS_LOGIN_PROD
 MAS_HOME = EAMS_HOME
 SHELL_IFRAME = "#manage-shell_Iframe"
 UPLOAD_IFRAME = "#upload_iframe"
@@ -24,11 +36,45 @@ UPLOAD_IFRAME = "#upload_iframe"
 # Default profile lives next to the project so login cookies persist across runs.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_USER_DATA_DIR = PROJECT_ROOT / "mas_browser_data"
+UAT_USER_DATA_DIR = PROJECT_ROOT / "mas_browser_data_uat"
 CREDENTIALS_PATH = PROJECT_ROOT / "eams_credentials.json"
 EXPORTS_DIR = PROJECT_ROOT / "exports"
 FAILED_ITEMS_DIR = PROJECT_ROOT / "failed_items"
 
 StatusFn = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class EamsEnvironment:
+    """Resolved EAMS hosts + persistent Chromium profile for one environment."""
+
+    key: str
+    label: str
+    home: str
+    login: str
+    user_data_dir: Path
+    post_login_url_glob: str
+
+
+def resolve_eams_environment(*, testing: bool = False) -> EamsEnvironment:
+    """Return production or UAT endpoints (and matching browser profile)."""
+    if testing:
+        return EamsEnvironment(
+            key="uat",
+            label="测试环境",
+            home=EAMS_HOME_UAT,
+            login=EAMS_LOGIN_UAT,
+            user_data_dir=UAT_USER_DATA_DIR,
+            post_login_url_glob="**/eams.manage.masuat.apps.ocpuat.mtr.bj.cn/**",
+        )
+    return EamsEnvironment(
+        key="prod",
+        label="正式环境",
+        home=EAMS_HOME_PROD,
+        login=EAMS_LOGIN_PROD,
+        user_data_dir=DEFAULT_USER_DATA_DIR,
+        post_login_url_glob="**/eams.manage.mas.mtr.bj.cn/**",
+    )
 
 
 @dataclass
@@ -76,15 +122,34 @@ class AutofillControl:
         self._pause = threading.Event()
         self._cancel = threading.Event()
         self._context = None
+        self._browser = None
+        self._browser_pid: int | None = None
         self._context_lock = threading.Lock()
 
     def bind_context(self, context) -> None:
         with self._context_lock:
             self._context = context
+            browser = None
+            pid = None
+            try:
+                browser = getattr(context, "browser", None)
+            except Exception:  # noqa: BLE001
+                browser = None
+            if browser is not None:
+                try:
+                    proc = getattr(browser, "process", None)
+                    if proc is not None:
+                        pid = int(proc.pid)
+                except Exception:  # noqa: BLE001
+                    pid = None
+            self._browser = browser
+            self._browser_pid = pid
 
     def clear_context(self) -> None:
         with self._context_lock:
             self._context = None
+            self._browser = None
+            self._browser_pid = None
 
     def pause(self) -> None:
         self._pause.set()
@@ -96,17 +161,45 @@ class AutofillControl:
         return self._pause.is_set()
 
     def request_exit(self) -> None:
-        """Signal cancel and close the browser to unblock any Playwright wait."""
+        """Signal cancel and force-close the browser to unblock Playwright waits."""
         self._cancel.set()
         self._pause.clear()  # unblock any pause wait
         with self._context_lock:
             ctx = self._context
+            browser = self._browser
+            pid = self._browser_pid
             self._context = None
-        if ctx is not None:
+            self._browser = None
+            self._browser_pid = None
+
+        def _force_close() -> None:
+            # Close from a helper thread — sync Playwright is blocked on the worker.
             try:
-                ctx.close()
+                if ctx is not None:
+                    for page in list(getattr(ctx, "pages", []) or []):
+                        try:
+                            page.close(run_before_unload=False)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    try:
+                        ctx.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if pid:
+                _kill_process(pid)
+
+        threading.Thread(
+            target=_force_close,
+            name="vincert-autofill-exit",
+            daemon=True,
+        ).start()
 
     def cancelled(self) -> bool:
         return self._cancel.is_set()
@@ -119,6 +212,28 @@ class AutofillControl:
             time.sleep(0.12)
         if self._cancel.is_set():
             raise AutofillCancelled("用户退出自动填写")
+
+
+def _kill_process(pid: int) -> None:
+    """Best-effort kill of a Chromium process (unblocks hung Playwright waits)."""
+    try:
+        import os
+        import signal
+
+        os.kill(pid, signal.SIGTERM)
+    except Exception:  # noqa: BLE001
+        pass
+    if sys.platform == "win32":
+        try:
+            import subprocess
+
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 COMPARE_FIELD_LABELS = {
@@ -306,6 +421,7 @@ def login_eams(
     *,
     login_wait_seconds: int = 120,
     status: StatusFn | None = None,
+    env: EamsEnvironment | None = None,
 ) -> None:
     """Open EAMS and autofill credentials when a login form is shown."""
     username = (username or "").strip()
@@ -313,15 +429,16 @@ def login_eams(
     if not username or not password:
         raise ValueError("请先在设置中填写 EAMS 用户名和密码")
 
-    _status(status, "打开 EAMS…")
-    page.goto(EAMS_HOME, wait_until="domcontentloaded")
+    target = env or resolve_eams_environment(testing=False)
+    _status(status, f"打开 EAMS（{target.label}）…")
+    page.goto(target.home, wait_until="domcontentloaded")
     if _already_logged_in(page, timeout_ms=5000):
         _status(status, "已检测到登录会话")
         return
 
     # Prefer dedicated auth portal; fall back to whatever redirect landed on.
     try:
-        page.goto(EAMS_LOGIN_URL, wait_until="domcontentloaded")
+        page.goto(target.login, wait_until="domcontentloaded")
     except Exception:  # noqa: BLE001
         pass
 
@@ -335,12 +452,12 @@ def login_eams(
     deadline_ms = max(login_wait_seconds, 30) * 1000
     _status(status, "等待登录完成…")
     try:
-        page.wait_for_url("**/eams.manage.mas.mtr.bj.cn/**", timeout=deadline_ms)
+        page.wait_for_url(target.post_login_url_glob, timeout=deadline_ms)
     except Exception:  # noqa: BLE001
         pass
-    page.goto(EAMS_HOME, wait_until="domcontentloaded")
+    page.goto(target.home, wait_until="domcontentloaded")
     page.wait_for_selector(SHELL_IFRAME, timeout=deadline_ms)
-    _status(status, "EAMS 登录成功")
+    _status(status, f"EAMS 登录成功（{target.label}）")
 
 
 def next_export_path(prefix: str = "vincert_batch") -> Path:
@@ -392,19 +509,22 @@ def run_mas_autofill(
     login_wait_seconds: int = 300,
     status: StatusFn | None = None,
     control: AutofillControl | None = None,
+    testing: bool = False,
 ) -> AutofillReport:
     """
     Drive EAMS 计量器具结果录入 using a persistent Chromium profile.
 
     If username/password are provided, the login form is autofilled when needed.
     Pass ``control`` to support pause / continue / exit from the UI.
+    Set ``testing=True`` to use the UAT hosts and a separate browser profile.
     """
     if not items and not (batch_import and excel_rows):
         raise ValueError("没有可自动填写的条目")
 
     sync_playwright = ensure_playwright()
     report = AutofillReport()
-    profile = Path(user_data_dir or DEFAULT_USER_DATA_DIR)
+    env = resolve_eams_environment(testing=testing)
+    profile = Path(user_data_dir or env.user_data_dir)
     profile.mkdir(parents=True, exist_ok=True)
     gate = control or AutofillControl()
 
@@ -415,12 +535,13 @@ def run_mas_autofill(
         context = None
         try:
             check()
-            _status(status, "正在启动浏览器…")
+            _status(status, f"正在启动浏览器（{env.label}）…")
             context = p.chromium.launch_persistent_context(
                 user_data_dir=str(profile),
                 headless=headless,
                 slow_mo=slow_mo,
-                viewport={"width": 1400, "height": 900},
+                # Follow the real OS window size (avoids fixed 1400×900 letterboxing).
+                no_viewport=True,
                 accept_downloads=True,
             )
             gate.bind_context(context)
@@ -433,12 +554,18 @@ def run_mas_autofill(
                     password,
                     login_wait_seconds=login_wait_seconds,
                     status=status,
+                    env=env,
                 )
             else:
-                _status(status, "打开 EAMS 主页（如需登录请在浏览器中完成）…")
-                page.goto(EAMS_HOME, wait_until="domcontentloaded")
+                _status(status, f"打开 EAMS 主页（{env.label}；如需登录请在浏览器中完成）…")
+                page.goto(env.home, wait_until="domcontentloaded")
             check()
-            shell = _wait_for_shell(page, login_wait_seconds=login_wait_seconds, status=status)
+            shell = _wait_for_shell(
+                page,
+                login_wait_seconds=login_wait_seconds,
+                status=status,
+                control=gate,
+            )
 
             check()
             _status(status, "进入「计量器具结果录入」…")
@@ -536,10 +663,12 @@ def open_eams_login_session(
     user_data_dir: Path | None = None,
     login_wait_seconds: int = 180,
     status: StatusFn | None = None,
+    testing: bool = False,
 ) -> None:
     """Launch browser, autofill EAMS login, then close after session is established."""
     sync_playwright = ensure_playwright()
-    profile = Path(user_data_dir or DEFAULT_USER_DATA_DIR)
+    env = resolve_eams_environment(testing=testing)
+    profile = Path(user_data_dir or env.user_data_dir)
     profile.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
@@ -547,7 +676,7 @@ def open_eams_login_session(
             user_data_dir=str(profile),
             headless=False,
             slow_mo=100,
-            viewport={"width": 1400, "height": 900},
+            no_viewport=True,
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
@@ -557,6 +686,7 @@ def open_eams_login_session(
                 password,
                 login_wait_seconds=login_wait_seconds,
                 status=status,
+                env=env,
             )
             _wait_for_shell(page, login_wait_seconds=login_wait_seconds, status=status)
             _status(status, "EAMS 登录完成，会话已保存")
@@ -564,22 +694,44 @@ def open_eams_login_session(
             context.close()
 
 
-def _wait_for_shell(page, *, login_wait_seconds: int, status: StatusFn | None):
+def _wait_for_shell(
+    page,
+    *,
+    login_wait_seconds: int,
+    status: StatusFn | None,
+    control: AutofillControl | None = None,
+):
     """Wait until the Maximo shell iframe is available (after optional login)."""
     deadline_ms = max(login_wait_seconds, 30) * 1000
-    try:
-        page.wait_for_selector(SHELL_IFRAME, timeout=min(20_000, deadline_ms))
-    except Exception:
-        _status(status, "未检测到已登录会话，请在浏览器中登录…")
-        page.wait_for_selector(SHELL_IFRAME, timeout=deadline_ms)
+    slice_ms = 2_000
+    waited = 0
+    prompted = False
+    while True:
+        if control is not None:
+            control.checkpoint(status)
+        try:
+            page.wait_for_selector(SHELL_IFRAME, timeout=slice_ms)
+            break
+        except Exception:
+            waited += slice_ms
+            if waited >= min(20_000, deadline_ms) and not prompted:
+                _status(status, "未检测到已登录会话，请在浏览器中登录…")
+                prompted = True
+            if waited >= deadline_ms:
+                page.wait_for_selector(SHELL_IFRAME, timeout=slice_ms)
+                break
 
     shell = _shell(page)
     # Prefer the measure-entry link; fall back to any shell content.
     try:
+        if control is not None:
+            control.checkpoint(status)
         shell.get_by_role("link", name="计量器具结果录入", exact=True).wait_for(
             timeout=min(30_000, deadline_ms)
         )
     except Exception:
+        if control is not None and control.cancelled():
+            raise AutofillCancelled("用户退出自动填写")
         _status(status, "等待主界面菜单加载…")
         page.wait_for_timeout(2000)
     return shell

@@ -179,7 +179,7 @@ class PdfPreviewController:
                                     f"{max(400, int(bounds[3]))}",
                                 ],
                             )
-                            page = browser.new_page(viewport=None)
+                            page = browser.new_page(no_viewport=True)
                         assert page is not None
                         self._set_window_bounds(page, bounds)
                         url = path_to_file_url(path)
