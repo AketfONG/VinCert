@@ -17,6 +17,7 @@ EAMS_HOME_PROD = (
     "https://eams.manage.mas.mtr.bj.cn/maximo/oslc/graphite/"
     "manage-shell/index.html#/main"
 )
+EAMS_PORTAL_PROD = "https://eams.home.mas.mtr.bj.cn/"
 EAMS_LOGIN_PROD = "https://auth.mas.mtr.bj.cn/login/"
 
 # UAT / testing (测试环境) — same Maximo flow, different hosts
@@ -24,6 +25,7 @@ EAMS_HOME_UAT = (
     "https://eams.manage.masuat.apps.ocpuat.mtr.bj.cn/maximo/oslc/graphite/"
     "manage-shell/index.html#/main"
 )
+EAMS_PORTAL_UAT = "https://eams.home.masuat.apps.ocpuat.mtr.bj.cn/"
 EAMS_LOGIN_UAT = "https://auth.masuat.apps.ocpuat.mtr.bj.cn/login/"
 
 # Back-compat aliases (default = production)
@@ -142,6 +144,7 @@ class EamsEnvironment:
     key: str
     label: str
     home: str
+    portal: str
     login: str
     user_data_dir: Path
     post_login_url_glob: str
@@ -154,6 +157,7 @@ def resolve_eams_environment(*, testing: bool = False) -> EamsEnvironment:
             key="uat",
             label="测试环境",
             home=EAMS_HOME_UAT,
+            portal=EAMS_PORTAL_UAT,
             login=EAMS_LOGIN_UAT,
             user_data_dir=UAT_USER_DATA_DIR,
             post_login_url_glob="**/eams.manage.masuat.apps.ocpuat.mtr.bj.cn/**",
@@ -162,6 +166,7 @@ def resolve_eams_environment(*, testing: bool = False) -> EamsEnvironment:
         key="prod",
         label="正式环境",
         home=EAMS_HOME_PROD,
+        portal=EAMS_PORTAL_PROD,
         login=EAMS_LOGIN_PROD,
         user_data_dir=DEFAULT_USER_DATA_DIR,
         post_login_url_glob="**/eams.manage.mas.mtr.bj.cn/**",
@@ -443,6 +448,96 @@ def _fill_textbox(
     box.press("Tab")
 
 
+def _open_maximo_dropdown(
+    frame,
+    name: str,
+    *,
+    timeout: float = 8000,
+    status: StatusFn | None = None,
+) -> None:
+    """Open a Maximo combobox via field click and/or 下拉映像."""
+    # Prefer the explicit dropdown glyph used by Maximo look-ups.
+    try:
+        arrow = frame.get_by_label(name).get_by_role("img", name="下拉映像")
+        if arrow.count() > 0 and arrow.first.is_visible():
+            _click(status, arrow.first, f"{name}·下拉", timeout=timeout)
+            return
+    except Exception:  # noqa: BLE001
+        pass
+    _click(status, frame.get_by_role("combobox", name=name), name, timeout=timeout)
+
+
+def _dropdown_value_candidates(value: str) -> list[str]:
+    """Return likely option labels for a certificate field value."""
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    aliases = {
+        "检定": ["检定", "Verification", "verification"],
+        "校准": ["校准", "Calibration", "calibration"],
+        "校验": ["校验", "校准/校验", "Check", "check"],
+    }
+    out: list[str] = []
+    for token in [raw, *aliases.get(raw, [])]:
+        if token and token not in out:
+            out.append(token)
+    # Also try without common trailing punctuation / whitespace variants.
+    compact = "".join(raw.split())
+    if compact and compact not in out:
+        out.append(compact)
+    return out
+
+
+def _click_dropdown_option(
+    frame,
+    value: str,
+    *,
+    timeout: float = 8000,
+    status: StatusFn | None = None,
+    page=None,
+) -> bool:
+    """Try to click an open Maximo dropdown option. Returns True on success."""
+    candidates = _dropdown_value_candidates(value)
+    # Let the popup paint.
+    time.sleep(0.28)
+
+    scopes = [frame]
+    root = page
+    if root is None:
+        root = getattr(frame, "page", None)
+    if root is not None and root is not frame:
+        scopes.append(root)
+
+    for scope in scopes:
+        for candidate in candidates:
+            getters = (
+                lambda c=candidate, s=scope: s.get_by_role(
+                    "menuitem", name=c, exact=True
+                ),
+                lambda c=candidate, s=scope: s.get_by_role(
+                    "option", name=c, exact=True
+                ),
+                lambda c=candidate, s=scope: s.get_by_text(c, exact=True),
+                lambda c=candidate, s=scope: s.get_by_role("menuitem", name=c),
+                lambda c=candidate, s=scope: s.get_by_text(c, exact=False),
+            )
+            for getter in getters:
+                try:
+                    loc = getter()
+                    if loc.count() <= 0:
+                        continue
+                    node = loc.first
+                    try:
+                        node.wait_for(state="visible", timeout=min(2500, timeout))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    _click(status, node, candidate, timeout=timeout)
+                    return True
+                except Exception:  # noqa: BLE001
+                    continue
+    return False
+
+
 def _select_combobox(
     frame,
     name: str,
@@ -450,23 +545,48 @@ def _select_combobox(
     *,
     timeout: float = 8000,
     status: StatusFn | None = None,
+    page=None,
 ) -> None:
     if not value:
         return
-    _click(status, frame.get_by_role("combobox", name=name), name, timeout=timeout)
-    # Maximo lookup menus surface as menuitem / option / plain text.
-    for getter in (
-        lambda: frame.get_by_role("menuitem", name=value, exact=True),
-        lambda: frame.get_by_role("option", name=value, exact=True),
-        lambda: frame.get_by_text(value, exact=True),
+    target = (value or "").strip()
+    _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
+    if _click_dropdown_option(
+        frame, target, timeout=timeout, status=status, page=page
     ):
-        loc = getter()
+        return
+
+    # Type-to-filter fallback (editable Maximo comboboxes).
+    try:
+        box = frame.get_by_role("combobox", name=name)
+        _click(status, box, name, timeout=timeout)
+        box.fill(target, timeout=timeout)
+        if _click_dropdown_option(
+            frame, target, timeout=timeout, status=status, page=page
+        ):
+            return
+        box.press("Enter")
+        time.sleep(0.2)
+        # If the combobox retained our value, treat as success.
         try:
-            if loc.count() > 0:
-                _click(status, loc.first, value, timeout=timeout)
+            current = (box.input_value(timeout=1500) or "").strip()
+            if target in current or current in target:
                 return
         except Exception:  # noqa: BLE001
-            continue
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    # One more open+click attempt after typing.
+    try:
+        _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
+        if _click_dropdown_option(
+            frame, target, timeout=timeout, status=status, page=page
+        ):
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
     raise RuntimeError(f"无法选择下拉项：{name} = {value}")
 
 
@@ -635,6 +755,56 @@ def _fill_eams_login_form(
     _click_auth_primary_button(page, label="登录", status=status)
 
 
+def _maybe_open_available_manage(
+    page,
+    env: EamsEnvironment,
+    *,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+) -> bool:
+    """Open Manage via the portal「Available Manage」link when that chooser appears.
+
+    Matches recorded flow:
+      page.goto(env.portal)
+      page.get_by_role("link", name="Available Manage").click()
+    Returns True if the link was clicked.
+    """
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
+    check()
+    # Prefer clicking if the link is already on the current page (auth redirect).
+    link = page.get_by_role("link", name="Available Manage")
+    visible = False
+    try:
+        visible = link.count() > 0 and bool(link.first.is_visible())
+    except Exception:  # noqa: BLE001
+        visible = False
+
+    if not visible:
+        try:
+            _status(status, f"打开 EAMS 门户（{env.label}）…")
+            page.goto(env.portal, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            return False
+        check()
+        link = page.get_by_role("link", name="Available Manage")
+        try:
+            link.first.wait_for(state="visible", timeout=5_000)
+            visible = True
+        except Exception:  # noqa: BLE001
+            return False
+
+    if not visible:
+        return False
+
+    check()
+    _click(status, link.first, "Available Manage", timeout=8_000)
+    return True
+
+
 def login_eams(
     page,
     username: str,
@@ -705,6 +875,16 @@ def login_eams(
     _fill_eams_login_form(page, username, password, status=status)
     check()
 
+    # Post-password app chooser (UAT/prod): portal → Available Manage, if shown.
+    try:
+        _maybe_open_available_manage(
+            page, target, status=status, control=control
+        )
+    except AutofillCancelled:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
+
     deadline = time.time() + max(login_wait_seconds, 30)
     _status(status, "等待登录完成…")
     navigated_home = False
@@ -752,7 +932,8 @@ def login_eams(
         if control is not None and control.cancelled():
             raise AutofillCancelled("用户退出自动填写") from exc
         raise TimeoutError(
-            f"登录超时（{target.label}）：未进入 EAMS 主界面。请确认账号密码或在浏览器中手动登录后重试。"
+            f"登录超时（{target.label}）：未进入 EAMS 主界面。"
+            "请确认账号密码或在浏览器中手动登录后重试。"
         ) from exc
 
 
@@ -858,6 +1039,8 @@ def run_mas_autofill(
     testing: bool = False,
     window_bounds: tuple[int, int, int, int] | None = None,
     step_delay_sec: float = 1.0,
+    shared_context=None,
+    shared_page=None,
 ) -> AutofillReport:
     """
     Drive EAMS 计量器具结果录入 using a persistent Chromium profile.
@@ -867,17 +1050,19 @@ def run_mas_autofill(
     Set ``testing=True`` to use the UAT hosts and a separate browser profile.
     ``window_bounds`` snaps the browser like the PDF preview (left=app, right=browser).
     ``step_delay_sec`` pauses between major automation steps (default 1s).
+    Pass ``shared_context`` + ``shared_page`` to reuse the PDF preview Chromium
+    window (EAMS runs in its own tab and is not closed afterward).
     """
     if not items and not (batch_import and excel_rows):
         raise ValueError("没有可自动填写的条目")
 
-    sync_playwright = ensure_playwright()
     report = AutofillReport()
     env = resolve_eams_environment(testing=testing)
     profile = Path(user_data_dir or env.user_data_dir)
     profile.mkdir(parents=True, exist_ok=True)
     gate = control or AutofillControl()
     delay = max(0.0, float(step_delay_sec))
+    owns_browser = shared_context is None or shared_page is None
 
     def check():
         gate.checkpoint(status)
@@ -887,47 +1072,57 @@ def run_mas_autofill(
             _status(status, label)
         _step_pause(gate, delay, status=status)
 
-    launch_args: list[str] = []
-    if window_bounds is not None:
-        left, top, width, height = window_bounds
-        launch_args.extend(
-            [
-                f"--window-position={int(left)},{int(top)}",
-                f"--window-size={max(400, int(width))},{max(400, int(height))}",
-            ]
-        )
-
-    # A prior kept-alive session must be closed before reusing the profile dir.
-    close_keepalive_browser()
-
-    playwright = sync_playwright().start()
+    playwright = None
     context = None
+    page = None
     try:
         check()
-        _status(status, f"正在启动浏览器（{env.label}）…")
-        # Playwright staging dir (GUID names). Completed files are copied to
-        # the real Downloads folder via _wire_browser_downloads.
-        pw_dl = PROJECT_ROOT / "browser_downloads" / "playwright_tmp"
-        pw_dl.mkdir(parents=True, exist_ok=True)
-        context = playwright.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=headless,
-            slow_mo=slow_mo,
-            # Follow the real OS window size (avoids fixed 1400×900 letterboxing).
-            no_viewport=True,
-            accept_downloads=True,
-            downloads_path=str(pw_dl),
-            args=launch_args or None,
-        )
+        if owns_browser:
+            sync_playwright = ensure_playwright()
+            launch_args: list[str] = []
+            if window_bounds is not None:
+                left, top, width, height = window_bounds
+                launch_args.extend(
+                    [
+                        f"--window-position={int(left)},{int(top)}",
+                        f"--window-size={max(400, int(width))},{max(400, int(height))}",
+                    ]
+                )
+            # A prior kept-alive session must be closed before reusing the profile dir.
+            close_keepalive_browser()
+            playwright = sync_playwright().start()
+            _status(status, f"正在启动浏览器（{env.label}）…")
+            pw_dl = PROJECT_ROOT / "browser_downloads" / "playwright_tmp"
+            pw_dl.mkdir(parents=True, exist_ok=True)
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=str(profile),
+                headless=headless,
+                slow_mo=slow_mo,
+                no_viewport=True,
+                accept_downloads=True,
+                downloads_path=str(pw_dl),
+                args=launch_args or None,
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            if window_bounds is not None:
+                try:
+                    _set_browser_window_bounds(page, window_bounds)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            context = shared_context
+            page = shared_page
+            _status(status, f"使用共享浏览器（{env.label}）…")
+            if window_bounds is not None:
+                try:
+                    _set_browser_window_bounds(page, window_bounds)
+                except Exception:  # noqa: BLE001
+                    pass
+
         downloads_dir = _wire_browser_downloads(context, status=status)
         _status(status, f"浏览器下载将保存到：{downloads_dir}")
         gate.bind_context(context, user_data_dir=profile)
-        page = context.pages[0] if context.pages else context.new_page()
-        if window_bounds is not None:
-            try:
-                _set_browser_window_bounds(page, window_bounds)
-            except Exception:  # noqa: BLE001
-                pass
+
         check()
         pause_step()
         if username and password:
@@ -1008,11 +1203,15 @@ def run_mas_autofill(
                     if fill_details:
                         check()
                         pause_step()
-                        _fill_record_fields(shell, item.fields, status=status)
+                        _fill_record_fields(
+                            shell, item.fields, status=status, page=page
+                        )
                         report.filled += 1
                     check()
                     pause_step()
-                    _upload_certificate_pdf(shell, pdf, status=status)
+                    _upload_certificate_pdf(
+                        shell, pdf, status=status, page=page
+                    )
                     report.uploaded += 1
                     if submit_workflow:
                         check()
@@ -1047,7 +1246,7 @@ def run_mas_autofill(
             report.cancelled = True
             _status(status, "已退出自动填写")
         else:
-            if context is None:
+            if owns_browser and context is None and playwright is not None:
                 try:
                     playwright.stop()
                 except Exception:  # noqa: BLE001
@@ -1055,12 +1254,13 @@ def run_mas_autofill(
             raise
     finally:
         gate.clear_context()
-        if context is not None:
+        if owns_browser and context is not None and playwright is not None:
             _retain_keepalive(playwright, context)
             _status(status, "自动化结束（浏览器保持打开）")
+        elif not owns_browser:
+            _status(status, "自动化结束（共享浏览器保持打开）")
 
     return report
-
 
 def open_eams_login_session(
     username: str,
@@ -1433,13 +1633,21 @@ def _needs_result_confirm(shell, *, status: StatusFn | None = None) -> bool:
 
 
 def _fill_record_fields(
-    shell, fields: CertificateFields, *, status: StatusFn | None = None
+    shell,
+    fields: CertificateFields,
+    *,
+    status: StatusFn | None = None,
+    page=None,
 ) -> None:
     """Fill certificate type, check date, result info (and related dates/org)."""
     if fields.measurement_type:
         try:
             _select_combobox(
-                shell, "检验方式", fields.measurement_type, status=status
+                shell,
+                "检验方式",
+                fields.measurement_type,
+                status=status,
+                page=page,
             )
         except Exception as exc:  # noqa: BLE001
             raise AutofillItemError(
@@ -1467,15 +1675,20 @@ def _fill_record_fields(
                 "检验结果",
                 timeout=3000,
             )
-            _click(
-                status,
-                shell.get_by_role("menuitem", name=result, exact=True),
-                result,
-                timeout=3000,
-            )
+            if not _click_dropdown_option(
+                shell, result, timeout=3000, status=status, page=page
+            ):
+                _click(
+                    status,
+                    shell.get_by_role("menuitem", name=result, exact=True),
+                    result,
+                    timeout=3000,
+                )
         except Exception:
             try:
-                _select_combobox(shell, "检验结果", result, status=status)
+                _select_combobox(
+                    shell, "检验结果", result, status=status, page=page
+                )
             except Exception:
                 pass
 
@@ -1483,7 +1696,7 @@ def _fill_record_fields(
 
 
 def _upload_certificate_pdf(
-    shell, pdf_path: str | Path, *, status: StatusFn | None = None
+    shell, pdf_path: str | Path, *, status: StatusFn | None = None, page=None
 ) -> None:
     path = Path(pdf_path)
     if not path.is_file():
@@ -1493,7 +1706,7 @@ def _upload_certificate_pdf(
     _status(status, f"选择附件：{path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(path))
     try:
-        _select_combobox(shell, "类型", "证书", status=status)
+        _select_combobox(shell, "类型", "证书", status=status, page=page)
     except Exception as exc:  # noqa: BLE001
         try:
             current = _read_labeled_value(shell, "类型")

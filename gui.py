@@ -25,6 +25,7 @@ from vincert.mas_autofill import (
     close_keepalive_browser,
     load_credentials,
     next_export_path,
+    resolve_eams_environment,
     run_mas_autofill,
     save_credentials,
     write_batch_excel,
@@ -715,13 +716,13 @@ class App(customtkinter.CTk):
         self.after(50, lambda: self._reassert_geometry_bounds(full=False))
         self.after(200, lambda: self._reassert_geometry_bounds(full=False))
 
+    def _browser_profile_dir(self) -> Path:
+        """Persistent Chromium profile shared by PDF preview + EAMS tabs."""
+        return resolve_eams_environment(testing=bool(self._testing_mode)).user_data_dir
+
     def _prepare_side_browser_layout(self) -> tuple[int, int, int, int]:
-        """Snap VinCert left and return remaining bounds for a browser window."""
-        # Autofill / preview share one side-by-side layout.
-        if self._pdf_preview.is_open:
-            # Closing triggers on_closed asynchronously — don't expand to fullscreen.
-            self._pdf_preview_suppress_restore = True
-            self._pdf_preview.close()
+        """Snap VinCert left and return remaining bounds for the shared browser."""
+        # Never close PDF / EAMS tabs here — they share one Chromium window.
         self._snap_app_left_half()
         self.update_idletasks()
         self.update()
@@ -773,32 +774,39 @@ class App(customtkinter.CTk):
         half = max(400, work_w // 2)
         return (work_x + work_w - half, work_y, half, max(400, work_h))
 
+    def _sync_window_layout_to_browser(self) -> None:
+        """Fullscreen when no Playwright window; otherwise keep split."""
+        if self._pdf_preview.is_open:
+            if not self._pdf_preview_layout_active:
+                self._snap_app_left_half()
+            return
+        self._apply_window_fullscreen()
+
     def _sync_pdf_preview(self):
-        """Open/update PDF preview when a file is selected; otherwise fullscreen."""
+        """Open/update PDF tab when a file is selected; close PDF tab otherwise."""
         path = self._selected_path
+        profile = self._browser_profile_dir()
         if path and Path(path).is_file():
             if self._autofill_busy:
                 return
-            if self._pdf_preview.is_open:
-                # Keep the same Chromium window — only navigate to the new file:// URL.
-                if not self._pdf_preview_layout_active:
-                    self._snap_app_left_half()
-                self.update_idletasks()
-                bounds = self._pdf_preview_bounds_remaining()
-                self._pdf_preview.show(path, bounds)
-                self._pdf_preview.focus()
-                return
-            bounds = self._prepare_side_browser_layout()
-            self._pdf_preview.show(path, bounds)
+            if not self._pdf_preview_layout_active:
+                self._snap_app_left_half()
+            self.update_idletasks()
+            bounds = (
+                self._pdf_preview_bounds_remaining()
+                if self._pdf_preview.is_open
+                else self._prepare_side_browser_layout()
+            )
+            self._pdf_preview.show(path, bounds, profile_dir=profile)
             self._pdf_preview.focus()
             return
-        if self._pdf_preview.is_open:
+        # No document selected — close PDF tab only; keep EAMS if present.
+        if self._pdf_preview.has_pdf:
             self._pdf_preview.close()
-        # No side browser — fill the work area immediately (don't wait on close callback).
-        self._apply_window_fullscreen()
+        self._sync_window_layout_to_browser()
 
     def _on_pdf_preview_closed(self):
-        """Restore fullscreen when the Chromium preview window is closed."""
+        """Called when the shared Chromium window fully closes (not PDF-tab-only)."""
         try:
             if not self.winfo_exists():
                 return
@@ -811,7 +819,6 @@ class App(customtkinter.CTk):
             return
         if self._pdf_preview.is_open:
             return
-        # User closed the preview (or it died) — expand VinCert to the work area.
         self._apply_window_fullscreen()
 
     def _track_content_wrap(self, label: customtkinter.CTkLabel) -> customtkinter.CTkLabel:
@@ -5343,8 +5350,10 @@ class App(customtkinter.CTk):
         control = self._autofill_control
 
         def worker():
-            try:
-                report = run_mas_autofill(
+            profile = self._browser_profile_dir()
+
+            def _run(context, page):
+                return run_mas_autofill(
                     items,
                     excel_path=excel_path,
                     excel_headers=excel_headers,
@@ -5355,11 +5364,25 @@ class App(customtkinter.CTk):
                     fill_details=True,
                     upload_pdf=True,  # compulsory: corresponding PDF always uploaded
                     submit_workflow=False,
-                    status=lambda msg: self.after(0, lambda m=msg: self._on_autofill_progress(m)),
+                    status=lambda msg: self.after(
+                        0, lambda m=msg: self._on_autofill_progress(m)
+                    ),
                     control=control,
                     testing=bool(self._testing_mode),
                     window_bounds=browser_bounds,
                     step_delay_sec=step_delay,
+                    user_data_dir=profile,
+                    shared_context=context,
+                    shared_page=page,
+                )
+
+            try:
+                report = self._pdf_preview.run_on_browser(
+                    _run,
+                    bounds=browser_bounds,
+                    profile_dir=profile,
+                    accept_downloads=True,
+                    slow_mo=100,
                 )
                 self.after(0, lambda: self._on_autofill_done(report, excel_path))
             except Exception as exc:  # noqa: BLE001
@@ -5375,13 +5398,14 @@ class App(customtkinter.CTk):
         )
 
     def _restore_layout_after_browser_session(self):
-        """Keep side-by-side layout; autofill Chromium is left open on purpose."""
-        # Do not reopen PDF preview or fullscreen — that would fight the open
-        # EAMS window. Stay snapped left beside it.
-        try:
-            self._snap_app_left_half()
-        except Exception:  # noqa: BLE001
-            pass
+        """Split if Chromium is still open; otherwise fullscreen."""
+        self._sync_window_layout_to_browser()
+        # Re-open PDF tab beside EAMS when a certificate is still selected.
+        if not self._autofill_busy:
+            try:
+                self._sync_pdf_preview()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
