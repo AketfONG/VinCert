@@ -41,9 +41,98 @@ CREDENTIALS_PATH = PROJECT_ROOT / "eams_credentials.json"
 EXPORTS_DIR = PROJECT_ROOT / "exports"
 FAILED_ITEMS_DIR = PROJECT_ROOT / "failed_items"
 # How long autofill may wait for login / shell to appear (manual login OK).
-DEFAULT_LOGIN_WAIT_SECONDS = 3600  # 1 hour
+DEFAULT_LOGIN_WAIT_SECONDS = 120
+
+# Keep Playwright + persistent context alive after a run so Chromium stays open.
+_keepalive_lock = threading.Lock()
+_keepalive_playwright = None
+_keepalive_context = None
 
 StatusFn = Callable[[str], None]
+
+
+def _default_downloads_dir() -> Path:
+    """Prefer the OS Downloads folder so Excel opens like a normal browser save."""
+    home = Path.home()
+    for candidate in (home / "Downloads", home / "下载"):
+        try:
+            if candidate.is_dir():
+                return candidate
+        except Exception:  # noqa: BLE001
+            continue
+    fallback = PROJECT_ROOT / "browser_downloads"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _unique_download_target(directory: Path, filename: str) -> Path:
+    safe = Path(filename or "download.bin").name
+    target = directory / safe
+    if not target.exists():
+        return target
+    stem, suffix = target.stem, target.suffix
+    n = 1
+    while True:
+        candidate = directory / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _wire_browser_downloads(context, *, status: StatusFn | None = None) -> Path:
+    """Save Playwright-intercepted downloads as complete files with real names.
+
+    Playwright routes attachments through a temp GUID path; opening that too
+    early (or via the download shelf) often yields a corrupt .xlsx. We wait for
+    completion and ``save_as`` into the user Downloads folder.
+    """
+    dest = _default_downloads_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    def _on_download(download) -> None:
+        try:
+            failure = download.failure()
+            if failure:
+                _status(status, f"下载失败：{failure}")
+                return
+            name = download.suggested_filename or "download.bin"
+            target = _unique_download_target(dest, name)
+            download.save_as(str(target))
+            # Basic sanity: Excel is a ZIP (xlsx) or OLE (xls); HTML error pages are not.
+            try:
+                size = target.stat().st_size
+            except Exception:  # noqa: BLE001
+                size = -1
+            if size < 64:
+                _status(status, f"下载异常（文件过小 {size}B）：{target.name}")
+                return
+            head = b""
+            try:
+                with target.open("rb") as fh:
+                    head = fh.read(8)
+            except Exception:  # noqa: BLE001
+                pass
+            lower = name.lower()
+            if lower.endswith((".xlsx", ".xlsm", ".xls")) and not (
+                head.startswith(b"PK")
+                or head[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+            ):
+                _status(
+                    status,
+                    f"下载内容不像 Excel（可能是网页错误页）：{target.name}",
+                )
+                return
+            _status(status, f"已保存下载：{target.name} → {dest}")
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"下载保存失败：{exc}")
+
+    def _bind_page(page) -> None:
+        page.on("download", _on_download)
+
+    context.on("page", lambda page: _bind_page(page))
+    for page in list(context.pages or []):
+        _bind_page(page)
+    return dest
 
 
 @dataclass(frozen=True)
@@ -117,6 +206,10 @@ class AutofillCancelled(Exception):
     """User requested exit from the autofill run."""
 
 
+class AutofillBatchImportError(Exception):
+    """EAMS batch Excel import failed (e.g. EXCEL导入错误)."""
+
+
 class AutofillControl:
     """Cross-thread pause / resume / exit signals for ``run_mas_autofill``."""
 
@@ -173,49 +266,11 @@ class AutofillControl:
         return self._pause.is_set()
 
     def request_exit(self) -> None:
-        """Signal cancel and force-close the browser to unblock Playwright waits."""
+        """Signal cancel. Does not close the browser — session stays open for the user."""
         self._cancel.set()
         self._pause.clear()  # unblock any pause wait
-        with self._context_lock:
-            ctx = self._context
-            browser = self._browser
-            pid = self._browser_pid
-            profile = self._user_data_dir
-            self._context = None
-            self._browser = None
-            self._browser_pid = None
-
-        def _force_close() -> None:
-            # Close from a helper thread — sync Playwright is blocked on the worker.
-            try:
-                if ctx is not None:
-                    for page in list(getattr(ctx, "pages", []) or []):
-                        try:
-                            page.close(run_before_unload=False)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    try:
-                        ctx.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                if browser is not None:
-                    browser.close()
-            except Exception:  # noqa: BLE001
-                pass
-            if pid:
-                _kill_process(pid)
-            # Persistent-context Chromium often has no exposed PID — kill by profile path.
-            if profile is not None:
-                _kill_chromium_for_profile(profile)
-
-        threading.Thread(
-            target=_force_close,
-            name="vincert-autofill-exit",
-            daemon=True,
-        ).start()
+        # Intentionally do not close / kill Chromium: autofill must leave the
+        # window open after stop, Excel error, or normal completion.
 
     def cancelled(self) -> bool:
         return self._cancel.is_set()
@@ -301,6 +356,46 @@ def _kill_chromium_for_profile(user_data_dir: Path) -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+def close_keepalive_browser() -> None:
+    """Close any autofill Chromium left open from a previous run."""
+    global _keepalive_playwright, _keepalive_context
+    with _keepalive_lock:
+        ctx = _keepalive_context
+        pw = _keepalive_playwright
+        _keepalive_context = None
+        _keepalive_playwright = None
+    if ctx is not None:
+        try:
+            ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _retain_keepalive(playwright, context) -> None:
+    """Replace any prior keepalive session with the current browser."""
+    global _keepalive_playwright, _keepalive_context
+    with _keepalive_lock:
+        old_ctx = _keepalive_context
+        old_pw = _keepalive_playwright
+        _keepalive_context = context
+        _keepalive_playwright = playwright
+    if old_ctx is not None and old_ctx is not context:
+        try:
+            old_ctx.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if old_pw is not None and old_pw is not playwright:
+        try:
+            old_pw.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 COMPARE_FIELD_LABELS = {
@@ -421,64 +516,123 @@ def _already_logged_in(page, *, timeout_ms: int = 3000) -> bool:
         return False
 
 
+def _fill_username_field(page, username: str) -> None:
+    # UAT/prod MAS auth portal uses accessible name「输入用户名」(codegen).
+    for name in ("输入用户名", "用户名", "账号", "Username", "User name", "user"):
+        try:
+            box = page.get_by_role("textbox", name=name)
+            box.click(timeout=2500)
+            box.fill(username, timeout=2500)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+    for selector in (
+        'input[name="username"]',
+        'input[id="username"]',
+        'input[name="userName"]',
+        'input[type="text"]',
+        'input[type="email"]',
+    ):
+        loc = page.locator(selector)
+        try:
+            if loc.count() > 0:
+                loc.first.click(timeout=2500)
+                loc.first.fill(username, timeout=2500)
+                return
+        except Exception:  # noqa: BLE001
+            continue
+    raise RuntimeError("未找到用户名输入框")
+
+
+def _fill_password_field(page, password: str) -> None:
+    # UAT/prod MAS auth portal uses accessible name「输入密码」(codegen).
+    for name in ("输入密码", "密码", "Password"):
+        try:
+            box = page.get_by_role("textbox", name=name)
+            box.fill(password, timeout=4000)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+    for name in ("输入密码", "密码", "Password"):
+        try:
+            page.get_by_label(name).fill(password, timeout=4000)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+    loc = page.locator('input[type="password"]')
+    if loc.count() == 0:
+        raise RuntimeError("未找到密码输入框")
+    loc.first.fill(password, timeout=4000)
+
+
+def _click_auth_primary_button(
+    page,
+    *,
+    label: str,
+    status: StatusFn | None = None,
+    timeout: float = 5000,
+) -> None:
+    """Click the MAS auth primary button (codegen: get_by_test_id('Button'))."""
+    # Recorded UAT flow uses data-testid="Button" for both 继续 and 登录.
+    try:
+        btn = page.get_by_test_id("Button")
+        _status(status, f"点击「{label}」")
+        btn.click(timeout=timeout)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+
+    for name in (
+        label,
+        "继续",
+        "Continue",
+        "下一步",
+        "Next",
+        "登录",
+        "登 录",
+        "Sign in",
+        "Login",
+        "提交",
+    ):
+        try:
+            _click(status, page.get_by_role("button", name=name), name, timeout=timeout)
+            return
+        except Exception:  # noqa: BLE001
+            continue
+
+    submit = page.locator('button[type="submit"], input[type="submit"]')
+    if submit.count() == 0:
+        raise RuntimeError(f"未找到按钮：{label}")
+    _click(status, submit.first, label, timeout=timeout)
+
+
 def _fill_eams_login_form(
     page, username: str, password: str, *, status: StatusFn | None = None
 ) -> None:
-    """Fill username/password on the MAS auth portal and submit."""
-    user_filled = False
-    for name in ("用户名", "账号", "Username", "User name", "user"):
-        try:
-            page.get_by_role("textbox", name=name).fill(username, timeout=1500)
-            user_filled = True
-            break
-        except Exception:  # noqa: BLE001
-            continue
-    if not user_filled:
-        for selector in (
-            'input[name="username"]',
-            'input[id="username"]',
-            'input[name="userName"]',
-            'input[type="text"]',
-            'input[type="email"]',
-        ):
-            loc = page.locator(selector)
-            try:
-                if loc.count() > 0:
-                    loc.first.fill(username, timeout=1500)
-                    user_filled = True
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-    if not user_filled:
-        raise RuntimeError("未找到用户名输入框")
+    """MAS auth (UAT/prod): 输入用户名 → Button → 输入密码 → Button."""
+    _status(status, "填写用户名…")
+    _fill_username_field(page, username)
 
-    pass_filled = False
-    for name in ("密码", "Password"):
-        try:
-            page.get_by_label(name).fill(password, timeout=1500)
-            pass_filled = True
-            break
-        except Exception:  # noqa: BLE001
-            continue
-    if not pass_filled:
-        loc = page.locator('input[type="password"]')
-        if loc.count() == 0:
-            raise RuntimeError("未找到密码输入框")
-        loc.first.fill(password, timeout=1500)
+    _click_auth_primary_button(page, label="继续", status=status)
 
-    clicked = False
-    for name in ("登录", "登 录", "Sign in", "Login", "提交"):
+    # Password step appears after 继续 / primary Button.
+    page.wait_for_timeout(500)
+    try:
+        page.get_by_role("textbox", name="输入密码").wait_for(
+            state="visible", timeout=10_000
+        )
+    except Exception:  # noqa: BLE001
         try:
-            _click(status, page.get_by_role("button", name=name), name, timeout=1500)
-            clicked = True
-            break
+            page.locator('input[type="password"]').first.wait_for(
+                state="visible", timeout=5000
+            )
         except Exception:  # noqa: BLE001
-            continue
-    if not clicked:
-        submit = page.locator('button[type="submit"], input[type="submit"]')
-        if submit.count() == 0:
-            raise RuntimeError("未找到登录按钮")
-        _click(status, submit.first, "提交登录", timeout=3000)
+            pass
+
+    _status(status, "填写密码…")
+    _fill_password_field(page, password)
+
+    _click_auth_primary_button(page, label="登录", status=status)
 
 
 def login_eams(
@@ -491,7 +645,7 @@ def login_eams(
     env: EamsEnvironment | None = None,
     control: AutofillControl | None = None,
 ) -> None:
-    """Open EAMS and autofill credentials when a login form is shown.
+    """Open EAMS auth portal and autofill credentials.
 
     Waits are sliced so pause/exit can interrupt (avoids multi-minute hangs on UAT).
     """
@@ -505,23 +659,44 @@ def login_eams(
             control.checkpoint(status)
 
     target = env or resolve_eams_environment(testing=False)
+
+    # Auth portal first (matches recorded UAT codegen). If already logged in,
+    # home will show the shell without needing the form.
     check()
-    _status(status, f"打开 EAMS（{target.label}）…")
-    page.goto(target.home, wait_until="domcontentloaded")
+    _status(status, f"打开 EAMS 登录页（{target.label}）…")
+    try:
+        page.goto(target.login, wait_until="domcontentloaded")
+    except Exception:  # noqa: BLE001
+        page.goto(target.home, wait_until="domcontentloaded")
+
     check()
-    if _already_logged_in(page, timeout_ms=3000):
+    if _already_logged_in(page, timeout_ms=2500):
         _status(status, "已检测到登录会话")
         return
 
-    # Prefer dedicated auth portal; fall back to whatever redirect landed on.
+    # Wait for the username field used by MAS UAT/prod auth UI.
     try:
-        check()
-        page.goto(target.login, wait_until="domcontentloaded")
+        page.get_by_role("textbox", name="输入用户名").wait_for(
+            state="visible", timeout=10_000
+        )
     except Exception:  # noqa: BLE001
-        pass
+        # Fall back to home → login redirect if the portal didn't render.
+        try:
+            check()
+            page.goto(target.home, wait_until="domcontentloaded")
+            check()
+            if _already_logged_in(page, timeout_ms=2000):
+                _status(status, "已检测到登录会话")
+                return
+            page.goto(target.login, wait_until="domcontentloaded")
+            page.get_by_role("textbox", name="输入用户名").wait_for(
+                state="visible", timeout=8000
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     check()
-    if _already_logged_in(page, timeout_ms=1500):
+    if _already_logged_in(page, timeout_ms=1000):
         _status(status, "已检测到登录会话")
         return
 
@@ -613,7 +788,7 @@ def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> 
 
 
 def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
-    """Place the Chromium window in the given screen rect via CDP."""
+    """Place the Chromium window — native right snap on Windows, CDP elsewhere."""
     left, top, width, height = bounds
     width = max(400, int(width))
     height = max(400, int(height))
@@ -632,6 +807,14 @@ def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
             },
         },
     )
+    if sys.platform == "win32":
+        try:
+            from .win_snap import snap_chrome
+
+            time.sleep(0.12)
+            snap_chrome(side="right")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _step_pause(
@@ -714,144 +897,167 @@ def run_mas_autofill(
             ]
         )
 
-    with sync_playwright() as p:
-        context = None
-        try:
-            check()
-            _status(status, f"正在启动浏览器（{env.label}）…")
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(profile),
-                headless=headless,
-                slow_mo=slow_mo,
-                # Follow the real OS window size (avoids fixed 1400×900 letterboxing).
-                no_viewport=True,
-                accept_downloads=True,
-                args=launch_args or None,
-            )
-            gate.bind_context(context, user_data_dir=profile)
-            page = context.pages[0] if context.pages else context.new_page()
-            if window_bounds is not None:
-                try:
-                    _set_browser_window_bounds(page, window_bounds)
-                except Exception:  # noqa: BLE001
-                    pass
-            check()
-            pause_step()
-            if username and password:
-                login_eams(
-                    page,
-                    username,
-                    password,
-                    login_wait_seconds=login_wait_seconds,
-                    status=status,
-                    env=env,
-                    control=gate,
-                )
-            else:
-                _status(status, f"打开 EAMS 主页（{env.label}；如需登录请在浏览器中完成）…")
-                page.goto(env.home, wait_until="domcontentloaded")
-            check()
-            pause_step()
-            shell = _wait_for_shell(
+    # A prior kept-alive session must be closed before reusing the profile dir.
+    close_keepalive_browser()
+
+    playwright = sync_playwright().start()
+    context = None
+    try:
+        check()
+        _status(status, f"正在启动浏览器（{env.label}）…")
+        # Playwright staging dir (GUID names). Completed files are copied to
+        # the real Downloads folder via _wire_browser_downloads.
+        pw_dl = PROJECT_ROOT / "browser_downloads" / "playwright_tmp"
+        pw_dl.mkdir(parents=True, exist_ok=True)
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(profile),
+            headless=headless,
+            slow_mo=slow_mo,
+            # Follow the real OS window size (avoids fixed 1400×900 letterboxing).
+            no_viewport=True,
+            accept_downloads=True,
+            downloads_path=str(pw_dl),
+            args=launch_args or None,
+        )
+        downloads_dir = _wire_browser_downloads(context, status=status)
+        _status(status, f"浏览器下载将保存到：{downloads_dir}")
+        gate.bind_context(context, user_data_dir=profile)
+        page = context.pages[0] if context.pages else context.new_page()
+        if window_bounds is not None:
+            try:
+                _set_browser_window_bounds(page, window_bounds)
+            except Exception:  # noqa: BLE001
+                pass
+        check()
+        pause_step()
+        if username and password:
+            login_eams(
                 page,
+                username,
+                password,
                 login_wait_seconds=login_wait_seconds,
                 status=status,
+                env=env,
                 control=gate,
             )
+        else:
+            _status(status, f"打开 EAMS 主页（{env.label}；如需登录请在浏览器中完成）…")
+            page.goto(env.home, wait_until="domcontentloaded")
+        check()
+        pause_step()
+        shell = _wait_for_shell(
+            page,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=gate,
+        )
 
+        check()
+        pause_step()
+        _status(status, "进入「计量器具结果录入」…")
+        _open_measure_app(shell, status=status)
+
+        if batch_import and excel_path:
             check()
             pause_step()
-            _status(status, "进入「计量器具结果录入」…")
-            _open_measure_app(shell, status=status)
+            excel_path = Path(excel_path)
+            if not excel_path.exists():
+                if excel_rows is None or excel_headers is None:
+                    raise FileNotFoundError(f"Excel 不存在且未提供数据行：{excel_path}")
+                write_batch_excel(excel_rows, excel_headers, excel_path)
+            _status(status, f"批量导入 Excel：{excel_path.name}")
+            _batch_import_excel(
+                shell,
+                excel_path,
+                status=status,
+                control=gate,
+                wait_seconds=login_wait_seconds,
+            )
+            report.imported_excel = True
+            check()
+            pause_step("批量导入已完成，开始逐份自动填写…")
 
-            if batch_import and excel_path:
+        if fill_details or upload_pdf:
+            # PDF upload is compulsory for each approved certificate.
+            upload_pdf = True
+            for i, item in enumerate(items, start=1):
                 check()
                 pause_step()
-                excel_path = Path(excel_path)
-                if not excel_path.exists():
-                    if excel_rows is None or excel_headers is None:
-                        raise FileNotFoundError(f"Excel 不存在且未提供数据行：{excel_path}")
-                    write_batch_excel(excel_rows, excel_headers, excel_path)
-                _status(status, f"批量导入 Excel：{excel_path.name}")
-                _batch_import_excel(shell, excel_path, status=status)
-                report.imported_excel = True
-
-            if fill_details or upload_pdf:
-                # PDF upload is compulsory for each approved certificate.
-                upload_pdf = True
-                for i, item in enumerate(items, start=1):
+                serial = (item.fields.serial_num or "").strip()
+                label = serial or item.fields.name or f"#{i}"
+                pdf = Path(item.pdf_path) if item.pdf_path else None
+                try:
+                    if pdf is None or not pdf.is_file():
+                        raise AutofillItemError(
+                            "缺少对应 PDF，无法上传附件",
+                            quarantine=True,
+                        )
+                    _status(status, f"填写第 {i}/{len(items)} 份：{label}")
                     check()
                     pause_step()
-                    serial = (item.fields.serial_num or "").strip()
-                    label = serial or item.fields.name or f"#{i}"
-                    pdf = Path(item.pdf_path) if item.pdf_path else None
-                    try:
-                        if pdf is None or not pdf.is_file():
-                            raise AutofillItemError(
-                                "缺少对应 PDF，无法上传附件",
-                                quarantine=True,
-                            )
-                        _status(status, f"填写第 {i}/{len(items)} 份：{label}")
+                    _open_record_by_serial(shell, serial, status=status)
+                    check()
+                    pause_step()
+                    _verify_compare_fields(shell, item.fields, status=status)
+                    check()
+                    if _needs_result_confirm(shell, status=status):
+                        raise AutofillItemError(
+                            "网页勾选了「需要确认结果」，已移出自动填写队列",
+                            quarantine=True,
+                        )
+                    if fill_details:
                         check()
                         pause_step()
-                        _open_record_by_serial(shell, serial, status=status)
+                        _fill_record_fields(shell, item.fields, status=status)
+                        report.filled += 1
+                    check()
+                    pause_step()
+                    _upload_certificate_pdf(shell, pdf, status=status)
+                    report.uploaded += 1
+                    if submit_workflow:
                         check()
                         pause_step()
-                        _verify_compare_fields(shell, item.fields, status=status)
-                        check()
-                        if _needs_result_confirm(shell, status=status):
-                            raise AutofillItemError(
-                                "网页勾选了「需要确认结果」，已移出自动填写队列",
-                                quarantine=True,
-                            )
-                        if fill_details:
-                            check()
-                            pause_step()
-                            _fill_record_fields(shell, item.fields, status=status)
-                            report.filled += 1
-                        check()
-                        pause_step()
-                        _upload_certificate_pdf(shell, pdf, status=status)
-                        report.uploaded += 1
-                        if submit_workflow:
-                            check()
-                            pause_step()
-                            _submit_workflow(shell, status=status)
-                    except AutofillCancelled:
-                        raise
-                    except AutofillItemError as exc:
-                        if gate.cancelled():
-                            raise AutofillCancelled("用户退出自动填写") from exc
-                        msg = f"{label}: {exc}"
-                        report.errors.append(msg)
-                        _status(status, f"失败 — {msg}")
-                        if exc.quarantine and item.pdf_path:
-                            report.quarantine_paths.append(item.pdf_path)
-                    except Exception as exc:  # noqa: BLE001
-                        if gate.cancelled():
-                            raise AutofillCancelled("用户退出自动填写") from exc
-                        msg = f"{label}: {exc}"
-                        report.errors.append(msg)
-                        _status(status, f"失败 — {msg}")
-                        if item.pdf_path:
-                            report.quarantine_paths.append(item.pdf_path)
-        except AutofillCancelled as exc:
+                        _submit_workflow(shell, status=status)
+                except AutofillCancelled:
+                    raise
+                except AutofillItemError as exc:
+                    if gate.cancelled():
+                        raise AutofillCancelled("用户退出自动填写") from exc
+                    msg = f"{label}: {exc}"
+                    report.errors.append(msg)
+                    _status(status, f"失败 — {msg}")
+                    if exc.quarantine and item.pdf_path:
+                        report.quarantine_paths.append(item.pdf_path)
+                except Exception as exc:  # noqa: BLE001
+                    if gate.cancelled():
+                        raise AutofillCancelled("用户退出自动填写") from exc
+                    msg = f"{label}: {exc}"
+                    report.errors.append(msg)
+                    _status(status, f"失败 — {msg}")
+                    if item.pdf_path:
+                        report.quarantine_paths.append(item.pdf_path)
+    except AutofillCancelled as exc:
+        report.cancelled = True
+        _status(status, f"已退出 — {exc}")
+    except AutofillBatchImportError as exc:
+        report.errors.append(str(exc))
+        _status(status, f"已停止 — {exc}")
+    except Exception as exc:  # noqa: BLE001
+        if gate.cancelled():
             report.cancelled = True
-            _status(status, f"已退出 — {exc}")
-        except Exception as exc:  # noqa: BLE001
-            if gate.cancelled():
-                report.cancelled = True
-                _status(status, "已退出自动填写")
-            else:
-                raise
-        finally:
-            gate.clear_context()
-            _status(status, "自动化结束，正在关闭浏览器会话…")
-            if context is not None:
+            _status(status, "已退出自动填写")
+        else:
+            if context is None:
                 try:
-                    context.close()
+                    playwright.stop()
                 except Exception:  # noqa: BLE001
                     pass
+            raise
+    finally:
+        gate.clear_context()
+        if context is not None:
+            _retain_keepalive(playwright, context)
+            _status(status, "自动化结束（浏览器保持打开）")
 
     return report
 
@@ -951,20 +1157,142 @@ def _open_measure_app(shell, *, status: StatusFn | None = None) -> None:
         menu.wait_for(state="visible", timeout=15_000)
 
 
+def _frame_visible_text(frame, text: str) -> bool:
+    """True if ``text`` is visible somewhere in the Maximo shell/frame."""
+    if not text:
+        return False
+    try:
+        loc = frame.get_by_text(text, exact=False)
+        if loc.count() <= 0:
+            return False
+        return bool(loc.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _batch_import_has_excel_error(shell) -> str | None:
+    """Return the matched error token if EAMS shows an Excel import failure."""
+    for token in ("EXCEL导入错误", "Excel导入错误", "excel导入错误"):
+        if _frame_visible_text(shell, token):
+            return token
+    return None
+
+
+def _batch_import_has_success(shell) -> bool:
+    """True when EAMS shows the post-import success dialog."""
+    for token in ("导入成功，请刷新查看", "导入成功", "请刷新查看"):
+        if _frame_visible_text(shell, token):
+            return True
+    return False
+
+
+def _batch_import_close_button(shell):
+    """Locate the result-dialog 关闭 control (role first, then text)."""
+    by_role = shell.get_by_role("button", name="关闭")
+    try:
+        if by_role.count() > 0:
+            return by_role.first
+    except Exception:  # noqa: BLE001
+        pass
+    by_text = shell.get_by_text("关闭", exact=True)
+    try:
+        if by_text.count() > 0:
+            return by_text.first
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _batch_import_dismiss_success(shell, *, status: StatusFn | None = None) -> None:
+    """Click 关闭 on「导入成功，请刷新查看」and wait until that dialog is gone."""
+    deadline = time.time() + 20
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        if not _batch_import_has_success(shell):
+            return
+        btn = _batch_import_close_button(shell)
+        if btn is None:
+            time.sleep(0.25)
+            continue
+        try:
+            if not btn.is_visible() or not btn.is_enabled():
+                time.sleep(0.25)
+                continue
+        except Exception:  # noqa: BLE001
+            time.sleep(0.25)
+            continue
+        try:
+            _click(status, btn, "关闭", timeout=8_000)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            time.sleep(0.35)
+            continue
+        # Confirm the success banner/dialog actually left.
+        gone_deadline = time.time() + 8
+        while time.time() < gone_deadline:
+            if not _batch_import_has_success(shell):
+                return
+            time.sleep(0.2)
+        last_err = RuntimeError("已点击「关闭」，但导入成功提示仍在")
+    if last_err is not None:
+        raise RuntimeError(f"无法关闭导入成功提示：{last_err}") from last_err
+    raise RuntimeError("无法关闭导入成功提示：未找到「关闭」")
+
+
 def _batch_import_excel(
-    shell, excel_path: Path, *, status: StatusFn | None = None
+    shell,
+    excel_path: Path,
+    *,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+    wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
 ) -> None:
+    """Upload the batch Excel and wait until the EAMS import dialog finishes.
+
+    On success, dismisses「导入成功，请刷新查看」via「关闭」before returning.
+    Per-certificate autofill must not start until this returns. Raises
+    ``AutofillBatchImportError`` if the UI shows ``EXCEL导入错误``.
+    """
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
     _click(status, shell.get_by_role("menuitem", name="批量导入计量结果"), "批量导入计量结果")
+    check()
     upload = _upload_frame(shell)
     _status(status, f"选择文件：{excel_path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(excel_path))
+    check()
     _click(status, shell.get_by_role("button", name="确定"), "确定")
-    # Import dialog may show progress then need 关闭.
-    try:
-        _click(status, shell.get_by_role("button", name="关闭"), "关闭", timeout=30_000)
-    except Exception:
-        # Some builds only show 确定 again; ignore if already closed.
-        pass
+    _status(status, "等待批量导入完成…")
+
+    # Do not treat a pre-result「关闭」as done — wait for success or error text.
+    deadline = time.time() + max(30, int(wait_seconds))
+
+    while True:
+        check()
+        err = _batch_import_has_excel_error(shell)
+        if err:
+            raise AutofillBatchImportError(
+                f"批量导入失败：检测到「{err}」，已停止自动填写"
+            )
+
+        if _batch_import_has_success(shell):
+            _status(status, "导入成功，关闭提示…")
+            check()
+            _batch_import_dismiss_success(shell, status=status)
+            _status(status, "批量导入已完成")
+            return
+
+        if time.time() >= deadline:
+            raise TimeoutError(
+                "批量导入超时：未出现「导入成功，请刷新查看」或错误提示"
+            )
+
+        time.sleep(0.35)
 
 
 def _open_record_by_serial(

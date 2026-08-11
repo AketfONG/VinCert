@@ -22,6 +22,7 @@ from vincert.mas_autofill import (
     AutofillControl,
     AutofillItem,
     FAILED_ITEMS_DIR,
+    close_keepalive_browser,
     load_credentials,
     next_export_path,
     run_mas_autofill,
@@ -305,8 +306,9 @@ TOAST_PAD = 12
 TOAST_BTN_HEIGHT = 40
 TOAST_BORDER_WIDTH = 2  # match active tile / settings outline
 TOAST_RADIUS = UI_RADIUS + 2  # 2px rounder than shared UI radius
+TOAST_MIN_MS = 5000
 TOAST_DEFAULT_MS = 5000
-TOAST_SUCCESS_MS = 2000
+TOAST_SUCCESS_MS = 5000
 TOAST_TICK_MS = 50
 TOAST_STACK_MAX = 8
 TOAST_STACK_GAP = 8
@@ -398,6 +400,9 @@ class App(customtkinter.CTk):
         self._removed_paths: set[str] = set()
         self._current_cert_index = 0
         self._current_step = "extract"
+        # Workflow gate: review stays locked until failed certs are cleared;
+        # extract locks after advancing to review. Tiles are not clickable.
+        self._workflow_phase = "extract"  # "extract" | "review"
         self._step_before_settings = "extract"
 
         self._source_folder: str | None = None
@@ -646,18 +651,34 @@ class App(customtkinter.CTk):
         self.update_idletasks()
 
     def _apply_window_fullscreen(self):
-        """Fill the monitor work area when no side browser is open (taskbar-safe)."""
+        """Fill the monitor — native maximize on Windows, work-area geometry elsewhere."""
         self._pdf_preview_layout_active = False
-        x, y, w, h = self._screen_work_area()
-        # Always use explicit work-area bounds so Windows taskbar is respected
-        # (state('zoomed') can still overlap the bottom nav bar with DPI quirks).
-        self._set_app_bounds(x, y, w, h)
-        # CTk/Tk may fight the first placement during bootstrap — re-assert.
-        self.after(50, lambda: self._reassert_work_area_bounds(full=True))
-        self.after(200, lambda: self._reassert_work_area_bounds(full=True))
+        if sys.platform == "win32":
+            hwnd = self._win_toplevel_hwnd()
+            if hwnd:
+                try:
+                    from vincert.win_snap import snap_hwnd
 
-    def _reassert_work_area_bounds(self, *, full: bool) -> None:
-        """Re-apply snap/fullscreen if layout flags still match (taskbar-safe)."""
+                    if snap_hwnd(hwnd, "maximize"):
+                        self.update_idletasks()
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                self.state("zoomed")
+                self.update_idletasks()
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        x, y, w, h = self._screen_work_area()
+        self._set_app_bounds(x, y, w, h)
+        self.after(50, lambda: self._reassert_geometry_bounds(full=True))
+        self.after(200, lambda: self._reassert_geometry_bounds(full=True))
+
+    def _reassert_geometry_bounds(self, *, full: bool) -> None:
+        """Re-apply calculated geometry on non-native platforms only."""
+        if sys.platform == "win32":
+            return
         try:
             if not self.winfo_exists():
                 return
@@ -675,13 +696,24 @@ class App(customtkinter.CTk):
             self._set_app_bounds(x, y, half, h)
 
     def _snap_app_left_half(self):
-        """Place VinCert on the left half of the work area (taskbar-safe)."""
+        """Snap VinCert to the left half (native Win+Left on Windows)."""
+        self._pdf_preview_layout_active = True
+        if sys.platform == "win32":
+            hwnd = self._win_toplevel_hwnd()
+            if hwnd:
+                try:
+                    from vincert.win_snap import snap_hwnd
+
+                    if snap_hwnd(hwnd, "left"):
+                        self.update_idletasks()
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
         x, y, w, h = self._screen_work_area()
         half = max(640, w // 2)
         self._set_app_bounds(x, y, half, h)
-        self._pdf_preview_layout_active = True
-        self.after(50, lambda: self._reassert_work_area_bounds(full=False))
-        self.after(200, lambda: self._reassert_work_area_bounds(full=False))
+        self.after(50, lambda: self._reassert_geometry_bounds(full=False))
+        self.after(200, lambda: self._reassert_geometry_bounds(full=False))
 
     def _prepare_side_browser_layout(self) -> tuple[int, int, int, int]:
         """Snap VinCert left and return remaining bounds for a browser window."""
@@ -692,6 +724,7 @@ class App(customtkinter.CTk):
             self._pdf_preview.close()
         self._snap_app_left_half()
         self.update_idletasks()
+        self.update()
         return self._pdf_preview_bounds_remaining()
 
     def _pdf_preview_bounds_remaining(self) -> tuple[int, int, int, int]:
@@ -753,9 +786,11 @@ class App(customtkinter.CTk):
                 self.update_idletasks()
                 bounds = self._pdf_preview_bounds_remaining()
                 self._pdf_preview.show(path, bounds)
+                self._pdf_preview.focus()
                 return
             bounds = self._prepare_side_browser_layout()
             self._pdf_preview.show(path, bounds)
+            self._pdf_preview.focus()
             return
         if self._pdf_preview.is_open:
             self._pdf_preview.close()
@@ -869,7 +904,6 @@ class App(customtkinter.CTk):
     def _restyle_primary_action_buttons(self):
         for name in (
             "ocr_extract_button",
-            "goto_review_button",
             "autofill_button",
             "autofill_pause_button",
             "autofill_exit_button",
@@ -925,8 +959,9 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=FONT_STEP, weight="bold"),
         ).grid(row=0, column=1, padx=(0, 12), sticky="ew")
 
-        self._bind_step_tile_click(tile, key)
         self._bind_step_tile_hover(tile, key)
+        # Step modules are progress indicators only — not manually selectable.
+        tile.configure(cursor="")
         return tile
 
     def _bind_step_tile_hover(self, widget, key: str):
@@ -948,26 +983,44 @@ class App(customtkinter.CTk):
             widget = widget.master
         return False
 
-    def _bind_step_tile_click(self, widget, key: str):
-        widget.bind("<Button-1>", lambda _e, k=key: self.show_step(k))
-        widget.configure(cursor="hand2")
-        for child in widget.winfo_children():
-            self._bind_step_tile_click(child, key)
-
     def _hover_step_tile(self, key: str, entering: bool):
         if self._autofill_busy:
             return
         if key == self._current_step:
             return
-        if entering:
-            self._apply_tile_style(key, "hover")
-        else:
-            self._apply_tile_style(key, "normal")
+        if self._step_tile_is_locked(key):
+            return
+        # Steps are not clickable — no hover affordance.
+        return
+
+    def _step_tile_is_locked(self, key: str) -> bool:
+        """True when a workflow tile should appear greyed / inactive."""
+        phase = getattr(self, "_workflow_phase", "extract")
+        if key == "review" and phase != "review":
+            return True
+        if key == "extract" and phase == "review":
+            return True
+        return False
 
     def _apply_tile_style(self, key: str, style: str):
         if self._autofill_busy or self._autofill_ui_chrome_locked:
             return
         tile = self.step_tiles[key]
+        if style == "locked" or (style != "active" and self._step_tile_is_locked(key)):
+            tile.configure(
+                fg_color=UI_LOCK_TILE_FG,
+                border_color=UI_LOCK_TILE_FG,
+                border_width=0,
+            )
+            for child in tile.winfo_children():
+                try:
+                    if isinstance(child, customtkinter.CTkFrame):
+                        child.configure(fg_color=UI_LOCK_BADGE_FG)
+                    elif isinstance(child, customtkinter.CTkLabel):
+                        child.configure(text_color=UI_LOCK_LABEL)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
         styles = {
             "normal": {
                 "tile_fg": TILE_BG_NORMAL,
@@ -991,13 +1044,47 @@ class App(customtkinter.CTk):
             border_color=colors["tile_border"],
             border_width=colors["border_width"],
         )
+        if style == "active":
+            for child in tile.winfo_children():
+                try:
+                    if isinstance(child, customtkinter.CTkFrame):
+                        child.configure(fg_color=ACTIVE_OUTLINE)
+                        for sub in child.winfo_children():
+                            if isinstance(sub, customtkinter.CTkLabel):
+                                sub.configure(text_color=("#ffffff", "#ffffff"))
+                    elif isinstance(child, customtkinter.CTkLabel):
+                        child.configure(text_color=SECONDARY_BTN_TEXT)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _update_step_tiles(self, active_key: str):
         for key in self.step_tiles:
-            if key == active_key:
+            if self._step_tile_is_locked(key):
+                self._apply_tile_style(key, "locked")
+            elif key == active_key:
                 self._apply_tile_style(key, "active")
             else:
                 self._apply_tile_style(key, "normal")
+
+    def _reset_workflow_to_extract(self):
+        """Back to extract phase (review locked) — used on clear / new folder."""
+        self._workflow_phase = "extract"
+        if self._current_step not in ("extract", "settings"):
+            self.show_step("extract")
+        else:
+            self._update_step_tiles(self._current_step)
+
+    def _advance_to_review(self):
+        """After failed certs are cleared — unlock review and lock extract."""
+        if not self._imported_files:
+            self.set_status("没有可核对的证书")
+            self._reset_workflow_to_extract()
+            return
+        self._workflow_phase = "review"
+        self._save_extract_fields_to_result()
+        self._load_approve_fields_for_current()
+        self.show_step("review")
+        self.set_status("已进入核对填写")
 
     def _update_settings_button(self, active: bool):
         if not hasattr(self, "settings_button"):
@@ -1305,6 +1392,14 @@ class App(customtkinter.CTk):
     def show_step(self, key: str):
         if self._autofill_busy and key != self._current_step:
             self.set_status("自动填写进行中，请先暂停或退出…")
+            return
+        # Workflow tiles are not manually selectable; block out-of-phase jumps.
+        phase = getattr(self, "_workflow_phase", "extract")
+        if key == "review" and phase != "review" and key != self._current_step:
+            self.set_status("请先完成批量提取并移出失败证书")
+            return
+        if key == "extract" and phase == "review" and key != self._current_step:
+            self.set_status("已进入核对填写，请继续审批或重新导入文件夹")
             return
         self._current_step = key
 
@@ -2591,6 +2686,7 @@ class App(customtkinter.CTk):
         undo_text: str | None = None,
         on_undo=None,
         on_complete=None,
+        complete_on_timeout: bool = True,
         style: str = "danger",
     ):
         """Show a top-right countdown toast; stacks below any already visible.
@@ -2600,6 +2696,7 @@ class App(customtkinter.CTk):
         Primary action dismisses early and also runs on_complete.
         Optional grey undo button runs on_undo instead and skips on_complete.
         Pass action_text=None (and no undo_text) to hide action buttons.
+        Set complete_on_timeout=False so expiry only dismisses (no on_complete).
         style: "danger" (red) or "success" (green).
         """
         while len(self._toasts) >= TOAST_STACK_MAX:
@@ -2638,7 +2735,7 @@ class App(customtkinter.CTk):
             text_color=TOAST_TITLE_COLOR,
         ).grid(row=0, column=0, sticky="ew")
 
-        duration_ms = max(duration_ms, TOAST_TICK_MS)
+        duration_ms = max(int(duration_ms or 0), TOAST_MIN_MS)
         seconds = max(1, int(round(duration_ms / 1000)))
         countdown = customtkinter.CTkLabel(
             header,
@@ -2686,6 +2783,7 @@ class App(customtkinter.CTk):
             + duration_ms,
             "on_complete": on_complete,
             "on_undo": on_undo,
+            "complete_on_timeout": bool(complete_on_timeout),
             "settled": False,
         }
 
@@ -2780,7 +2878,9 @@ class App(customtkinter.CTk):
             if remaining <= 0:
                 expired.append(entry)
         for entry in expired:
-            self._dismiss_toast(entry, run_complete=True)
+            self._dismiss_toast(
+                entry, run_complete=bool(entry.get("complete_on_timeout", True))
+            )
         if self._toasts:
             self._toast_tick_after_id = self.after(TOAST_TICK_MS, self._toast_tick)
 
@@ -2969,7 +3069,7 @@ class App(customtkinter.CTk):
 
         actions = customtkinter.CTkFrame(footer, fg_color="transparent")
         actions.grid(row=2, column=0, sticky="ew")
-        actions.grid_columnconfigure((0, 1), weight=1)
+        actions.grid_columnconfigure(0, weight=1)
 
         self.ocr_extract_button = customtkinter.CTkButton(
             actions,
@@ -2983,23 +3083,8 @@ class App(customtkinter.CTk):
             text_color=SUCCESS_BTN_TEXT,
             command=self._on_ocr_extract,
         )
-        self.ocr_extract_button.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.ocr_extract_button.grid(row=0, column=0, sticky="ew")
         self._style_primary_action_button(self.ocr_extract_button)
-
-        self.goto_review_button = customtkinter.CTkButton(
-            actions,
-            corner_radius=UI_RADIUS,
-            text="前往核对填写 →",
-            height=PRIMARY_ACTION_BTN_HEIGHT,
-            round_height_to_even_numbers=False,
-            font=self._button_font(FONT_SECTION),
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
-            command=self._go_to_review,
-        )
-        self.goto_review_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
-        self._style_primary_action_button(self.goto_review_button)
 
         self._update_extract_ocr_ui()
 
@@ -3154,9 +3239,34 @@ class App(customtkinter.CTk):
             self.set_status("未选择文件夹")
             return
         self.show_step("extract")
+        self._reset_workflow_to_extract()
         self._load_folder(path)
 
     def _clear_extract(self):
+        """Ask for confirmation before wiping the document list."""
+        if self._autofill_busy:
+            self.set_status("自动填写进行中，请先退出后再清空…")
+            return
+        if self._extract_busy:
+            self.set_status("正在处理中，请稍候…")
+            return
+        n = len(self._imported_files)
+        if n == 0 and not self._source_folder:
+            self.set_status("列表已空")
+            return
+        self.show_toast(
+            f"将清空文档列表中的 {n} 份证书及解析结果。\n此操作不可撤销。",
+            title="清空文档列表",
+            action_text="确认清空",
+            undo_text="取消",
+            on_complete=self._confirm_clear_extract,
+            complete_on_timeout=False,
+            duration_ms=TOAST_DEFAULT_MS,
+            style="danger",
+        )
+        self.set_status("确认清空文档列表？")
+
+    def _confirm_clear_extract(self):
         self.show_step("extract")
         self._extract_busy = False
         self._source_folder = None
@@ -3176,12 +3286,15 @@ class App(customtkinter.CTk):
         self._update_autofill_button()
         self._sync_pdf_preview()
         self.set_status("已清空提取列表")
+        self.show_success_toast("已清空文档列表。", title="清空")
+        self._reset_workflow_to_extract()
 
     def _load_folder(self, folder: str):
         if self._extract_busy:
             self.set_status("正在处理中，请稍候…")
             return
 
+        self._reset_workflow_to_extract()
         self.folder_label.configure(text=folder)
         self.set_status("正在扫描文件夹…")
         self.update_idletasks()
@@ -3399,8 +3512,9 @@ class App(customtkinter.CTk):
 
         targets = [p for p in self._imported_files if self._cert_needs_ocr(p)]
         if not targets:
-            self.set_status("没有未解析或失败的证书")
+            self.set_status("没有未解析或失败的证书 · 进入核对填写")
             self.show_success_toast("没有需要移出的证书。", title="移出失败证书")
+            self._advance_to_review()
             return
 
         self._pending_quarantine_paths = list(targets)
@@ -3455,6 +3569,7 @@ class App(customtkinter.CTk):
 
         self.set_status(msg)
         self.show_success_toast(msg)
+        self._advance_to_review()
 
     def _undo_pending_quarantine(self):
         count = len(self._pending_quarantine_paths)
@@ -3476,6 +3591,7 @@ class App(customtkinter.CTk):
         self._pending_quarantine_paths = []
         if not paths:
             self.show_success_toast("没有需要移出的证书。")
+            self._advance_to_review()
             return
         moved = self._quarantine_failed_paths(paths)
         self._sort_imported_files()
@@ -3492,6 +3608,7 @@ class App(customtkinter.CTk):
         msg = f"失败 {moved} 份已移出队列 · 已复制到 {self._failed_items_dir_short()}/"
         self.set_status(msg)
         self.show_success_toast(msg)
+        self._advance_to_review()
 
     def _on_ocr_extract_fail(self, message: str):
         self._extract_busy = False
@@ -4164,14 +4281,6 @@ class App(customtkinter.CTk):
         else:
             self.extract_errors_label.configure(text="")
 
-    def _go_to_review(self):
-        if not self._imported_files:
-            self.set_status("请先选择文件夹并完成提取")
-            return
-        self._save_extract_fields_to_result()
-        self._load_approve_fields_for_current()
-        self.show_step("review")
-
     # ----------------------------------------------------------- review + fill
     def _build_review_controls(self, parent: customtkinter.CTkFrame):
         header, content, footer = self._make_pinned_footer_layout(parent)
@@ -4671,7 +4780,7 @@ class App(customtkinter.CTk):
                         child.configure(text_color=SECONDARY_BTN_TEXT)
                 except Exception:  # noqa: BLE001
                     pass
-            self._set_widget_tree_cursor(tile, "hand2")
+            self._set_widget_tree_cursor(tile, "")
         self._update_step_tiles(self._current_step)
 
     def _keep_autofill_run_controls_active(self):
@@ -4937,9 +5046,8 @@ class App(customtkinter.CTk):
             pass
         self.append_autofill_log("正在退出自动填写…", error=True)
         self.set_status("正在退出自动填写…")
-        # Close the terminal immediately — don't leave it hanging after kill.
+        # Close the terminal immediately — browser stays open for manual review.
         self.close_autofill_log()
-        self._restore_layout_after_browser_session()
         # Safety net: if the worker never returns, restore controls anyway.
         self.after(2500, self._autofill_exit_watchdog)
 
@@ -4953,9 +5061,12 @@ class App(customtkinter.CTk):
         self._autofill_exit_confirming = False
         self.close_autofill_log()
         self._restore_autofill_button()
-        self._restore_layout_after_browser_session()
-        self.set_status("已强制退出自动填写")
-        self.show_toast("已强制退出自动填写。", title="导出并自动填写", duration_ms=TOAST_SUCCESS_MS)
+        self.set_status("已停止自动填写（浏览器保持打开）")
+        self.show_toast(
+            "已停止自动填写。浏览器保持打开。",
+            title="导出并自动填写",
+            duration_ms=TOAST_SUCCESS_MS,
+        )
 
     def _save_fields_before_navigate(self):
         if (
@@ -5069,6 +5180,22 @@ class App(customtkinter.CTk):
         if hasattr(self, "cert_nav_label"):
             self.cert_nav_label.configure(text=self._cert_nav_text())
 
+    def _advance_to_next_document_after_review_action(self):
+        """After approve/remove, select the next item in the document list."""
+        if not self._imported_files:
+            self._update_review_cert_status()
+            self._refresh_doc_list_marks()
+            return
+        nxt = self._current_cert_index + 1
+        if nxt < len(self._imported_files):
+            self._select_document(self._imported_files[nxt])
+            if self._current_step == "review" and hasattr(self, "field_entries"):
+                self._load_approve_fields_for_current()
+            return
+        # Last item — refresh marks/status on the current selection.
+        self._update_review_cert_status()
+        self._refresh_doc_list_marks()
+
     def _on_toggle_approve_entry(self):
         path = self._current_cert_path()
         if path is None:
@@ -5087,6 +5214,7 @@ class App(customtkinter.CTk):
                 self._load_approve_fields_for_current()
             else:
                 self._update_review_cert_status()
+            self._refresh_doc_list_marks()
             self.set_status(msg)
             return
 
@@ -5106,15 +5234,8 @@ class App(customtkinter.CTk):
         self._autofill_queue.append(path)
         self._update_autofill_button()
         self.set_status(f"已批准，队列 {len(self._autofill_queue)} 份")
-        for i in range(self._current_cert_index + 1, len(self._imported_files)):
-            candidate = self._imported_files[i]
-            if candidate not in self._autofill_queue and candidate not in self._removed_paths:
-                self._current_cert_index = i
-                self._sync_cert_index_to_list()
-                self._load_approve_fields_for_current()
-                return
-        self._update_review_cert_status()
         self._refresh_doc_list_marks()
+        self._advance_to_next_document_after_review_action()
 
     def _on_toggle_remove_entry(self):
         path = self._current_cert_path()
@@ -5140,11 +5261,12 @@ class App(customtkinter.CTk):
         if path in self._autofill_queue:
             self._autofill_queue.remove(path)
         self._update_autofill_button()
-        self._update_review_cert_status()
-        self._refresh_doc_list_marks()
         name = Path(path).name
         msg = f"已移出核对队列 · {name}"
         self.set_status(msg)
+        self._refresh_doc_list_marks()
+        self._advance_to_next_document_after_review_action()
+
     def _on_master_autofill(self):
         """Approve-queue → Excel in exports/ → Playwright MAS batch import + fill."""
         # Cancel any fail-folder countdown so export doesn't archive leftovers
@@ -5253,11 +5375,13 @@ class App(customtkinter.CTk):
         )
 
     def _restore_layout_after_browser_session(self):
-        """After autofill browser closes, restore PDF preview or fullscreen."""
-        if self._selected_path and Path(self._selected_path).is_file():
-            self._sync_pdf_preview()
-        else:
-            self._apply_window_fullscreen()
+        """Keep side-by-side layout; autofill Chromium is left open on purpose."""
+        # Do not reopen PDF preview or fullscreen — that would fight the open
+        # EAMS window. Stay snapped left beside it.
+        try:
+            self._snap_app_left_half()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
@@ -5394,6 +5518,10 @@ class App(customtkinter.CTk):
             return
         try:
             self._pdf_preview.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            close_keepalive_browser()
         except Exception:  # noqa: BLE001
             pass
         self.destroy()
