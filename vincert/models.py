@@ -28,6 +28,13 @@ class CertificateFields:
             "manufacturer": self.manufacturer,
         }
 
+    def compare_fields(self) -> dict[str, str]:
+        """比对字段 checked on the webpage after open — excludes 计量器具名称."""
+        return {
+            "serial_num": self.serial_num,
+            "manufacturer": self.manufacturer,
+        }
+
     def autofill_fields(self) -> dict[str, str]:
         """Fields written into the target webpage form."""
         return {
