@@ -76,6 +76,7 @@ def parse_certificate(
     use_ocr_fallback: bool = False,
     force_ocr: bool = False,
     fill_missing_pages: bool = True,
+    extra_label_aliases: dict[str, list[str] | tuple[str, ...]] | None = None,
 ) -> ParseResult:
     """
     Parse a metrology certificate PDF.
@@ -86,6 +87,8 @@ def parse_certificate(
 
     OCR (manual ``force_ocr`` / optional fallback) follows ji_liang:
       cover @150% → PaddleOCR → OCR-line field extract (+ digital parser fill).
+
+    ``extra_label_aliases`` merges user Settings rules into built-in label aliases.
     """
     path = Path(pdf_path)
     errors: list[str] = []
@@ -132,7 +135,9 @@ def parse_certificate(
                     method = "ocr"
                     # Primary: ji_liang OCR-line heuristics; fill gaps via digital parser.
                     fields = parse_ocr_lines(ocr_lines)
-                    fields = merge_fields(fields, parse_fields(raw))
+                    fields = merge_fields(
+                        fields, parse_fields(raw, extra_label_aliases=extra_label_aliases)
+                    )
                 else:
                     errors.append("OCR produced no text on cover page")
                     if not raw.strip():
@@ -143,7 +148,11 @@ def parse_certificate(
         errors.append("封面无嵌入文本（可使用 OCR提取）")
 
     if method != "ocr":
-        fields = parse_fields(raw) if raw.strip() else CertificateFields()
+        fields = (
+            parse_fields(raw, extra_label_aliases=extra_label_aliases)
+            if raw.strip()
+            else CertificateFields()
+        )
 
     used_extra_pages = False
 
@@ -160,7 +169,9 @@ def parse_certificate(
                 continue
             if not cover_page_only:
                 raw = f"{raw}\n{page_raw}" if raw.strip() else page_raw
-            page_fields = parse_fields(page_raw)
+            page_fields = parse_fields(
+                page_raw, extra_label_aliases=extra_label_aliases
+            )
             before_missing = set(_missing_fill_keys(fields))
             fields = merge_fields(fields, page_fields)
             if set(_missing_fill_keys(fields)) != before_missing:

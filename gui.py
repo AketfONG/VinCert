@@ -9,6 +9,7 @@ import json
 import shutil
 import sys
 import threading
+import webbrowser
 
 import customtkinter
 import tkinter as tk
@@ -30,6 +31,7 @@ from vincert.mas_autofill import (
     save_credentials,
     write_batch_excel,
 )
+from vincert.parse_metrology import LABEL_ALIASES, parse_fields
 from vincert.pdf_preview import PdfPreviewController
 
 customtkinter.set_appearance_mode("System")
@@ -44,6 +46,22 @@ AUTOFILL_EXIT_WARN_MS = 10_000
 
 
 DEFAULT_FAILED_ITEMS_DIR = FAILED_ITEMS_DIR.resolve()
+
+# Settings → 解析规则：user can add label aliases for these fields.
+PARSE_RULE_FIELDS = [
+    ("name", "计量器具名称"),
+    ("serial_num", "计量器具编号"),
+    ("manufacturer", "制造厂"),
+    ("model", "型号/规格"),
+    ("certificate_no", "证书编号"),
+    ("client_name", "客户名称"),
+    ("measurement_date", "本次检测日期"),
+    ("due_date", "本次检测有效期至"),
+    ("issue_date", "发布日期"),
+    ("measurement_unit", "检测机构"),
+    ("measurement_type", "检验方式"),
+]
+PARSE_RULE_FIELD_LABELS = {key: label for key, label in PARSE_RULE_FIELDS}
 
 
 def load_ui_settings(path: Path | None = None) -> dict:
@@ -60,6 +78,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "testing_mode": False,
         "demo_folder": "",
         "autofill_step_delay_sec": DEFAULT_AUTOFILL_STEP_DELAY_SEC,
+        "parse_rules": {},
     }
     if not settings_path.exists():
         return dict(defaults)
@@ -94,7 +113,49 @@ def load_ui_settings(path: Path | None = None) -> dict:
             out["autofill_step_delay_sec"] = max(0.0, min(30.0, delay))
         except (TypeError, ValueError):
             pass
+    if "parse_rules" in data:
+        out["parse_rules"] = _normalize_parse_rules(data.get("parse_rules"))
     return out
+
+
+def _normalize_parse_rules(raw) -> dict[str, list[str]]:
+    """Sanitize persisted label-alias rules: field key → list of aliases."""
+    allowed = {key for key, _label in PARSE_RULE_FIELDS} | set(LABEL_ALIASES.keys())
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for key, values in raw.items():
+        field = str(key or "").strip()
+        if field not in allowed:
+            continue
+        aliases: list[str] = []
+        seen: set[str] = set()
+        if isinstance(values, (list, tuple)):
+            seq = values
+        elif values:
+            seq = [values]
+        else:
+            seq = []
+        for item in seq:
+            alias = str(item or "").strip()
+            if not alias or alias in seen:
+                continue
+            seen.add(alias)
+            aliases.append(alias)
+        if aliases:
+            out[field] = aliases
+    return out
+
+
+def load_parse_rules(path: Path | None = None) -> dict[str, list[str]]:
+    """User-defined label aliases for certificate field parsing."""
+    return _normalize_parse_rules(load_ui_settings(path).get("parse_rules"))
+
+
+def save_parse_rules(rules: dict[str, list[str]], path: Path | None = None) -> dict[str, list[str]]:
+    cleaned = _normalize_parse_rules(rules)
+    save_ui_settings(parse_rules=cleaned)
+    return cleaned
 
 
 def save_ui_settings(**updates) -> Path:
@@ -246,8 +307,9 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.5b"
-BUILD_DATE = "06/08/2026"
+BUILD_VERSION = "v0.5"
+BUILD_DATE = "13/08/2026"
+RELEASES_URL = "https://github.com/AketfONG/VinCert/releases"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
 FONT_BRAND = 22
@@ -257,6 +319,7 @@ FONT_BODY = 14
 FONT_LABEL = 13
 FONT_ENTRY = 15
 FONT_META = 13
+FONT_CAPTION = 12
 FONT_BUTTON = 14
 FONT_STEP = 15
 FONT_BADGE = 18
@@ -438,6 +501,8 @@ class App(customtkinter.CTk):
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
         self._autofill_step_delay_sec = load_autofill_step_delay_sec()
+        self._parse_rules: dict[str, list[str]] = load_parse_rules()
+        self._parse_rules_field_key = PARSE_RULE_FIELDS[0][0]
         self._content_wrap_labels: list[customtkinter.CTkLabel] = []
         self._pdf_preview_layout_active = False
         # Ignore the next preview-closed callback (intentional close before re-snap).
@@ -1160,12 +1225,31 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=FONT_BRAND, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
-        customtkinter.CTkLabel(
-            brand_inner,
+
+        version_row = customtkinter.CTkFrame(brand_inner, fg_color="transparent")
+        version_row.grid(row=0, column=1, sticky="e")
+        version_row.grid_columnconfigure(0, weight=0)
+
+        self.build_version_label = customtkinter.CTkLabel(
+            version_row,
             text=f"{BUILD_VERSION} · {BUILD_DATE}",
             font=customtkinter.CTkFont(size=FONT_META),
             text_color="gray60",
             anchor="e",
+        )
+        self.build_version_label.grid(row=0, column=0, sticky="e", padx=(0, 6))
+
+        customtkinter.CTkButton(
+            version_row,
+            corner_radius=UI_RADIUS,
+            text="GitHub",
+            width=64,
+            height=28,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            font=self._button_font(FONT_CAPTION),
+            command=self._open_releases_page,
         ).grid(row=0, column=1, sticky="e")
 
         steps_row = customtkinter.CTkFrame(nav, fg_color="transparent")
@@ -1337,6 +1421,7 @@ class App(customtkinter.CTk):
         )
         self.controls_header_wrap.grid_propagate(False)
         self.controls_header_wrap.grid_columnconfigure(0, weight=1)
+        self.controls_header_wrap.grid_columnconfigure(1, weight=0)
         self.controls_header_wrap.grid_rowconfigure(0, weight=1)
 
         self.controls_header = customtkinter.CTkLabel(
@@ -1346,6 +1431,21 @@ class App(customtkinter.CTk):
             anchor="w",
         )
         self.controls_header.grid(row=0, column=0, sticky="w")
+
+        self.controls_header_back_btn = customtkinter.CTkButton(
+            self.controls_header_wrap,
+            corner_radius=UI_RADIUS,
+            text="返回设置",
+            width=96,
+            height=32,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            font=self._button_font(FONT_META),
+            command=self._on_open_settings,
+        )
+        self.controls_header_back_btn.grid(row=0, column=1, sticky="e")
+        self.controls_header_back_btn.grid_remove()
 
         self.controls_body = customtkinter.CTkFrame(self.controls_inner, fg_color="transparent")
         self.controls_body.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 16))
@@ -1357,6 +1457,7 @@ class App(customtkinter.CTk):
             ("extract", self._build_extract_controls),
             ("review", self._build_review_controls),
             ("settings", self._build_settings_controls),
+            ("parse_rules", self._build_parse_rules_controls),
         ]:
             frame = customtkinter.CTkFrame(self.controls_body, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
@@ -1411,14 +1512,16 @@ class App(customtkinter.CTk):
         self._current_step = key
 
         self._update_step_tiles(key)
-        self._update_settings_button(key == "settings")
+        self._update_settings_button(key in {"settings", "parse_rules"})
 
         titles = {
             "extract": "批量提取",
             "review": "核对填写",
             "settings": "设置",
+            "parse_rules": "解析规则",
         }
         self.controls_header.configure(text=titles.get(key, key))
+        self._update_controls_header_back(key == "parse_rules")
 
         for name, frame in self.step_views.items():
             if name == key:
@@ -1430,6 +1533,9 @@ class App(customtkinter.CTk):
             self._update_autofill_button()
             self._schedule_active_page_vcenter(force=True)
         elif key == "settings":
+            self._schedule_active_page_vcenter(force=True)
+        elif key == "parse_rules":
+            self._refresh_parse_rules_panel()
             self._schedule_active_page_vcenter(force=True)
         elif key == "extract":
             # Re-measure after raise (esp. returning from settings/zoom).
@@ -2146,8 +2252,411 @@ class App(customtkinter.CTk):
             command=self._clear_demo_folder,
         ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
+        customtkinter.CTkLabel(
+            content,
+            text="解析规则",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=21, column=0, sticky="ew", pady=(8, 8))
+
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text=(
+                    "为解析字段增加标签别名（例如新证书上的「设备编号」）。"
+                    "配置页会显示当前证书的原始解析文本，便于对照添加规则。"
+                ),
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=22, column=0, sticky="ew", pady=(0, 12))
+
+        customtkinter.CTkButton(
+            content,
+            corner_radius=UI_RADIUS,
+            text="配置解析规则…",
+            height=40,
+            fg_color=PRIMARY_BTN_FG,
+            hover_color=PRIMARY_BTN_HOVER,
+            text_color=PRIMARY_BTN_TEXT,
+            font=self._button_font(FONT_BUTTON),
+            command=self._open_parse_rules_config,
+        ).grid(row=23, column=0, sticky="ew", pady=(0, 16))
+
         self._bind_scrollable_mousewheel(self.settings_scroll, self.settings_scroll)
         self._schedule_active_page_vcenter(force=True)
+
+    def _build_parse_rules_controls(self, parent: customtkinter.CTkFrame):
+        """Settings sub-page: edit label aliases with raw parse text visible."""
+        _header, old_content, _footer = self._make_pinned_footer_layout(
+            parent, with_header=False, with_footer=False
+        )
+        meta = parent._vcenter_meta
+        middle = meta["middle"]
+        old_content.destroy()
+
+        self.parse_rules_scroll = customtkinter.CTkScrollableFrame(
+            middle,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        self.parse_rules_scroll.grid_columnconfigure(0, weight=1)
+        meta["content"] = self.parse_rules_scroll
+        meta["scrollable"] = True
+
+        content = self.parse_rules_scroll
+        self._bind_scrollable_mousewheel(self.parse_rules_scroll, self.parse_rules_scroll)
+        self._bind_scrollable_mousewheel(
+            self.parse_rules_scroll, self.parse_rules_scroll._parent_canvas
+        )
+
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text=(
+                    "对照下方原始解析文本，为字段添加证书上出现的标签别名。"
+                    "保存后重新提取即可生效。"
+                ),
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 12))
+
+        customtkinter.CTkLabel(
+            content,
+            text="原始解析文本",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+
+        self.parse_rules_raw_source = customtkinter.CTkLabel(
+            content,
+            text="未选择已解析证书",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_CAPTION),
+            text_color="gray60",
+        )
+        self.parse_rules_raw_source.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+
+        self.parse_rules_raw_text = customtkinter.CTkTextbox(
+            content,
+            height=180,
+            corner_radius=UI_RADIUS,
+            font=customtkinter.CTkFont(size=FONT_BODY),
+            fg_color=FIELD_FG_COLOR,
+            text_color=FIELD_TEXT_COLOR,
+            wrap="word",
+        )
+        self.parse_rules_raw_text.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        self.parse_rules_raw_text.insert("1.0", "请先在左侧选择已提取的证书，以查看原始文本。")
+        self.parse_rules_raw_text.configure(state="disabled")
+        self._bind_scrollable_mousewheel(self.parse_rules_scroll, self.parse_rules_raw_text)
+
+        customtkinter.CTkLabel(
+            content,
+            text="字段标签别名",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=4, column=0, sticky="ew", pady=(4, 6))
+
+        field_row = customtkinter.CTkFrame(content, fg_color="transparent")
+        field_row.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        field_row.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkLabel(field_row, text="目标字段", anchor="w").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self.parse_rules_field_menu = customtkinter.CTkOptionMenu(
+            field_row,
+            values=[label for _key, label in PARSE_RULE_FIELDS],
+            command=self._on_parse_rules_field_changed,
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        self.parse_rules_field_menu.grid(row=0, column=1, sticky="ew")
+        self.parse_rules_field_menu.set(PARSE_RULE_FIELDS[0][1])
+
+        self.parse_rules_builtin_label = customtkinter.CTkLabel(
+            content,
+            text="",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_CAPTION),
+            text_color="gray60",
+            wraplength=CONTENT_WRAP,
+            justify="left",
+        )
+        self._track_content_wrap(self.parse_rules_builtin_label)
+        self.parse_rules_builtin_label.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+
+        add_row = customtkinter.CTkFrame(content, fg_color="transparent")
+        add_row.grid(row=7, column=0, sticky="ew", pady=(0, 8))
+        add_row.grid_columnconfigure(0, weight=1)
+        self.parse_rules_alias_entry = self._make_field_entry(
+            add_row, placeholder="新标签别名，例如：设备编号"
+        )
+        self.parse_rules_alias_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        customtkinter.CTkButton(
+            add_row,
+            corner_radius=UI_RADIUS,
+            text="添加",
+            width=88,
+            height=36,
+            fg_color=PRIMARY_BTN_FG,
+            hover_color=PRIMARY_BTN_HOVER,
+            text_color=PRIMARY_BTN_TEXT,
+            font=self._button_font(FONT_BUTTON),
+            command=self._on_add_parse_rule_alias,
+        ).grid(row=0, column=1, sticky="e")
+
+        self.parse_rules_alias_list = customtkinter.CTkFrame(
+            content, fg_color="transparent"
+        )
+        self.parse_rules_alias_list.grid(row=8, column=0, sticky="ew", pady=(0, 12))
+        self.parse_rules_alias_list.grid_columnconfigure(0, weight=1)
+
+        preview_row = customtkinter.CTkFrame(content, fg_color="transparent")
+        preview_row.grid(row=9, column=0, sticky="ew", pady=(0, 8))
+        preview_row.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkButton(
+            preview_row,
+            corner_radius=UI_RADIUS,
+            text="试解析当前原文",
+            height=36,
+            fg_color=PRIMARY_BTN_FG,
+            hover_color=PRIMARY_BTN_HOVER,
+            text_color=PRIMARY_BTN_TEXT,
+            font=self._button_font(FONT_BUTTON),
+            command=self._on_try_parse_rules,
+        ).grid(row=0, column=0, sticky="w")
+
+        customtkinter.CTkLabel(
+            content,
+            text="试解析结果",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=10, column=0, sticky="ew", pady=(4, 6))
+
+        self.parse_rules_preview_text = customtkinter.CTkTextbox(
+            content,
+            height=140,
+            corner_radius=UI_RADIUS,
+            font=customtkinter.CTkFont(size=FONT_BODY),
+            fg_color=FIELD_FG_COLOR,
+            text_color=FIELD_TEXT_COLOR,
+            wrap="word",
+        )
+        self.parse_rules_preview_text.grid(row=11, column=0, sticky="ew", pady=(0, 16))
+        self.parse_rules_preview_text.insert("1.0", "点击「试解析当前原文」预览规则效果。")
+        self.parse_rules_preview_text.configure(state="disabled")
+        self._bind_scrollable_mousewheel(
+            self.parse_rules_scroll, self.parse_rules_preview_text
+        )
+
+        self._refresh_parse_rules_alias_list()
+        self._update_parse_rules_builtin_hint()
+        self._schedule_active_page_vcenter(force=True)
+
+    def _update_controls_header_back(self, visible: bool) -> None:
+        """Show/hide the title-bar「返回设置」control (parse-rules page only)."""
+        if not hasattr(self, "controls_header_back_btn"):
+            return
+        if visible:
+            self.controls_header_back_btn.grid()
+        else:
+            self.controls_header_back_btn.grid_remove()
+
+    def _open_parse_rules_config(self):
+        if self._autofill_busy:
+            self.set_status("自动填写进行中，请先暂停或退出…")
+            return
+        if self._current_step not in {"settings", "parse_rules"}:
+            self._step_before_settings = self._current_step
+        self.show_step("parse_rules")
+
+    def _open_releases_page(self):
+        """Open the public GitHub Releases page in the default browser."""
+        try:
+            webbrowser.open(RELEASES_URL, new=2)
+            self.set_status("已打开 GitHub Releases")
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"无法打开链接：{exc}")
+            self.show_toast(
+                f"无法打开：{RELEASES_URL}\n{exc}",
+                title="GitHub Releases",
+            )
+
+    def _parse_rule_field_key_from_label(self, label: str) -> str:
+        for key, name in PARSE_RULE_FIELDS:
+            if name == label:
+                return key
+        return PARSE_RULE_FIELDS[0][0]
+
+    def _on_parse_rules_field_changed(self, label: str):
+        self._parse_rules_field_key = self._parse_rule_field_key_from_label(label)
+        self._refresh_parse_rules_alias_list()
+        self._update_parse_rules_builtin_hint()
+
+    def _update_parse_rules_builtin_hint(self):
+        if not hasattr(self, "parse_rules_builtin_label"):
+            return
+        key = self._parse_rules_field_key
+        builtin = LABEL_ALIASES.get(key, ())
+        if builtin:
+            text = "内置标签：" + "、".join(builtin)
+        else:
+            text = "该字段主要靠启发式识别；仍可添加标签别名辅助定位。"
+        self.parse_rules_builtin_label.configure(text=text)
+
+    def _refresh_parse_rules_alias_list(self):
+        if not hasattr(self, "parse_rules_alias_list"):
+            return
+        for child in self.parse_rules_alias_list.winfo_children():
+            child.destroy()
+        key = self._parse_rules_field_key
+        aliases = list(self._parse_rules.get(key, []))
+        if not aliases:
+            customtkinter.CTkLabel(
+                self.parse_rules_alias_list,
+                text="暂无自定义别名",
+                anchor="w",
+                text_color="gray60",
+                font=customtkinter.CTkFont(size=FONT_CAPTION),
+            ).grid(row=0, column=0, sticky="ew")
+            return
+        for i, alias in enumerate(aliases):
+            row = customtkinter.CTkFrame(self.parse_rules_alias_list, fg_color="transparent")
+            row.grid(row=i, column=0, sticky="ew", pady=(0, 4))
+            row.grid_columnconfigure(0, weight=1)
+            customtkinter.CTkLabel(row, text=alias, anchor="w").grid(
+                row=0, column=0, sticky="ew", padx=(0, 8)
+            )
+            customtkinter.CTkButton(
+                row,
+                corner_radius=UI_RADIUS,
+                text="删除",
+                width=72,
+                height=30,
+                fg_color=SECONDARY_BTN_FG,
+                hover_color=SECONDARY_BTN_HOVER,
+                text_color=SECONDARY_BTN_TEXT,
+                font=self._button_font(FONT_CAPTION),
+                command=lambda a=alias: self._on_remove_parse_rule_alias(a),
+            ).grid(row=0, column=1, sticky="e")
+
+    def _persist_parse_rules(self):
+        self._parse_rules = save_parse_rules(self._parse_rules)
+
+    def _on_add_parse_rule_alias(self):
+        alias = ""
+        if hasattr(self, "parse_rules_alias_entry"):
+            alias = self.parse_rules_alias_entry.get().strip()
+        if not alias:
+            self.set_status("请先输入要添加的标签别名")
+            return
+        key = self._parse_rules_field_key
+        current = list(self._parse_rules.get(key, []))
+        if alias in current:
+            self.set_status(f"别名已存在：{alias}")
+            return
+        builtin = LABEL_ALIASES.get(key, ())
+        if alias in builtin:
+            self.set_status(f"「{alias}」已是内置标签，无需添加")
+            return
+        current.append(alias)
+        self._parse_rules[key] = current
+        self._persist_parse_rules()
+        if hasattr(self, "parse_rules_alias_entry"):
+            self.parse_rules_alias_entry.delete(0, "end")
+        self._refresh_parse_rules_alias_list()
+        self.set_status(f"已添加解析别名：{PARSE_RULE_FIELD_LABELS.get(key, key)} ← {alias}")
+        self.show_success_toast(
+            f"已添加「{alias}」→ {PARSE_RULE_FIELD_LABELS.get(key, key)}",
+            title="解析规则",
+        )
+
+    def _on_remove_parse_rule_alias(self, alias: str):
+        key = self._parse_rules_field_key
+        current = [a for a in self._parse_rules.get(key, []) if a != alias]
+        if current:
+            self._parse_rules[key] = current
+        else:
+            self._parse_rules.pop(key, None)
+        self._persist_parse_rules()
+        self._refresh_parse_rules_alias_list()
+        self.set_status(f"已删除别名：{alias}")
+
+    def _current_raw_parse_text(self) -> str:
+        path = self._selected_path
+        if not path:
+            return ""
+        result = self._parse_results.get(path)
+        if result is None:
+            return ""
+        raw = (result.raw_text or "").strip()
+        if raw:
+            return raw
+        if result.lines:
+            return "\n".join(result.lines)
+        return ""
+
+    def _set_parse_rules_textbox(self, widget, text: str) -> None:
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def _refresh_parse_rules_panel(self):
+        if not hasattr(self, "parse_rules_raw_text"):
+            return
+        path = self._selected_path
+        raw = self._current_raw_parse_text()
+        if path and raw:
+            source = f"来源：{Path(path).name}"
+            body = raw
+        elif path and path in self._parse_results:
+            source = f"来源：{Path(path).name}（无原始文本）"
+            body = "（当前证书没有可用的原始解析文本）"
+        elif path:
+            source = f"来源：{Path(path).name}（尚未提取）"
+            body = "请先在「批量提取」中解析该证书，再回到此处查看原文。"
+        else:
+            source = "未选择已解析证书"
+            body = "请先在左侧选择已提取的证书，以查看原始文本。"
+        if hasattr(self, "parse_rules_raw_source"):
+            self.parse_rules_raw_source.configure(text=source)
+        self._set_parse_rules_textbox(self.parse_rules_raw_text, body)
+        self._refresh_parse_rules_alias_list()
+        self._update_parse_rules_builtin_hint()
+
+    def _on_try_parse_rules(self):
+        raw = self._current_raw_parse_text()
+        if not raw.strip():
+            self.set_status("没有可用的原始解析文本")
+            self.show_toast(
+                "请先选择并提取一份证书，以便对照原文试解析。",
+                title="解析规则",
+                duration_ms=TOAST_SUCCESS_MS,
+            )
+            return
+        try:
+            fields = parse_fields(raw, extra_label_aliases=self._parse_rules)
+        except Exception as exc:  # noqa: BLE001
+            self.set_status(f"试解析失败：{exc}")
+            return
+        lines = [
+            f"{label}：{getattr(fields, key, '') or '—'}"
+            for key, label in PARSE_RULE_FIELDS
+        ]
+        preview = "\n".join(lines)
+        self._set_parse_rules_textbox(self.parse_rules_preview_text, preview)
+        self.set_status("试解析完成（未写回证书结果；重新提取后规则才会应用到列表）")
+
+    def _extra_label_aliases(self) -> dict[str, list[str]]:
+        return dict(self._parse_rules or {})
 
     def _demo_folder_display(self) -> str:
         return self._demo_folder or "未选择演示文件夹"
@@ -2705,7 +3214,48 @@ class App(customtkinter.CTk):
         Pass action_text=None (and no undo_text) to hide action buttons.
         Set complete_on_timeout=False so expiry only dismisses (no on_complete).
         style: "danger" (red) or "success" (green).
+
+        Repeating the same title/message/style/actions refreshes the existing
+        toast countdown instead of stacking duplicates.
         """
+        duration_ms = max(int(duration_ms or 0), TOAST_MIN_MS)
+        identity = (
+            str(title or ""),
+            str(message or ""),
+            str(style or "danger"),
+            action_text,
+            undo_text,
+        )
+        now_ms = int(self.winfo_toplevel().tk.call("clock", "milliseconds"))
+
+        # Refresh an identical visible toast instead of spawning another copy.
+        for entry in self._toasts:
+            if entry.get("identity") != identity or entry.get("settled"):
+                continue
+            entry["duration_ms"] = duration_ms
+            entry["deadline_ms"] = now_ms + duration_ms
+            entry["on_complete"] = on_complete
+            entry["on_undo"] = on_undo
+            entry["complete_on_timeout"] = bool(complete_on_timeout)
+            seconds = max(1, int(round(duration_ms / 1000)))
+            try:
+                entry["progress"].set(1.0)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                entry["countdown"].configure(text=f"{seconds}s")
+            except Exception:  # noqa: BLE001
+                pass
+            # Keep the refreshed toast at the bottom of the stack (most recent).
+            try:
+                self._toasts.remove(entry)
+                self._toasts.append(entry)
+            except ValueError:
+                pass
+            self._relayout_toast_stack()
+            self._schedule_toast_tick()
+            return
+
         while len(self._toasts) >= TOAST_STACK_MAX:
             self._dismiss_toast(self._toasts[0], run_complete=False)
 
@@ -2742,7 +3292,6 @@ class App(customtkinter.CTk):
             text_color=TOAST_TITLE_COLOR,
         ).grid(row=0, column=0, sticky="ew")
 
-        duration_ms = max(int(duration_ms or 0), TOAST_MIN_MS)
         seconds = max(1, int(round(duration_ms / 1000)))
         countdown = customtkinter.CTkLabel(
             header,
@@ -2782,12 +3331,12 @@ class App(customtkinter.CTk):
         self._toast_seq += 1
         entry = {
             "id": self._toast_seq,
+            "identity": identity,
             "frame": toast,
             "progress": progress,
             "countdown": countdown,
             "duration_ms": duration_ms,
-            "deadline_ms": int(self.winfo_toplevel().tk.call("clock", "milliseconds"))
-            + duration_ms,
+            "deadline_ms": now_ms + duration_ms,
             "on_complete": on_complete,
             "on_undo": on_undo,
             "complete_on_timeout": bool(complete_on_timeout),
@@ -3335,7 +3884,12 @@ class App(customtkinter.CTk):
             for i, path in enumerate(paths, start=1):
                 self.set_status(f"解析进度 {i}/{len(paths)}")
                 self.update_idletasks()
-                results[path] = parse_certificate(path, use_ocr_fallback=False, force_ocr=False)
+                results[path] = parse_certificate(
+                    path,
+                    use_ocr_fallback=False,
+                    force_ocr=False,
+                    extra_label_aliases=self._extra_label_aliases(),
+                )
             self._on_folder_loaded(folder, paths, results)
         except Exception as exc:  # noqa: BLE001
             self._on_folder_fail(str(exc))
@@ -3475,6 +4029,7 @@ class App(customtkinter.CTk):
             self.ocr_extract_button.configure(state="disabled")
         self._set_ocr_progress(0, len(targets))
         self.set_status(f"OCR提取开始：{len(targets)} 份")
+        aliases = self._extra_label_aliases()
 
         def worker():
             done = 0
@@ -3491,6 +4046,7 @@ class App(customtkinter.CTk):
                             path,
                             use_ocr_fallback=False,
                             force_ocr=True,
+                            extra_label_aliases=aliases,
                         )
                         self._parse_results[path] = result
                         if result.ok:
@@ -4198,6 +4754,8 @@ class App(customtkinter.CTk):
         if self._current_step == "review" and hasattr(self, "field_entries"):
             self._load_approve_fields_for_current()
             self._update_review_cert_status()
+        if self._current_step == "parse_rules":
+            self._refresh_parse_rules_panel()
         self._sync_pdf_preview()
 
     def _save_extract_fields_to_result(self):
@@ -4939,7 +5497,7 @@ class App(customtkinter.CTk):
         except Exception:  # noqa: BLE001
             pass
         try:
-            self._update_settings_button(self._current_step == "settings")
+            self._update_settings_button(self._current_step in {"settings", "parse_rules"})
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -5114,11 +5672,16 @@ class App(customtkinter.CTk):
         self.set_status("下一份")
 
     def _leave_settings_if_open(self, key: str | None = None):
-        """If settings is showing, leave to `key` or the step that opened settings."""
+        """If settings is showing, leave to `key` or the step that opened settings.
+
+        Parse-rules stays open so selecting documents can refresh raw text.
+        """
+        if self._current_step == "parse_rules":
+            return
         if self._current_step != "settings":
             return
         target = key or getattr(self, "_step_before_settings", None) or "extract"
-        if target == "settings":
+        if target in {"settings", "parse_rules"}:
             target = "extract"
         self.show_step(target)
 
@@ -5126,7 +5689,7 @@ class App(customtkinter.CTk):
         if self._autofill_busy:
             self.set_status("自动填写进行中，请先暂停或退出…")
             return
-        if self._current_step != "settings":
+        if self._current_step not in {"settings", "parse_rules"}:
             self._step_before_settings = self._current_step
         self.show_step("settings")
 

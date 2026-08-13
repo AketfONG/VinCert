@@ -229,9 +229,41 @@ def _value_after_label(
     return ""
 
 
-def _all_stop_labels() -> set[str]:
+def merge_label_aliases(
+    extra: dict[str, list[str] | tuple[str, ...]] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Built-in ``LABEL_ALIASES`` plus user-defined labels (user labels first)."""
+    merged: dict[str, tuple[str, ...]] = {
+        key: tuple(aliases) for key, aliases in LABEL_ALIASES.items()
+    }
+    if not extra:
+        return merged
+    for key, values in extra.items():
+        if not key:
+            continue
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in values or ():
+            alias = str(raw or "").strip()
+            if not alias or alias in seen:
+                continue
+            seen.add(alias)
+            cleaned.append(alias)
+        if not cleaned:
+            continue
+        existing = merged.get(key, ())
+        # Prefer user aliases so new wording wins length ties when equal.
+        combined = tuple(cleaned) + tuple(a for a in existing if a not in seen)
+        merged[key] = combined
+    return merged
+
+
+def _all_stop_labels(
+    label_aliases: dict[str, tuple[str, ...]] | None = None,
+) -> set[str]:
+    aliases_map = label_aliases if label_aliases is not None else LABEL_ALIASES
     labels: set[str] = set()
-    for aliases in LABEL_ALIASES.values():
+    for aliases in aliases_map.values():
         labels.update(aliases)
     labels.update(
         {
@@ -356,15 +388,20 @@ def detect_unit(lines: list[str], raw: str = "") -> str:
     return ""
 
 
-def parse_fields(raw_text: str) -> CertificateFields:
+def parse_fields(
+    raw_text: str,
+    *,
+    extra_label_aliases: dict[str, list[str] | tuple[str, ...]] | None = None,
+) -> CertificateFields:
     lines = clean_lines(raw_text)
-    stops = _all_stop_labels()
+    aliases_map = merge_label_aliases(extra_label_aliases)
+    stops = _all_stop_labels(aliases_map)
     fields = CertificateFields()
 
     fields.measurement_type = detect_type(lines, raw_text)
     fields.measurement_unit = detect_unit(lines, raw_text)
 
-    for key, aliases in LABEL_ALIASES.items():
+    for key, aliases in aliases_map.items():
         idx = _find_label_index(lines, aliases)
         if idx is None:
             continue
