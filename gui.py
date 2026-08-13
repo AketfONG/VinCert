@@ -660,12 +660,7 @@ class App(customtkinter.CTk):
             return None
 
     def _set_app_bounds(self, left: int, top: int, width: int, height: int) -> None:
-        """Place VinCert exactly in a screen rect (respects Windows work area).
-
-        On Windows, Win32 SetWindowPos sizes the *outer* frame to the work area.
-        Tk ``geometry`` sizes the *client* area, which would push the title bar /
-        borders into the taskbar — never use that for fullscreen/snap on win32.
-        """
+        """Place VinCert with Tk geometry (may leave a small frame/gap vs work area)."""
         left, top = int(left), int(top)
         width, height = max(400, int(width)), max(400, int(height))
         try:
@@ -674,138 +669,51 @@ class App(customtkinter.CTk):
                     self.attributes("-fullscreen", False)
                 except Exception:  # noqa: BLE001
                     pass
-            # Never use state('zoomed') — it ignores the taskbar on some DPI setups.
             self.state("normal")
         except Exception:  # noqa: BLE001
             pass
         self.update_idletasks()
-
-        if sys.platform == "win32":
-            hwnd = self._win_toplevel_hwnd()
-            if hwnd:
-                try:
-                    import ctypes
-                    from ctypes import wintypes
-
-                    user32 = ctypes.windll.user32
-                    # SWP_NOZORDER | SWP_SHOWWINDOW — exact outer-frame placement.
-                    SWP_NOZORDER = 0x0004
-                    SWP_SHOWWINDOW = 0x0040
-                    user32.SetWindowPos(
-                        wintypes.HWND(hwnd),
-                        wintypes.HWND(0),
-                        left,
-                        top,
-                        width,
-                        height,
-                        SWP_NOZORDER | SWP_SHOWWINDOW,
-                    )
-                    self.update_idletasks()
-
-                    # Clamp if DPI / DWM still pushed us past the work rect.
-                    class RECT(ctypes.Structure):
-                        _fields_ = [
-                            ("left", wintypes.LONG),
-                            ("top", wintypes.LONG),
-                            ("right", wintypes.LONG),
-                            ("bottom", wintypes.LONG),
-                        ]
-
-                    rect = RECT()
-                    if user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
-                        work_x, work_y, work_w, work_h = self._screen_work_area()
-                        work_right = work_x + work_w
-                        work_bottom = work_y + work_h
-                        over_x = max(0, int(rect.right) - work_right)
-                        over_y = max(0, int(rect.bottom) - work_bottom)
-                        if over_x or over_y or int(rect.left) < work_x or int(rect.top) < work_y:
-                            user32.SetWindowPos(
-                                wintypes.HWND(hwnd),
-                                wintypes.HWND(0),
-                                work_x if int(rect.left) < work_x else left,
-                                work_y if int(rect.top) < work_y else top,
-                                max(400, width - over_x),
-                                max(400, height - over_y),
-                                SWP_NOZORDER | SWP_SHOWWINDOW,
-                            )
-                            self.update_idletasks()
-                    return
-                except Exception:  # noqa: BLE001
-                    pass
-
-        # Non-Windows (or Win32 API unavailable): Tk geometry is best-effort.
         self.geometry(f"{width}x{height}+{left}+{top}")
         self.update_idletasks()
 
     def _apply_window_fullscreen(self):
-        """Fill the monitor — native maximize on Windows, work-area geometry elsewhere."""
+        """Maximize / fill the work area when no side browser layout is needed."""
         if not getattr(self, "_auto_window_snap", True):
             self._pdf_preview_layout_active = False
             return
         self._pdf_preview_layout_active = False
-        if sys.platform == "win32":
-            hwnd = self._win_toplevel_hwnd()
-            if hwnd:
+        try:
+            if sys.platform == "darwin":
                 try:
-                    from vincert.win_snap import snap_hwnd
-
-                    if snap_hwnd(hwnd, "maximize"):
-                        self.update_idletasks()
-                        return
+                    self.attributes("-fullscreen", False)
                 except Exception:  # noqa: BLE001
                     pass
+            self.state("normal")
+        except Exception:  # noqa: BLE001
+            pass
+        self.update_idletasks()
+        if sys.platform == "win32":
             try:
                 self.state("zoomed")
-                self.update_idletasks()
                 return
             except Exception:  # noqa: BLE001
                 pass
         x, y, w, h = self._screen_work_area()
         self._set_app_bounds(x, y, w, h)
-        self.after(50, lambda: self._reassert_geometry_bounds(full=True))
-        self.after(200, lambda: self._reassert_geometry_bounds(full=True))
-
-    def _reassert_geometry_bounds(self, *, full: bool) -> None:
-        """Re-apply calculated geometry on non-native platforms only."""
-        if sys.platform == "win32":
-            return
-        try:
-            if not self.winfo_exists():
-                return
-        except Exception:  # noqa: BLE001
-            return
-        if full and self._pdf_preview_layout_active:
-            return
-        if not full and not self._pdf_preview_layout_active:
-            return
-        x, y, w, h = self._screen_work_area()
-        if full:
-            self._set_app_bounds(x, y, w, h)
-        else:
-            half = max(640, w // 2)
-            self._set_app_bounds(x, y, half, h)
+        if sys.platform == "darwin":
+            try:
+                self.state("zoomed")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _snap_app_left_half(self):
-        """Snap VinCert to the left half (native Win+Left on Windows)."""
+        """Place VinCert on the left half of the work area via Tk geometry."""
         if not getattr(self, "_auto_window_snap", True):
             return
-        self._pdf_preview_layout_active = True
-        if sys.platform == "win32":
-            hwnd = self._win_toplevel_hwnd()
-            if hwnd:
-                try:
-                    from vincert.win_snap import snap_hwnd
-
-                    if snap_hwnd(hwnd, "left"):
-                        self.update_idletasks()
-                        return
-                except Exception:  # noqa: BLE001
-                    pass
         x, y, w, h = self._screen_work_area()
         half = max(640, w // 2)
         self._set_app_bounds(x, y, half, h)
-        self.after(50, lambda: self._reassert_geometry_bounds(full=False))
-        self.after(200, lambda: self._reassert_geometry_bounds(full=False))
+        self._pdf_preview_layout_active = True
 
     def _browser_profile_dir(self) -> Path:
         """Persistent Chromium profile shared by PDF preview + EAMS tabs."""
@@ -823,7 +731,6 @@ class App(customtkinter.CTk):
         if self._auto_window_snap:
             self._snap_app_left_half()
             self.update_idletasks()
-            self.update()
             return self._pdf_preview_bounds_remaining()
         self.update_idletasks()
         return self._default_browser_bounds()
@@ -2205,28 +2112,6 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(
             content,
-            text="失败证书",
-            anchor="w",
-            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-        ).grid(row=10, column=0, sticky="ew", pady=(8, 8))
-
-        self._track_content_wrap(
-            customtkinter.CTkLabel(
-                content,
-                text=(
-                    f"移出未解析/失败证书时，会复制到导入文件夹下的 "
-                    f"「{FAILED_ITEMS_SUBDIR}/」子目录（同名文件不重复复制）。"
-                ),
-                anchor="w",
-                font=customtkinter.CTkFont(size=FONT_BODY),
-                text_color="gray60",
-                wraplength=CONTENT_WRAP,
-                justify="left",
-            )
-        ).grid(row=11, column=0, sticky="ew", pady=(0, 16))
-
-        customtkinter.CTkLabel(
-            content,
             text="测试模式",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
@@ -3012,7 +2897,6 @@ class App(customtkinter.CTk):
     def _nudge_window_geometry_after_scale(self):
         """Force Tk/CTk to refill the window after scale-down (clears black bars)."""
         try:
-            # Prefer re-applying work-area snap (never state('zoomed') — taskbar).
             if self._auto_window_snap and self._pdf_preview_layout_active:
                 self._snap_app_left_half()
                 return
@@ -3023,7 +2907,6 @@ class App(customtkinter.CTk):
             height = int(self.winfo_height())
             if width <= 1 or height <= 1:
                 return
-            # macOS / other: 1px nudge clears letterboxing.
             self.geometry(f"{width}x{height + 1}")
             self.update_idletasks()
             self.geometry(f"{width}x{height}")
@@ -3225,23 +3108,18 @@ class App(customtkinter.CTk):
                 pass
 
     def finish_autofill_log(self, *, ok: bool = True, auto_close_ms: int = AUTOFILL_LOG_FINISH_MS):
-        """Mark the autofill terminal done/failed and optionally auto-close later."""
+        """Mark the autofill terminal done/failed and show a close countdown."""
+        done_label = "完成" if ok else "失败"
+        accent = SUCCESS_BTN_HOVER if ok else DANGER_BTN_HOVER
+        border = SUCCESS_BTN_FG if ok else DANGER_BTN_FG
         if self._autofill_log_status is not None:
             try:
-                if ok:
-                    self._autofill_log_status.configure(
-                        text="完成",
-                        text_color=SUCCESS_BTN_HOVER,
-                    )
-                    if self._autofill_log_frame is not None:
-                        self._autofill_log_frame.configure(border_color=SUCCESS_BTN_FG)
-                else:
-                    self._autofill_log_status.configure(
-                        text="失败",
-                        text_color=DANGER_BTN_HOVER,
-                    )
-                    if self._autofill_log_frame is not None:
-                        self._autofill_log_frame.configure(border_color=DANGER_BTN_FG)
+                self._autofill_log_status.configure(
+                    text=done_label,
+                    text_color=accent,
+                )
+                if self._autofill_log_frame is not None:
+                    self._autofill_log_frame.configure(border_color=border)
             except Exception:  # noqa: BLE001
                 pass
         if self._autofill_log_finish_after_id is not None:
@@ -3250,10 +3128,32 @@ class App(customtkinter.CTk):
             except Exception:  # noqa: BLE001
                 pass
             self._autofill_log_finish_after_id = None
-        if auto_close_ms and auto_close_ms > 0:
-            self._autofill_log_finish_after_id = self.after(
-                auto_close_ms, self.close_autofill_log
-            )
+        if not auto_close_ms or auto_close_ms <= 0:
+            return
+
+        total_sec = max(1, int(round(auto_close_ms / 1000)))
+        state = {"left": total_sec}
+
+        def _tick():
+            self._autofill_log_finish_after_id = None
+            if self._autofill_log_frame is None:
+                return
+            left = int(state["left"])
+            if left <= 0:
+                self.close_autofill_log()
+                return
+            if self._autofill_log_status is not None:
+                try:
+                    self._autofill_log_status.configure(
+                        text=f"{done_label} · {left}s",
+                        text_color=accent,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            state["left"] = left - 1
+            self._autofill_log_finish_after_id = self.after(1000, _tick)
+
+        _tick()
 
     def close_autofill_log(self):
         if self._autofill_log_finish_after_id is not None:
@@ -6044,6 +5944,25 @@ class App(customtkinter.CTk):
         if self._autofill_busy:
             self.set_status("自动填写进行中，请稍候…")
             return
+
+        # Untouched certs (neither approved nor removed) → red-dot removed
+        # before automation starts, so the list matches what will be filled.
+        auto_removed = 0
+        approved = set(self._autofill_queue)
+        for path in self._imported_files:
+            if path in approved or path in self._removed_paths:
+                continue
+            self._removed_paths.add(path)
+            auto_removed += 1
+        if auto_removed:
+            self._refresh_doc_list_marks()
+            self._update_autofill_button()
+            self._update_approve_toggle_button()
+            self._update_remove_toggle_button()
+            self._update_review_fields_state()
+            self.set_status(
+                f"未操作 {auto_removed} 份已标为移出 · 批准 {n} 份开始自动填写"
+            )
 
         items: list[AutofillItem] = []
         for path in self._autofill_queue:

@@ -342,12 +342,8 @@ class PdfPreviewController:
         if bounds is None:
             return
         try:
-            if sys.platform == "win32":
-                self._set_window_bounds(page, bounds)
-                time.sleep(0.12)
-                self._snap_browser_right(title_hint=title_hint)
-            else:
-                self._set_window_bounds(page, bounds)
+            # CDP bounds only — avoid Win+Right snap (animates / flickers).
+            self._set_window_bounds(page, bounds)
         except Exception:  # noqa: BLE001
             if force:
                 raise

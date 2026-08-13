@@ -636,6 +636,32 @@ def _already_logged_in(page, *, timeout_ms: int = 3000) -> bool:
         return False
 
 
+def _manage_chooser_visible(page) -> bool:
+    """True when the post-auth app chooser (Available Manage / 启动) is showing."""
+    checks = (
+        ("link", "Available Manage", False),
+        ("link", "启动", True),
+        ("button", "close", True),
+    )
+    for role, name, exact in checks:
+        try:
+            loc = page.get_by_role(role, name=name, exact=exact)
+            if loc.count() > 0 and bool(loc.first.is_visible()):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _login_form_visible(page) -> bool:
+    """True when the MAS username field is ready for autofill."""
+    try:
+        box = page.get_by_role("textbox", name="输入用户名")
+        return box.count() > 0 and bool(box.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _fill_username_field(page, username: str) -> None:
     # UAT/prod MAS auth portal uses accessible name「输入用户名」(codegen).
     for name in ("输入用户名", "用户名", "账号", "Username", "User name", "user"):
@@ -755,142 +781,72 @@ def _fill_eams_login_form(
     _click_auth_primary_button(page, label="登录", status=status)
 
 
-def _maybe_open_available_manage(
+def _post_login_enter_manage(
     page,
-    env: EamsEnvironment,
     *,
     status: StatusFn | None = None,
-    control: AutofillControl | None = None,
-) -> bool:
-    """Open Manage via the portal「Available Manage」link when that chooser appears.
-
-    Matches recorded flow:
-      page.goto(env.portal)
-      page.get_by_role("link", name="Available Manage").click()
-    Returns True if the link was clicked.
-    """
-
-    def check():
-        if control is not None:
-            control.checkpoint(status)
-
-    check()
-    # Prefer clicking if the link is already on the current page (auth redirect).
-    link = page.get_by_role("link", name="Available Manage")
-    visible = False
-    try:
-        visible = link.count() > 0 and bool(link.first.is_visible())
-    except Exception:  # noqa: BLE001
-        visible = False
-
-    if not visible:
-        try:
-            _status(status, f"打开 EAMS 门户（{env.label}）…")
-            page.goto(env.portal, wait_until="domcontentloaded")
-        except Exception:  # noqa: BLE001
-            return False
-        check()
-        link = page.get_by_role("link", name="Available Manage")
-        try:
-            link.first.wait_for(state="visible", timeout=5_000)
-            visible = True
-        except Exception:  # noqa: BLE001
-            return False
-
-    if not visible:
-        return False
-
-    check()
-    _click(status, link.first, "Available Manage", timeout=8_000)
-    return True
-
-
-def login_eams(
-    page,
-    username: str,
-    password: str,
-    *,
-    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
-    status: StatusFn | None = None,
-    env: EamsEnvironment | None = None,
     control: AutofillControl | None = None,
 ) -> None:
-    """Open EAMS auth portal and autofill credentials.
+    """App chooser: close → Available Manage → dismiss dialog → 启动.
 
-    Waits are sliced so pause/exit can interrupt (avoids multi-minute hangs on UAT).
+    Also used on consecutive runs when the session skips password and lands
+    directly on the Manage chooser page.
     """
-    username = (username or "").strip()
-    password = password or ""
-    if not username or not password:
-        raise ValueError("请先在设置中填写 EAMS 用户名和密码")
 
     def check():
         if control is not None:
             control.checkpoint(status)
 
-    target = env or resolve_eams_environment(testing=False)
-
-    # Auth portal first (matches recorded UAT codegen). If already logged in,
-    # home will show the shell without needing the form.
     check()
-    _status(status, f"打开 EAMS 登录页（{target.label}）…")
     try:
-        page.goto(target.login, wait_until="domcontentloaded")
-    except Exception:  # noqa: BLE001
-        page.goto(target.home, wait_until="domcontentloaded")
-
-    check()
-    if _already_logged_in(page, timeout_ms=2500):
-        _status(status, "已检测到登录会话")
-        return
-
-    # Wait for the username field used by MAS UAT/prod auth UI.
-    try:
-        page.get_by_role("textbox", name="输入用户名").wait_for(
-            state="visible", timeout=10_000
-        )
-    except Exception:  # noqa: BLE001
-        # Fall back to home → login redirect if the portal didn't render.
-        try:
-            check()
-            page.goto(target.home, wait_until="domcontentloaded")
-            check()
-            if _already_logged_in(page, timeout_ms=2000):
-                _status(status, "已检测到登录会话")
-                return
-            page.goto(target.login, wait_until="domcontentloaded")
-            page.get_by_role("textbox", name="输入用户名").wait_for(
-                state="visible", timeout=8000
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    check()
-    if _already_logged_in(page, timeout_ms=1000):
-        _status(status, "已检测到登录会话")
-        return
-
-    _status(status, "正在自动填写登录信息…")
-    check()
-    _fill_eams_login_form(page, username, password, status=status)
-    check()
-
-    # Post-password app chooser (UAT/prod): portal → Available Manage, if shown.
-    try:
-        _maybe_open_available_manage(
-            page, target, status=status, control=control
-        )
-    except AutofillCancelled:
-        raise
+        page.wait_for_load_state("domcontentloaded", timeout=15_000)
     except Exception:  # noqa: BLE001
         pass
+    page.wait_for_timeout(500)
+
+    check()
+    _status(status, "关闭提示…")
+    close_btn = page.get_by_role("button", name="close", exact=True)
+    try:
+        close_btn.wait_for(state="visible", timeout=8_000)
+        _click(status, close_btn, "close", timeout=8_000)
+    except Exception:  # noqa: BLE001
+        _status(status, "未找到 close，继续…")
+
+    check()
+    _status(status, "打开 Available Manage…")
+    manage = page.get_by_role("link", name="Available Manage")
+    manage.wait_for(state="visible", timeout=20_000)
+    _click(status, manage, "Available Manage", timeout=12_000)
+
+    check()
+    page.once("dialog", lambda dialog: dialog.dismiss())
+    _status(status, "点击启动…")
+    launch = page.get_by_role("link", name="启动", exact=True)
+    launch.wait_for(state="visible", timeout=20_000)
+    _click(status, launch, "启动", timeout=12_000)
+    page.wait_for_timeout(500)
+
+
+def _wait_for_manage_shell(
+    page,
+    target: EamsEnvironment,
+    *,
+    login_wait_seconds: int,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+) -> None:
+    """Poll until Maximo shell is up after Manage entry (or existing session)."""
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
 
     deadline = time.time() + max(login_wait_seconds, 30)
-    _status(status, "等待登录完成…")
+    _status(status, "等待进入 EAMS…")
     navigated_home = False
     while True:
         check()
-        # Shell iframe means login already landed in Maximo.
         try:
             page.wait_for_selector(SHELL_IFRAME, timeout=2000)
             _status(status, f"EAMS 登录成功（{target.label}）")
@@ -902,7 +858,6 @@ def login_eams(
                 raise AutofillCancelled("用户退出自动填写") from exc
 
         check()
-        # Brief URL wait — never block the full login timeout in one call.
         try:
             page.wait_for_url(target.post_login_url_glob, timeout=1500)
             if not navigated_home:
@@ -920,7 +875,6 @@ def login_eams(
             break
 
     check()
-    # Last attempt: open home and require shell, still with a short timeout.
     try:
         page.goto(target.home, wait_until="domcontentloaded")
         page.wait_for_selector(SHELL_IFRAME, timeout=8000)
@@ -935,6 +889,175 @@ def login_eams(
             f"登录超时（{target.label}）：未进入 EAMS 主界面。"
             "请确认账号密码或在浏览器中手动登录后重试。"
         ) from exc
+
+
+def login_eams(
+    page,
+    username: str,
+    password: str,
+    *,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
+    status: StatusFn | None = None,
+    env: EamsEnvironment | None = None,
+    control: AutofillControl | None = None,
+) -> None:
+    """Open EAMS auth portal and autofill credentials when needed.
+
+    Consecutive runs may skip the password form and land on the Manage
+    chooser — that path still runs close → Available Manage → 启动.
+    """
+    username = (username or "").strip()
+    password = password or ""
+    if not username or not password:
+        raise ValueError("请先在设置中填写 EAMS 用户名和密码")
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
+    target = env or resolve_eams_environment(testing=False)
+
+    check()
+    _status(status, f"打开 EAMS 登录页（{target.label}）…")
+    try:
+        page.goto(target.login, wait_until="domcontentloaded")
+    except Exception:  # noqa: BLE001
+        try:
+            page.goto(target.portal, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            page.goto(target.home, wait_until="domcontentloaded")
+
+    check()
+    if _already_logged_in(page, timeout_ms=2500):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    # Session cookie present: auth redirects to app chooser (no password).
+    if _manage_chooser_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    # Wait briefly for either the login form or the Manage chooser.
+    try:
+        page.get_by_role("textbox", name="输入用户名").wait_for(
+            state="visible", timeout=8_000
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    check()
+    if _already_logged_in(page, timeout_ms=1000):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    if not _login_form_visible(page) and not _manage_chooser_visible(page):
+        # Auth may send us elsewhere — try the EAMS portal chooser next.
+        try:
+            check()
+            _status(status, f"打开 EAMS 门户（{target.label}）…")
+            page.goto(target.portal, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            pass
+
+    check()
+    if _already_logged_in(page, timeout_ms=1500):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    if _manage_chooser_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    if not _login_form_visible(page):
+        # Last chance: home may already be the shell, or show login redirect.
+        try:
+            check()
+            page.goto(target.home, wait_until="domcontentloaded")
+            if _already_logged_in(page, timeout_ms=2000):
+                _status(status, "已检测到登录会话（Manage 已打开）")
+                return
+            if _manage_chooser_visible(page):
+                _status(status, "已登录，进入 Available Manage…")
+                _post_login_enter_manage(page, status=status, control=control)
+                _wait_for_manage_shell(
+                    page,
+                    target,
+                    login_wait_seconds=login_wait_seconds,
+                    status=status,
+                    control=control,
+                )
+                return
+            page.goto(target.login, wait_until="domcontentloaded")
+            page.get_by_role("textbox", name="输入用户名").wait_for(
+                state="visible", timeout=8000
+            )
+        except AutofillCancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
+    if _manage_chooser_visible(page) and not _login_form_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    _status(status, "正在自动填写登录信息…")
+    check()
+    _fill_eams_login_form(page, username, password, status=status)
+    check()
+
+    try:
+        _post_login_enter_manage(page, status=status, control=control)
+    except AutofillCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"进入 Manage 步骤未完成：{exc}")
+
+    _wait_for_manage_shell(
+        page,
+        target,
+        login_wait_seconds=login_wait_seconds,
+        status=status,
+        control=control,
+    )
 
 
 def next_export_path(prefix: str = "vincert_batch") -> Path:
@@ -969,7 +1092,7 @@ def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> 
 
 
 def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
-    """Place the Chromium window — native right snap on Windows, CDP elsewhere."""
+    """Place the Chromium window via CDP bounds (no Win+Arrow snap)."""
     left, top, width, height = bounds
     width = max(400, int(width))
     height = max(400, int(height))
@@ -988,14 +1111,6 @@ def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
             },
         },
     )
-    if sys.platform == "win32":
-        try:
-            from .win_snap import snap_chrome
-
-            time.sleep(0.12)
-            snap_chrome(side="right")
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _step_pause(
