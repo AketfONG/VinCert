@@ -1222,6 +1222,26 @@ def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> 
     return path
 
 
+def _delete_export_spreadsheet(
+    excel_path: Path | str | None,
+    *,
+    status: StatusFn | None = None,
+) -> bool:
+    """Remove a batch-export Excel after a failed EAMS import. Returns True if deleted."""
+    if not excel_path:
+        return False
+    path = Path(excel_path)
+    try:
+        if not path.is_file():
+            return False
+        path.unlink()
+        _status(status, f"已删除失败导入表格：{path.name}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"删除失败导入表格未成功：{path.name}（{exc}）")
+        return False
+
+
 def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
     """Place the Chromium window via CDP bounds (no Win+Arrow snap)."""
     left, top, width, height = bounds
@@ -1410,13 +1430,20 @@ def run_mas_autofill(
                     raise FileNotFoundError(f"Excel 不存在且未提供数据行：{excel_path}")
                 write_batch_excel(excel_rows, excel_headers, excel_path)
             _status(status, f"批量导入 Excel：{excel_path.name}")
-            _batch_import_excel(
-                shell,
-                excel_path,
-                status=status,
-                control=gate,
-                wait_seconds=login_wait_seconds,
-            )
+            try:
+                _batch_import_excel(
+                    shell,
+                    excel_path,
+                    status=status,
+                    control=gate,
+                    wait_seconds=login_wait_seconds,
+                )
+            except AutofillBatchImportError:
+                _delete_export_spreadsheet(excel_path, status=status)
+                raise
+            except TimeoutError as exc:
+                _delete_export_spreadsheet(excel_path, status=status)
+                raise AutofillBatchImportError(str(exc)) from exc
             report.imported_excel = True
             check()
             pause_step("批量导入已完成，开始逐份自动填写…")
@@ -1765,13 +1792,22 @@ def _batch_import_excel(
         time.sleep(0.35)
 
 
+def _confirm_leave_detail_yes(
+    shell, *, status: StatusFn | None = None, timeout: float = 8_000
+) -> None:
+    """Click「是」on the leave-detail confirm that follows 列表视图."""
+    yes = shell.get_by_role("button", name="是")
+    yes.wait_for(state="visible", timeout=timeout)
+    _click(status, yes, "是", timeout=8_000)
+
+
 def _return_to_list_view_and_save(
     shell,
     *,
     status: StatusFn | None = None,
     require_save: bool = True,
 ) -> None:
-    """Leave the detail form: 列表视图 → 保存 (codegen order)."""
+    """Leave the detail form: 列表视图 → 是 → 保存 (codegen order)."""
     _status(status, "返回列表视图…")
     list_link = shell.get_by_role("link", name="列表视图")
     try:
@@ -1782,6 +1818,17 @@ def _return_to_list_view_and_save(
             raise AutofillItemError(f"无法打开列表视图：{exc}", quarantine=False) from exc
         _status(status, "未找到「列表视图」，继续…")
         return
+
+    try:
+        _status(status, "确认离开（是）…")
+        _confirm_leave_detail_yes(shell, status=status)
+    except Exception as exc:  # noqa: BLE001
+        if require_save:
+            raise AutofillItemError(
+                f"未出现或无法点击「是」：{exc}",
+                quarantine=False,
+            ) from exc
+        _status(status, "未找到「是」，继续…")
 
     save = shell.get_by_role("menuitem", name="保存")
     try:
