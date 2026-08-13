@@ -659,8 +659,52 @@ class App(customtkinter.CTk):
         except Exception:  # noqa: BLE001
             return None
 
+    def _frame_chrome_size(self) -> tuple[int, int]:
+        """Return (extra_width, extra_height) of the OS frame beyond the Tk client.
+
+        Playwright bounds are outer-window sizes. Tk ``geometry`` width/height
+        are the client area — using work height as client height pushes the
+        title bar into the taskbar. Subtract this chrome so VinCert's outer
+        height matches the Playwright window.
+        """
+        if sys.platform == "win32":
+            hwnd = self._win_toplevel_hwnd()
+            if hwnd:
+                try:
+                    import ctypes
+                    from ctypes import wintypes
+
+                    class RECT(ctypes.Structure):
+                        _fields_ = [
+                            ("left", wintypes.LONG),
+                            ("top", wintypes.LONG),
+                            ("right", wintypes.LONG),
+                            ("bottom", wintypes.LONG),
+                        ]
+
+                    user32 = ctypes.windll.user32
+                    outer = RECT()
+                    client = RECT()
+                    if user32.GetWindowRect(
+                        wintypes.HWND(hwnd), ctypes.byref(outer)
+                    ) and user32.GetClientRect(
+                        wintypes.HWND(hwnd), ctypes.byref(client)
+                    ):
+                        ow = int(outer.right) - int(outer.left)
+                        oh = int(outer.bottom) - int(outer.top)
+                        cw = int(client.right) - int(client.left)
+                        ch = int(client.bottom) - int(client.top)
+                        if ow > cw >= 0 and oh > ch >= 0:
+                            return ow - cw, oh - ch
+                except Exception:  # noqa: BLE001
+                    pass
+            return 16, 39
+        if sys.platform == "darwin":
+            return 0, 28
+        return 0, 0
+
     def _set_app_bounds(self, left: int, top: int, width: int, height: int) -> None:
-        """Place VinCert with Tk geometry (may leave a small frame/gap vs work area)."""
+        """Place VinCert via Tk geometry so *outer* size matches work/Playwright."""
         left, top = int(left), int(top)
         width, height = max(400, int(width)), max(400, int(height))
         try:
@@ -673,7 +717,10 @@ class App(customtkinter.CTk):
         except Exception:  # noqa: BLE001
             pass
         self.update_idletasks()
-        self.geometry(f"{width}x{height}+{left}+{top}")
+        chrome_w, chrome_h = self._frame_chrome_size()
+        client_w = max(400, width - chrome_w)
+        client_h = max(400, height - chrome_h)
+        self.geometry(f"{client_w}x{client_h}+{left}+{top}")
         self.update_idletasks()
 
     def _apply_window_fullscreen(self):
@@ -720,10 +767,13 @@ class App(customtkinter.CTk):
         return resolve_eams_environment(testing=bool(self._testing_mode)).user_data_dir
 
     def _default_browser_bounds(self) -> tuple[int, int, int, int]:
-        """Right half of the work area — used when auto-snap is off."""
+        """Right half of the work area — same outer height as VinCert."""
         work_x, work_y, work_w, work_h = self._screen_work_area()
         half = max(400, work_w // 2)
-        return (work_x + work_w - half, work_y, half, max(400, work_h))
+        _, chrome_h = self._frame_chrome_size()
+        app_h = max(int(self.winfo_height()), 1) + chrome_h
+        shared_h = max(400, min(work_h, app_h if app_h >= 400 else work_h))
+        return (work_x + work_w - half, work_y, half, shared_h)
 
     def _prepare_side_browser_layout(self) -> tuple[int, int, int, int]:
         """Optionally snap VinCert left and return bounds for the shared browser."""
@@ -738,8 +788,8 @@ class App(customtkinter.CTk):
     def _pdf_preview_bounds_remaining(self) -> tuple[int, int, int, int]:
         """Size the browser to the unused work-area space beside VinCert.
 
-        Uses the live gui.py window geometry so the preview gets whatever
-        remains (typically to the right), not a hard-coded half split.
+        Height matches VinCert's outer frame so both sit on the same bottom
+        edge (above the taskbar / home bar).
         """
         self.update_idletasks()
         work_x, work_y, work_w, work_h = self._screen_work_area()
@@ -750,8 +800,10 @@ class App(customtkinter.CTk):
         app_top = int(self.winfo_rooty())
         app_width = max(int(self.winfo_width()), 1)
         app_height = max(int(self.winfo_height()), 1)
+        chrome_w, chrome_h = self._frame_chrome_size()
         app_right = app_left + app_width
-        app_bottom = app_top + app_height
+        app_outer_h = app_height + chrome_h
+        shared_h = max(400, min(work_h, app_outer_h if app_outer_h >= 400 else work_h))
 
         # Prefer the strip to the right of the app within the work area.
         right_width = work_right - app_right
@@ -759,15 +811,15 @@ class App(customtkinter.CTk):
             left = max(app_right, work_x)
             top = work_y
             width = work_right - left
-            height = work_h
-            return (left, top, max(400, width), max(400, height))
+            return (left, top, max(400, width), shared_h)
 
         # Prefer the strip to the left of the app.
         left_width = app_left - work_x
         if left_width >= 400:
-            return (work_x, work_y, max(400, left_width), max(400, work_h))
+            return (work_x, work_y, max(400, left_width), shared_h)
 
         # Prefer space below the app (unusual, but better than overlapping).
+        app_bottom = app_top + app_height
         below = work_bottom - app_bottom
         if below >= 300:
             return (
@@ -779,7 +831,7 @@ class App(customtkinter.CTk):
 
         # Last resort: right half of the work area.
         half = max(400, work_w // 2)
-        return (work_x + work_w - half, work_y, half, max(400, work_h))
+        return (work_x + work_w - half, work_y, half, shared_h)
 
     def _sync_window_layout_to_browser(self) -> None:
         """Fullscreen when no Playwright window; otherwise keep split."""
@@ -4848,7 +4900,7 @@ class App(customtkinter.CTk):
         for path in self._doc_rows:
             self._style_doc_row(path, selected=(path == self._selected_path))
 
-    def _select_document(self, path: str):
+    def _select_document(self, path: str, *, sync_preview: bool = True):
         if path not in self._imported_files:
             return
         if self._autofill_busy:
@@ -4868,7 +4920,8 @@ class App(customtkinter.CTk):
             self._update_review_cert_status()
         if self._current_step == "parse_rules":
             self._refresh_parse_rules_panel()
-        self._sync_pdf_preview()
+        if sync_preview:
+            self._sync_pdf_preview()
 
     def _save_extract_fields_to_result(self):
         path = self._selected_path
@@ -6093,14 +6146,11 @@ class App(customtkinter.CTk):
         )
 
     def _restore_layout_after_browser_session(self):
-        """Split if Chromium is still open; otherwise fullscreen."""
+        """Split if Chromium is still open; otherwise fullscreen.
+
+        Do not reopen the PDF tab — leave the EAMS page as the last view.
+        """
         self._sync_window_layout_to_browser()
-        # Re-open PDF tab beside EAMS when a certificate is still selected.
-        if not self._autofill_busy:
-            try:
-                self._sync_pdf_preview()
-            except Exception:  # noqa: BLE001
-                pass
 
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
@@ -6133,12 +6183,11 @@ class App(customtkinter.CTk):
                     if self._selected_path in self._imported_files
                     else self._imported_files[0]
                 )
-                self._select_document(select)
+                self._select_document(select, sync_preview=False)
             else:
                 self._selected_path = None
                 if hasattr(self, "field_entries"):
                     self._clear_approve_fields()
-                self._sync_pdf_preview()
 
         err_n = len(report.errors or [])
         cancelled = bool(getattr(report, "cancelled", False))
