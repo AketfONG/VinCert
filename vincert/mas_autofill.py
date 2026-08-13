@@ -1060,13 +1060,18 @@ def login_eams(
     )
 
 
-def next_export_path(prefix: str = "vincert_batch") -> Path:
-    """Timestamped Excel path under the project ``exports/`` folder."""
+def next_export_path(
+    prefix: str = "vincert_batch",
+    *,
+    directory: Path | str | None = None,
+) -> Path:
+    """Timestamped Excel path under ``directory``, or project ``exports/`` if omitted."""
     from datetime import datetime
 
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(directory) if directory else EXPORTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return EXPORTS_DIR / f"{prefix}_{stamp}.xlsx"
+    return out_dir / f"{prefix}_{stamp}.xlsx"
 
 
 def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> Path:

@@ -4013,6 +4013,29 @@ class App(customtkinter.CTk):
             return None
         return (root / FAILED_ITEMS_SUBDIR).resolve()
 
+    def _import_folder_root(self) -> Path | None:
+        """Return the selected import folder when it exists."""
+        folder = (self._source_folder or "").strip()
+        if not folder:
+            return None
+        root = Path(folder)
+        return root.resolve() if root.is_dir() else None
+
+    def _next_excel_export_path(self) -> Path:
+        """Save batch Excel in the import folder root (fallback: project exports/)."""
+        root = self._import_folder_root()
+        return next_export_path(directory=root)
+
+    def _excel_export_location_label(self, path: Path) -> str:
+        """Short path label for toasts/status (prefer import-folder relative)."""
+        root = self._import_folder_root()
+        try:
+            if root is not None:
+                return str(path.relative_to(root))
+        except Exception:  # noqa: BLE001
+            pass
+        return path.name
+
     def _failed_items_dir_short(self) -> str:
         out = self._failed_items_dir_for_import()
         if out is None:
@@ -5927,7 +5950,7 @@ class App(customtkinter.CTk):
         self._advance_to_next_document_after_review_action()
 
     def _on_master_autofill(self):
-        """Approve-queue → Excel in exports/ → Playwright MAS batch import + fill."""
+        """Approve-queue → Excel in import folder → Playwright MAS batch import + fill."""
         # Cancel any fail-folder countdown so export doesn't archive leftovers
         # (including review-removed certs that were still in a pending toast).
         self._cancel_pending_quarantine()
@@ -5981,7 +6004,7 @@ class App(customtkinter.CTk):
 
         excel_rows = self._export_rows()
         excel_headers = [label for _key, label in EXPORT_COLUMNS]
-        excel_path = next_export_path()
+        excel_path = self._next_excel_export_path()
 
         try:
             write_batch_excel(excel_rows, excel_headers, excel_path)
@@ -5998,9 +6021,10 @@ class App(customtkinter.CTk):
         self._show_autofill_run_controls()
         browser_bounds = self._prepare_side_browser_layout()
         step_delay = float(self._autofill_step_delay_sec)
-        export_msg = f"已导出 {len(excel_rows)} 份到 exports/{excel_path.name}"
+        where = self._excel_export_location_label(excel_path)
+        export_msg = f"已导出 {len(excel_rows)} 份到导入文件夹 · {where}"
         start_msg = f"开始自动填写 {len(items)} 份…"
-        self.set_status(f"自动填写开始：{len(items)} 份 → {excel_path.name}")
+        self.set_status(f"自动填写开始：{len(items)} 份 → {where}")
         self.show_success_toast(export_msg, title="导出 Excel")
         self.show_success_toast(start_msg, title="自动填写")
         self.open_autofill_log()
@@ -6175,7 +6199,7 @@ class App(customtkinter.CTk):
         return rows
 
     def _on_export_excel(self):
-        """Save approved queue Excel into project exports/ (no autofill)."""
+        """Save approved queue Excel into the import folder root (no autofill)."""
         self._cancel_pending_quarantine()
         self._save_fields_before_navigate()
         if self._autofill_busy:
@@ -6191,7 +6215,7 @@ class App(customtkinter.CTk):
             )
             return
 
-        target = next_export_path()
+        target = self._next_excel_export_path()
         try:
             write_batch_excel(
                 rows,
@@ -6203,7 +6227,8 @@ class App(customtkinter.CTk):
             self.show_toast(f"导出失败：{exc}", title="导出 Excel")
             return
 
-        msg = f"已导出 {len(rows)} 份到 exports/{target.name}"
+        where = self._excel_export_location_label(target)
+        msg = f"已导出 {len(rows)} 份到导入文件夹 · {where}"
         self.set_status(msg)
         self.show_success_toast(msg, title="导出 Excel")
 
