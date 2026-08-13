@@ -22,7 +22,6 @@ from vincert.folder_import import find_pdfs_in_folder
 from vincert.mas_autofill import (
     AutofillControl,
     AutofillItem,
-    FAILED_ITEMS_DIR,
     close_keepalive_browser,
     load_credentials,
     next_export_path,
@@ -45,7 +44,7 @@ DEFAULT_AUTOFILL_STEP_DELAY_SEC = 1.0
 AUTOFILL_EXIT_WARN_MS = 10_000
 
 
-DEFAULT_FAILED_ITEMS_DIR = FAILED_ITEMS_DIR.resolve()
+FAILED_ITEMS_SUBDIR = "failed_items"
 
 # Settings → 解析规则：user can add label aliases for these fields.
 PARSE_RULE_FIELDS = [
@@ -74,7 +73,9 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "content_centering": True,
         "status_dots": True,
         "doc_list_scale_fonts": True,
-        "failed_items_dir": str(DEFAULT_FAILED_ITEMS_DIR),
+        "hide_scrollbars": False,
+        "auto_window_snap": True,
+        "pdf_preview_enabled": True,
         "testing_mode": False,
         "demo_folder": "",
         "autofill_step_delay_sec": DEFAULT_AUTOFILL_STEP_DELAY_SEC,
@@ -101,8 +102,12 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["status_dots"] = bool(data["status_dots"])
     if "doc_list_scale_fonts" in data:
         out["doc_list_scale_fonts"] = bool(data["doc_list_scale_fonts"])
-    if "failed_items_dir" in data and data["failed_items_dir"]:
-        out["failed_items_dir"] = str(data["failed_items_dir"])
+    if "hide_scrollbars" in data:
+        out["hide_scrollbars"] = bool(data["hide_scrollbars"])
+    if "auto_window_snap" in data:
+        out["auto_window_snap"] = bool(data["auto_window_snap"])
+    if "pdf_preview_enabled" in data:
+        out["pdf_preview_enabled"] = bool(data["pdf_preview_enabled"])
     if "testing_mode" in data:
         out["testing_mode"] = bool(data["testing_mode"])
     if "demo_folder" in data and data["demo_folder"]:
@@ -223,19 +228,31 @@ def save_doc_list_scale_fonts(enabled: bool, path: Path | None = None) -> Path:
     return save_ui_settings(doc_list_scale_fonts=bool(enabled))
 
 
-def load_failed_items_dir(path: Path | None = None) -> Path:
-    """Return the configured quarantine folder for failed certificates."""
-    raw = load_ui_settings(path).get("failed_items_dir") or str(DEFAULT_FAILED_ITEMS_DIR)
-    try:
-        return Path(str(raw)).expanduser().resolve()
-    except Exception:  # noqa: BLE001
-        return DEFAULT_FAILED_ITEMS_DIR
+def load_hide_scrollbars(path: Path | None = None) -> bool:
+    """Return True when native CTk scrollbars are hidden (wheel scroll still works)."""
+    return bool(load_ui_settings(path).get("hide_scrollbars", False))
 
 
-def save_failed_items_dir(folder: str | Path, path: Path | None = None) -> Path:
-    resolved = Path(folder).expanduser().resolve()
-    save_ui_settings(failed_items_dir=str(resolved))
-    return resolved
+def save_hide_scrollbars(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(hide_scrollbars=bool(enabled))
+
+
+def load_auto_window_snap(path: Path | None = None) -> bool:
+    """Return True when VinCert auto-snaps beside the browser / PDF preview."""
+    return bool(load_ui_settings(path).get("auto_window_snap", True))
+
+
+def save_auto_window_snap(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(auto_window_snap=bool(enabled))
+
+
+def load_pdf_preview_enabled(path: Path | None = None) -> bool:
+    """Return True when selecting a certificate opens the Chromium PDF preview."""
+    return bool(load_ui_settings(path).get("pdf_preview_enabled", True))
+
+
+def save_pdf_preview_enabled(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(pdf_preview_enabled=bool(enabled))
 
 
 def load_testing_mode(path: Path | None = None) -> bool:
@@ -307,7 +324,7 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.5"
+BUILD_VERSION = "v0.6"
 BUILD_DATE = "13/08/2026"
 RELEASES_URL = "https://github.com/AketfONG/VinCert/releases"
 
@@ -497,7 +514,9 @@ class App(customtkinter.CTk):
         self._content_centering = load_content_centering()
         self._status_dots = load_status_dots()
         self._doc_list_scale_fonts = load_doc_list_scale_fonts()
-        self._failed_items_dir = load_failed_items_dir()
+        self._hide_scrollbars = load_hide_scrollbars()
+        self._auto_window_snap = load_auto_window_snap()
+        self._pdf_preview_enabled = load_pdf_preview_enabled()
         self._testing_mode = load_testing_mode()
         self._demo_folder = load_demo_folder()
         self._autofill_step_delay_sec = load_autofill_step_delay_sec()
@@ -522,6 +541,8 @@ class App(customtkinter.CTk):
         self.show_step("extract")
         self._update_extract_ocr_ui()
         self.after_idle(self._bootstrap_window_layout)
+        if self._hide_scrollbars:
+            self.after_idle(self._refresh_scrollbar_visibility)
 
     def _widget_scaling_factor(self) -> float:
         if hasattr(self, "controls_inner"):
@@ -718,6 +739,9 @@ class App(customtkinter.CTk):
 
     def _apply_window_fullscreen(self):
         """Fill the monitor — native maximize on Windows, work-area geometry elsewhere."""
+        if not getattr(self, "_auto_window_snap", True):
+            self._pdf_preview_layout_active = False
+            return
         self._pdf_preview_layout_active = False
         if sys.platform == "win32":
             hwnd = self._win_toplevel_hwnd()
@@ -763,6 +787,8 @@ class App(customtkinter.CTk):
 
     def _snap_app_left_half(self):
         """Snap VinCert to the left half (native Win+Left on Windows)."""
+        if not getattr(self, "_auto_window_snap", True):
+            return
         self._pdf_preview_layout_active = True
         if sys.platform == "win32":
             hwnd = self._win_toplevel_hwnd()
@@ -785,13 +811,22 @@ class App(customtkinter.CTk):
         """Persistent Chromium profile shared by PDF preview + EAMS tabs."""
         return resolve_eams_environment(testing=bool(self._testing_mode)).user_data_dir
 
+    def _default_browser_bounds(self) -> tuple[int, int, int, int]:
+        """Right half of the work area — used when auto-snap is off."""
+        work_x, work_y, work_w, work_h = self._screen_work_area()
+        half = max(400, work_w // 2)
+        return (work_x + work_w - half, work_y, half, max(400, work_h))
+
     def _prepare_side_browser_layout(self) -> tuple[int, int, int, int]:
-        """Snap VinCert left and return remaining bounds for the shared browser."""
+        """Optionally snap VinCert left and return bounds for the shared browser."""
         # Never close PDF / EAMS tabs here — they share one Chromium window.
-        self._snap_app_left_half()
+        if self._auto_window_snap:
+            self._snap_app_left_half()
+            self.update_idletasks()
+            self.update()
+            return self._pdf_preview_bounds_remaining()
         self.update_idletasks()
-        self.update()
-        return self._pdf_preview_bounds_remaining()
+        return self._default_browser_bounds()
 
     def _pdf_preview_bounds_remaining(self) -> tuple[int, int, int, int]:
         """Size the browser to the unused work-area space beside VinCert.
@@ -841,6 +876,8 @@ class App(customtkinter.CTk):
 
     def _sync_window_layout_to_browser(self) -> None:
         """Fullscreen when no Playwright window; otherwise keep split."""
+        if not self._auto_window_snap:
+            return
         if self._pdf_preview.is_open:
             if not self._pdf_preview_layout_active:
                 self._snap_app_left_half()
@@ -849,19 +886,35 @@ class App(customtkinter.CTk):
 
     def _sync_pdf_preview(self):
         """Open/update PDF tab when a file is selected; close PDF tab otherwise."""
+        if not self._pdf_preview_enabled:
+            if self._pdf_preview.has_pdf:
+                self._pdf_preview.close()
+            elif self._auto_window_snap and not self._pdf_preview.is_open:
+                # No preview and no shared browser — restore fullscreen if we were split.
+                if self._pdf_preview_layout_active:
+                    self._apply_window_fullscreen()
+            return
+
         path = self._selected_path
         profile = self._browser_profile_dir()
         if path and Path(path).is_file():
             if self._autofill_busy:
                 return
-            if not self._pdf_preview_layout_active:
+            if self._auto_window_snap and not self._pdf_preview_layout_active:
                 self._snap_app_left_half()
             self.update_idletasks()
-            bounds = (
-                self._pdf_preview_bounds_remaining()
-                if self._pdf_preview.is_open
-                else self._prepare_side_browser_layout()
-            )
+            if self._auto_window_snap:
+                bounds = (
+                    self._pdf_preview_bounds_remaining()
+                    if self._pdf_preview.is_open
+                    else self._prepare_side_browser_layout()
+                )
+            else:
+                bounds = (
+                    self._pdf_preview_bounds_remaining()
+                    if self._pdf_preview.is_open
+                    else self._default_browser_bounds()
+                )
             self._pdf_preview.show(path, bounds, profile_dir=profile)
             self._pdf_preview.focus()
             return
@@ -883,6 +936,9 @@ class App(customtkinter.CTk):
         if self._autofill_busy:
             return
         if self._pdf_preview.is_open:
+            return
+        if not self._auto_window_snap:
+            self._pdf_preview_layout_active = False
             return
         self._apply_window_fullscreen()
 
@@ -1728,7 +1784,7 @@ class App(customtkinter.CTk):
                 )
                 self._schedule_settings_scroll_repair()
             else:
-                # Overflow: top-align and show scrollbar.
+                # Overflow: top-align; show scrollbar unless user hid bars.
                 if window_id is not None:
                     canvas.coords(window_id, 0, 0)
                 content.update_idletasks()
@@ -1738,7 +1794,10 @@ class App(customtkinter.CTk):
                     canvas.configure(
                         scrollregion=(0, 0, max(0, x2), max(0, y2 - _y1))
                     )
-                content._create_grid()
+                if getattr(self, "_hide_scrollbars", False):
+                    self._hide_scrollable_bar(content)
+                else:
+                    content._create_grid()
                 canvas.yview_moveto(0)
         except Exception:  # noqa: BLE001
             pass
@@ -2100,72 +2159,78 @@ class App(customtkinter.CTk):
             row=2, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
         )
 
+        self.hide_scrollbars_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="隐藏滚动条",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._hide_scrollbars:
+            self.hide_scrollbars_switch.select()
+        else:
+            self.hide_scrollbars_switch.deselect()
+        self.hide_scrollbars_switch.configure(command=self._on_hide_scrollbars_toggle)
+        self.hide_scrollbars_switch.grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
+        )
+
+        self.auto_window_snap_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="自动窗口分屏",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._auto_window_snap:
+            self.auto_window_snap_switch.select()
+        else:
+            self.auto_window_snap_switch.deselect()
+        self.auto_window_snap_switch.configure(command=self._on_auto_window_snap_toggle)
+        self.auto_window_snap_switch.grid(
+            row=3, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+        )
+
+        self.pdf_preview_enabled_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="PDF 预览",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._pdf_preview_enabled:
+            self.pdf_preview_enabled_switch.select()
+        else:
+            self.pdf_preview_enabled_switch.deselect()
+        self.pdf_preview_enabled_switch.configure(
+            command=self._on_pdf_preview_enabled_toggle
+        )
+        self.pdf_preview_enabled_switch.grid(
+            row=4, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
+        )
+
         customtkinter.CTkLabel(
             content,
-            text="失败证书目录",
+            text="失败证书",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
         ).grid(row=10, column=0, sticky="ew", pady=(8, 8))
 
-        # Description + path on separate rows so long paths aren't cropped.
         self._track_content_wrap(
             customtkinter.CTkLabel(
                 content,
-                text="移出未解析/失败证书时，会复制到此文件夹。",
+                text=(
+                    f"移出未解析/失败证书时，会复制到导入文件夹下的 "
+                    f"「{FAILED_ITEMS_SUBDIR}/」子目录（同名文件不重复复制）。"
+                ),
                 anchor="w",
                 font=customtkinter.CTkFont(size=FONT_BODY),
                 text_color="gray60",
                 wraplength=CONTENT_WRAP,
                 justify="left",
             )
-        ).grid(row=11, column=0, sticky="ew", pady=(0, 4))
-        self.failed_items_dir_label = self._track_content_wrap(
-            customtkinter.CTkLabel(
-                content,
-                text=str(self._failed_items_dir),
-                anchor="w",
-                font=customtkinter.CTkFont(size=FONT_META),
-                text_color="gray60",
-                wraplength=CONTENT_WRAP,
-                justify="left",
-            )
-        )
-        self.failed_items_dir_label.grid(row=12, column=0, sticky="ew", pady=(0, 8))
-
-        failed_dir_row = customtkinter.CTkFrame(content, fg_color="transparent")
-        failed_dir_row.grid(row=13, column=0, sticky="ew", pady=(0, 16))
-        failed_dir_row.grid_columnconfigure((0, 1), weight=1)
-
-        customtkinter.CTkButton(
-            failed_dir_row,
-            corner_radius=UI_RADIUS,
-            text="选择文件夹…",
-            height=40,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
-            font=self._button_font(FONT_BUTTON),
-            command=self._pick_failed_items_dir,
-        ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
-
-        customtkinter.CTkButton(
-            failed_dir_row,
-            corner_radius=UI_RADIUS,
-            text="恢复默认",
-            height=40,
-            fg_color=SECONDARY_BTN_FG,
-            hover_color=SECONDARY_BTN_HOVER,
-            text_color=SECONDARY_BTN_TEXT,
-            font=self._button_font(FONT_BUTTON),
-            command=self._reset_failed_items_dir,
-        ).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+        ).grid(row=11, column=0, sticky="ew", pady=(0, 16))
 
         customtkinter.CTkLabel(
             content,
             text="测试模式",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-        ).grid(row=14, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=12, column=0, sticky="ew", pady=(8, 8))
 
         self._track_content_wrap(
             customtkinter.CTkLabel(
@@ -2180,7 +2245,7 @@ class App(customtkinter.CTk):
                 wraplength=CONTENT_WRAP,
                 justify="left",
             )
-        ).grid(row=15, column=0, sticky="ew", pady=(0, 6))
+        ).grid(row=13, column=0, sticky="ew", pady=(0, 6))
         self.testing_mode_switch = customtkinter.CTkSwitch(
             content,
             text="启用测试模式（EAMS UAT）",
@@ -2191,14 +2256,14 @@ class App(customtkinter.CTk):
         else:
             self.testing_mode_switch.deselect()
         self.testing_mode_switch.configure(command=self._on_testing_mode_toggle)
-        self.testing_mode_switch.grid(row=16, column=0, sticky="w", pady=(0, 12))
+        self.testing_mode_switch.grid(row=14, column=0, sticky="w", pady=(0, 12))
 
         customtkinter.CTkLabel(
             content,
             text="演示证书文件夹",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-        ).grid(row=17, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=15, column=0, sticky="ew", pady=(8, 8))
 
         self._track_content_wrap(
             customtkinter.CTkLabel(
@@ -2210,7 +2275,7 @@ class App(customtkinter.CTk):
                 wraplength=CONTENT_WRAP,
                 justify="left",
             )
-        ).grid(row=18, column=0, sticky="ew", pady=(0, 4))
+        ).grid(row=16, column=0, sticky="ew", pady=(0, 4))
         self.demo_folder_label = self._track_content_wrap(
             customtkinter.CTkLabel(
                 content,
@@ -2222,10 +2287,10 @@ class App(customtkinter.CTk):
                 justify="left",
             )
         )
-        self.demo_folder_label.grid(row=19, column=0, sticky="ew", pady=(0, 8))
+        self.demo_folder_label.grid(row=17, column=0, sticky="ew", pady=(0, 8))
 
         demo_dir_row = customtkinter.CTkFrame(content, fg_color="transparent")
-        demo_dir_row.grid(row=20, column=0, sticky="ew", pady=(0, 16))
+        demo_dir_row.grid(row=18, column=0, sticky="ew", pady=(0, 16))
         demo_dir_row.grid_columnconfigure((0, 1), weight=1)
 
         customtkinter.CTkButton(
@@ -2257,7 +2322,7 @@ class App(customtkinter.CTk):
             text="解析规则",
             anchor="w",
             font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-        ).grid(row=21, column=0, sticky="ew", pady=(8, 8))
+        ).grid(row=19, column=0, sticky="ew", pady=(8, 8))
 
         self._track_content_wrap(
             customtkinter.CTkLabel(
@@ -2272,7 +2337,7 @@ class App(customtkinter.CTk):
                 wraplength=CONTENT_WRAP,
                 justify="left",
             )
-        ).grid(row=22, column=0, sticky="ew", pady=(0, 12))
+        ).grid(row=20, column=0, sticky="ew", pady=(0, 12))
 
         customtkinter.CTkButton(
             content,
@@ -2284,7 +2349,7 @@ class App(customtkinter.CTk):
             text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._open_parse_rules_config,
-        ).grid(row=23, column=0, sticky="ew", pady=(0, 16))
+        ).grid(row=21, column=0, sticky="ew", pady=(0, 16))
 
         self._bind_scrollable_mousewheel(self.settings_scroll, self.settings_scroll)
         self._schedule_active_page_vcenter(force=True)
@@ -2733,51 +2798,6 @@ class App(customtkinter.CTk):
         self.set_status(f"测试模式：正在加载演示文件夹…")
         self._load_folder(str(path))
 
-    def _failed_items_dir_display(self) -> str:
-        return str(self._failed_items_dir)
-
-    def _failed_items_dir_short(self) -> str:
-        return self._failed_items_dir.name or str(self._failed_items_dir)
-
-    def _update_failed_items_dir_label(self):
-        if hasattr(self, "failed_items_dir_label"):
-            self.failed_items_dir_label.configure(text=self._failed_items_dir_display())
-
-    def _set_failed_items_dir(self, folder: Path):
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:  # noqa: BLE001
-            self.set_status(f"无法使用失败证书目录：{exc}")
-            self.show_toast(
-                f"无法使用该文件夹：{exc}",
-                title="失败证书目录",
-            )
-            return False
-        self._failed_items_dir = folder.resolve()
-        save_failed_items_dir(self._failed_items_dir)
-        self._update_failed_items_dir_label()
-        return True
-
-    def _pick_failed_items_dir(self):
-        path = filedialog.askdirectory(
-            parent=self,
-            title="选择失败证书目录",
-            initialdir=str(self._failed_items_dir),
-        )
-        if not path:
-            self.set_status("未更改失败证书目录")
-            return
-        if self._set_failed_items_dir(Path(path)):
-            msg = f"失败证书目录已更新：{self._failed_items_dir}"
-            self.set_status(msg)
-            self.show_success_toast(msg, title="失败证书目录")
-
-    def _reset_failed_items_dir(self):
-        if self._set_failed_items_dir(DEFAULT_FAILED_ITEMS_DIR):
-            msg = f"已恢复默认目录：{self._failed_items_dir}"
-            self.set_status(msg)
-            self.show_success_toast(msg, title="失败证书目录")
-
     def _on_ui_zoom_toggle(self):
         self._apply_ui_zoom(bool(self.ui_zoom_switch.get()))
 
@@ -2792,6 +2812,15 @@ class App(customtkinter.CTk):
 
     def _on_doc_list_scale_fonts_toggle(self):
         self._apply_doc_list_scale_fonts(bool(self.doc_list_scale_fonts_switch.get()))
+
+    def _on_hide_scrollbars_toggle(self):
+        self._apply_hide_scrollbars(bool(self.hide_scrollbars_switch.get()))
+
+    def _on_auto_window_snap_toggle(self):
+        self._apply_auto_window_snap(bool(self.auto_window_snap_switch.get()))
+
+    def _on_pdf_preview_enabled_toggle(self):
+        self._apply_pdf_preview_enabled(bool(self.pdf_preview_enabled_switch.get()))
 
     def _apply_content_centering(self, enabled: bool):
         self._content_centering = enabled
@@ -2812,6 +2841,59 @@ class App(customtkinter.CTk):
         self.set_status(
             "已开启列表文字缩放" if enabled else "已关闭列表文字缩放（固定字号）"
         )
+
+    def _apply_hide_scrollbars(self, enabled: bool):
+        self._hide_scrollbars = enabled
+        save_hide_scrollbars(enabled)
+        self._refresh_scrollbar_visibility()
+        self.set_status(
+            "已隐藏滚动条（仍可用滚轮滑动）"
+            if enabled
+            else "已显示滚动条"
+        )
+
+    def _apply_auto_window_snap(self, enabled: bool):
+        self._auto_window_snap = enabled
+        save_auto_window_snap(enabled)
+        if enabled:
+            self._sync_window_layout_to_browser()
+            if self._pdf_preview_enabled:
+                self._sync_pdf_preview()
+            self.set_status("已开启自动窗口分屏")
+        else:
+            self._pdf_preview_layout_active = False
+            self.set_status("已关闭自动窗口分屏")
+
+    def _apply_pdf_preview_enabled(self, enabled: bool):
+        self._pdf_preview_enabled = enabled
+        save_pdf_preview_enabled(enabled)
+        if enabled:
+            self._sync_pdf_preview()
+            self.set_status("已开启 PDF 预览")
+        else:
+            if self._pdf_preview.has_pdf:
+                self._pdf_preview.close()
+            self.set_status("已关闭 PDF 预览")
+
+    def _iter_app_scrollables(self):
+        for name in ("doc_list_frame", "settings_scroll", "parse_rules_scroll"):
+            frame = getattr(self, name, None)
+            if frame is not None:
+                yield frame
+
+    def _hide_scrollable_bar(self, scrollable) -> None:
+        try:
+            scrollable._scrollbar.grid_remove()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_scrollbar_visibility(self) -> None:
+        """Re-apply show/hide for all known scrollable frames."""
+        if self._hide_scrollbars:
+            for frame in self._iter_app_scrollables():
+                self._hide_scrollable_bar(frame)
+        self._schedule_doc_list_scrollbar_sync()
+        self._schedule_active_page_vcenter(force=True)
 
     def _apply_buttons_bold(self, bold: bool):
         self._buttons_bold = bold
@@ -2931,10 +3013,10 @@ class App(customtkinter.CTk):
         """Force Tk/CTk to refill the window after scale-down (clears black bars)."""
         try:
             # Prefer re-applying work-area snap (never state('zoomed') — taskbar).
-            if self._pdf_preview_layout_active:
+            if self._auto_window_snap and self._pdf_preview_layout_active:
                 self._snap_app_left_half()
                 return
-            if sys.platform == "win32":
+            if self._auto_window_snap and sys.platform == "win32":
                 self._apply_window_fullscreen()
                 return
             width = int(self.winfo_width())
@@ -3690,6 +3772,25 @@ class App(customtkinter.CTk):
             return -notches
         return (-speed) if getattr(event, "num", 0) == 4 else speed
 
+    def _scrollable_yview_fractions(self, canvas) -> tuple[float, float]:
+        try:
+            first, last = canvas.yview()
+            return float(first), float(last)
+        except Exception:  # noqa: BLE001
+            return 0.0, 1.0
+
+    def _clamp_scrollable_yview(self, canvas, first: float) -> None:
+        """Move canvas to ``first`` without allowing overscroll past ends."""
+        cur_first, cur_last = self._scrollable_yview_fractions(canvas)
+        view = max(0.0, min(1.0, cur_last - cur_first))
+        # When content fits, stay locked at top.
+        if view >= 1.0 - 1e-6:
+            canvas.yview_moveto(0.0)
+            return
+        max_first = max(0.0, 1.0 - view)
+        target = max(0.0, min(max_first, float(first)))
+        canvas.yview_moveto(target)
+
     def _on_scrollable_mousewheel(self, scrollable, event):
         if (
             self._autofill_busy
@@ -3707,25 +3808,57 @@ class App(customtkinter.CTk):
         try:
             canvas = scrollable._parent_canvas
         except Exception:  # noqa: BLE001
-            return
-        if canvas.yview() == (0.0, 1.0):
-            return
+            return "break"
+
+        first, last = self._scrollable_yview_fractions(canvas)
+        view = max(0.0, last - first)
+        # Content fits — no scroll, and kill bounce/flicker at the edges.
+        if view >= 1.0 - 1e-6:
+            self._clamp_scrollable_yview(canvas, 0.0)
+            return "break"
+
+        # Positive ``toward_top`` moves the viewport toward the start of content.
+        toward_top = 0.0
         if sys.platform.startswith("win"):
-            # Unit scrolling is tiny on Win32/CTk; move ~half the visible page per notch.
             delta = int(getattr(event, "delta", 0) or 0)
             notches = int(delta / 120) if delta else 0
             if notches == 0 and delta:
                 notches = 1 if delta > 0 else -1
-            if notches:
-                first, last = canvas.yview()
-                view = max(float(last) - float(first), 0.08)
-                canvas.yview_moveto(
-                    max(0.0, min(1.0, float(first) - notches * view * 0.55))
-                )
+            # Win: positive delta → scroll up (toward top).
+            toward_top = float(notches) * max(view, 0.08) * 0.55
+        elif sys.platform == "darwin":
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta == 0:
+                return "break"
+            # Darwin: positive delta → toward top. Keep speed similar to before.
+            if abs(delta) <= 1:
+                toward_top = float(delta) * 0.045
+            else:
+                toward_top = float(delta) * 0.02
+        else:
+            # X11 Button-4 = up, Button-5 = down.
+            num = int(getattr(event, "num", 0) or 0)
+            if num == 4:
+                toward_top = max(view, 0.08) * 0.45
+            elif num == 5:
+                toward_top = -max(view, 0.08) * 0.45
+            else:
+                return "break"
+
+        if toward_top == 0.0:
             return "break"
-        steps = self._mousewheel_scroll_steps(event)
-        if steps:
-            canvas.yview_scroll(steps, "units")
+
+        eps = 1e-4
+        at_top = first <= eps
+        at_bottom = last >= 1.0 - eps
+        if toward_top > 0 and at_top:
+            self._clamp_scrollable_yview(canvas, 0.0)
+            return "break"
+        if toward_top < 0 and at_bottom:
+            self._clamp_scrollable_yview(canvas, 1.0)
+            return "break"
+
+        self._clamp_scrollable_yview(canvas, first - toward_top)
         return "break"
 
     def _on_doc_list_mousewheel(self, event):
@@ -3763,7 +3896,10 @@ class App(customtkinter.CTk):
             if window_id is not None:
                 canvas.coords(window_id, 0, 0)
             canvas.configure(scrollregion=(0, 0, max(0, x2), max(y2, content_height)))
-            scrollable._create_grid()
+            if getattr(self, "_hide_scrollbars", False):
+                scrollbar.grid_remove()
+            else:
+                scrollable._create_grid()
             top, _bottom = canvas.yview()
             if top < 0 or top > 1:
                 canvas.yview_moveto(0)
@@ -3967,29 +4103,77 @@ class App(customtkinter.CTk):
         if hasattr(self, "ocr_progress_label"):
             self.ocr_progress_label.configure(text=label)
 
-    def _unique_failed_path(self, src: Path) -> Path:
-        out_dir = self._failed_items_dir
+    def _failed_items_dir_for_import(self) -> Path | None:
+        """Return ``{import_folder}/failed_items`` when an import folder is set."""
+        folder = (self._source_folder or "").strip()
+        if not folder:
+            return None
+        root = Path(folder)
+        if not root.is_dir():
+            return None
+        return (root / FAILED_ITEMS_SUBDIR).resolve()
+
+    def _failed_items_dir_short(self) -> str:
+        out = self._failed_items_dir_for_import()
+        if out is None:
+            return f"…/{FAILED_ITEMS_SUBDIR}"
+        try:
+            parent = out.parent.name
+            return f"{parent}/{FAILED_ITEMS_SUBDIR}"
+        except Exception:  # noqa: BLE001
+            return FAILED_ITEMS_SUBDIR
+
+    def _unique_failed_path(self, src: Path, out_dir: Path) -> Path | None:
+        """Destination path under ``out_dir``, or None if the same name already exists.
+
+        Same filename in the failed folder counts as a duplicate — skip re-copy.
+        """
         out_dir.mkdir(parents=True, exist_ok=True)
         dest = out_dir / src.name
-        if not dest.exists():
-            return dest
-        stem, suffix = src.stem, src.suffix
-        n = 1
-        while True:
-            candidate = out_dir / f"{stem}_{n}{suffix}"
-            if not candidate.exists():
-                return candidate
-            n += 1
+        if dest.exists():
+            return None
+        return dest
 
-    def _quarantine_failed_paths(self, paths: list[str]) -> int:
-        """Copy failed PDFs to the configured failed-items folder and remove them from the queue."""
-        moved = 0
-        for path in list(paths):
+    def _quarantine_failed_paths(self, paths: list[str]) -> tuple[int, int]:
+        """Copy failed PDFs into the import folder's failed_items subdir and drop them.
+
+        Returns ``(removed_from_queue, newly_copied)``. Same-name files already in
+        the failed folder are not copied again, but are still removed from the queue.
+        """
+        out_dir = self._failed_items_dir_for_import()
+        if out_dir is None:
+            self.set_status("无法移出失败证书：未选择导入文件夹")
+            self.show_toast(
+                "请先选择导入文件夹，失败证书将保存到其中的 "
+                f"「{FAILED_ITEMS_SUBDIR}/」子目录。",
+                title="移出失败证书",
+            )
+            return 0, 0
+
+        removed = 0
+        copied = 0
+        seen_names: set[str] = set()
+        # Preserve order while dropping duplicate source paths in this batch.
+        unique_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for path in paths:
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            unique_paths.append(path)
+
+        for path in unique_paths:
             src = Path(path)
+            name_key = src.name.casefold()
             try:
-                dest = self._unique_failed_path(src)
-                shutil.copy2(src, dest)
-                moved += 1
+                if name_key not in seen_names:
+                    seen_names.add(name_key)
+                    dest = self._unique_failed_path(src, out_dir)
+                    if dest is None:
+                        self.set_status(f"失败文件夹已有同名文件，跳过复制：{src.name}")
+                    else:
+                        shutil.copy2(src, dest)
+                        copied += 1
             except Exception as exc:  # noqa: BLE001
                 self.set_status(f"无法保存失败项 {src.name}：{exc}")
                 continue
@@ -4002,9 +4186,10 @@ class App(customtkinter.CTk):
             self._removed_paths.discard(path)
             if self._selected_path == path:
                 self._selected_path = None
+            removed += 1
 
         self._sort_imported_files()
-        return moved
+        return removed, copied
 
     def _on_ocr_extract(self):
         """Manually run PaddleOCR on certificates that still need it."""
@@ -4168,7 +4353,11 @@ class App(customtkinter.CTk):
             self._selected_path = None
             self._clear_extract_fields_display()
             self._sync_pdf_preview()
-        msg = f"失败 {moved} 份已移出队列 · 已复制到 {self._failed_items_dir_short()}/"
+        removed, copied = moved
+        msg = (
+            f"失败 {removed} 份已移出队列 · 新复制 {copied} 份到 "
+            f"{self._failed_items_dir_short()}/"
+        )
         self.set_status(msg)
         self.show_success_toast(msg)
         self._advance_to_review()
@@ -5989,8 +6178,9 @@ class App(customtkinter.CTk):
             seen.add(path)
             quarantine_unique.append(path)
         moved = 0
+        copied = 0
         if quarantine_unique:
-            moved = self._quarantine_failed_paths(quarantine_unique)
+            moved, copied = self._quarantine_failed_paths(quarantine_unique)
             self._rebuild_doc_list()
             self._update_cert_nav_labels()
             self._update_autofill_button()
@@ -6021,7 +6211,10 @@ class App(customtkinter.CTk):
                 f" · 填写 {report.filled} · 附件 {report.uploaded}"
             )
         if moved:
-            summary += f" · 移出失败 {moved} → {self._failed_items_dir_short()}/"
+            summary += (
+                f" · 移出失败 {moved}（新复制 {copied}）→ "
+                f"{self._failed_items_dir_short()}/"
+            )
         if err_n:
             summary += f" · 失败 {err_n}"
             if report.errors:
