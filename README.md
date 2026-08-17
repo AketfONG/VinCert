@@ -10,9 +10,8 @@ VinCert is a desktop tool for batch-importing certificates, reviewing OCR result
 [![Target](https://img.shields.io/badge/target-Windows-0078D4)](.)
 
 ---
-# v0.5 (13/08/2026) Release Notes
+# v0.6 (17/08/2026) Release Notes
 
-- **Automation Updates** - Extending Flow for UAT Environment
-- **UI/ UX Polish** — Optimized Alert Logics, Flow of Use, Boundary Checking
-- **Custom Rule Config** — Add new Keywords for more complete Parsing Logics
-- **Bug Fixes & Improvements** — Added Link to Github
+- **Automation Done** - Robust Logic Ready for Beta Testing
+- **Updated Flow** — 提取核对 & 自动化
+- **Bug Fixes & Improvements** — UI Polish, More Customization

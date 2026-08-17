@@ -126,6 +126,63 @@ def bring_hwnd_to_front(hwnd: int) -> bool:
         return False
 
 
+def raise_hwnds_above_others(*hwnds: int | None) -> bool:
+    """Raise several windows above normal apps without leaving them always-on-top.
+
+    Used while VinCert + Chromium resize/split so other windows do not cover them.
+    Does not keep permanent topmost — user can still Alt+Tab elsewhere afterward.
+    """
+    if not is_windows():
+        return False
+    ordered = [int(h) for h in hwnds if h]
+    if not ordered:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+        SWP_SHOWWINDOW = 0x0040
+        SW_RESTORE = 9
+        SW_SHOW = 5
+
+        for hwnd in ordered:
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOW)
+            user32.SetWindowPos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+
+        # Clear topmost in reverse so the first window ends highest among the pair.
+        for hwnd in reversed(ordered):
+            user32.SetWindowPos(
+                wintypes.HWND(hwnd),
+                wintypes.HWND(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+            user32.BringWindowToTop(wintypes.HWND(hwnd))
+
+        # Focus the primary (first) window without burying the rest.
+        bring_hwnd_to_front(ordered[0])
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def find_hwnds_for_pid(pid: int) -> list[int]:
     """Return visible top-level HWNDs owned by ``pid`` (largest first)."""
     if not is_windows() or not pid:

@@ -418,10 +418,50 @@ def _status(cb: StatusFn | None, message: str) -> None:
         cb(message)
 
 
-def _click(status: StatusFn | None, locator, label: str, *, timeout: float = 8000):
-    """Click a Playwright locator and report the UI action."""
-    _status(status, f"点击「{label}」")
+_action_timing = threading.local()
+
+
+def _bind_action_timing(
+    gate: AutofillControl | None,
+    seconds: float,
+    status: StatusFn | None = None,
+) -> None:
+    _action_timing.gate = gate
+    _action_timing.seconds = max(0.0, float(seconds or 0.0))
+    _action_timing.status = status
+
+
+def _unbind_action_timing() -> None:
+    _action_timing.gate = None
+    _action_timing.seconds = 0.0
+    _action_timing.status = None
+
+
+def _action_pause() -> None:
+    """Wait the configured control interval (honors pause/exit)."""
+    seconds = float(getattr(_action_timing, "seconds", 0.0) or 0.0)
+    gate = getattr(_action_timing, "gate", None)
+    status = getattr(_action_timing, "status", None)
+    if gate is not None:
+        _step_pause(gate, seconds, status=status)
+        return
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def _click(
+    status: StatusFn | None,
+    locator,
+    label: str,
+    *,
+    timeout: float = 8000,
+    pause: bool = True,
+):
+    """Click a Playwright locator, then wait the configured control interval."""
     locator.click(timeout=timeout)
+    _status(status, f"点击「{label}」")
+    if pause:
+        _action_pause()
 
 
 def _shell(page):
@@ -443,9 +483,10 @@ def _fill_textbox(
     if not value:
         return
     box = frame.get_by_role("textbox", name=name)
-    _click(status, box, name, timeout=timeout)
+    _click(status, box, name, timeout=timeout, pause=False)
     box.fill(value, timeout=timeout)
     box.press("Tab")
+    _action_pause()
 
 
 def _open_maximo_dropdown(
@@ -538,6 +579,15 @@ def _click_dropdown_option(
     return False
 
 
+def _combobox_has_value(frame, name: str, value: str) -> bool:
+    """True when the combobox already shows ``value`` (normalized)."""
+    want = _norm_compare(value)
+    if not want:
+        return False
+    got = _norm_compare(_read_labeled_value(frame, name))
+    return bool(got) and (got == want or want in got or got in want)
+
+
 def _select_combobox(
     frame,
     name: str,
@@ -550,35 +600,37 @@ def _select_combobox(
     if not value:
         return
     target = (value or "").strip()
+    if _combobox_has_value(frame, name, target):
+        return
     _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
     if _click_dropdown_option(
         frame, target, timeout=timeout, status=status, page=page
     ):
         return
+    if _combobox_has_value(frame, name, target):
+        return
 
     # Type-to-filter fallback (editable Maximo comboboxes).
     try:
         box = frame.get_by_role("combobox", name=name)
-        _click(status, box, name, timeout=timeout)
+        _click(status, box, name, timeout=timeout, pause=False)
         box.fill(target, timeout=timeout)
+        _action_pause()
         if _click_dropdown_option(
             frame, target, timeout=timeout, status=status, page=page
         ):
             return
         box.press("Enter")
         time.sleep(0.2)
-        # If the combobox retained our value, treat as success.
-        try:
-            current = (box.input_value(timeout=1500) or "").strip()
-            if target in current or current in target:
-                return
-        except Exception:  # noqa: BLE001
-            pass
+        if _combobox_has_value(frame, name, target):
+            return
     except Exception:  # noqa: BLE001
         pass
 
     # One more open+click attempt after typing.
     try:
+        if _combobox_has_value(frame, name, target):
+            return
         _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
         if _click_dropdown_option(
             frame, target, timeout=timeout, status=status, page=page
@@ -587,6 +639,8 @@ def _select_combobox(
     except Exception:  # noqa: BLE001
         pass
 
+    if _combobox_has_value(frame, name, target):
+        return
     raise RuntimeError(f"无法选择下拉项：{name} = {value}")
 
 
@@ -636,6 +690,32 @@ def _already_logged_in(page, *, timeout_ms: int = 3000) -> bool:
         return False
 
 
+def _manage_chooser_visible(page) -> bool:
+    """True when the post-auth app chooser (Available Manage / 启动) is showing."""
+    checks = (
+        ("link", "Available Manage", False),
+        ("link", "启动", True),
+        ("button", "close", True),
+    )
+    for role, name, exact in checks:
+        try:
+            loc = page.get_by_role(role, name=name, exact=exact)
+            if loc.count() > 0 and bool(loc.first.is_visible()):
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _login_form_visible(page) -> bool:
+    """True when the MAS username field is ready for autofill."""
+    try:
+        box = page.get_by_role("textbox", name="输入用户名")
+        return box.count() > 0 and bool(box.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _fill_username_field(page, username: str) -> None:
     # UAT/prod MAS auth portal uses accessible name「输入用户名」(codegen).
     for name in ("输入用户名", "用户名", "账号", "Username", "User name", "user"):
@@ -643,6 +723,7 @@ def _fill_username_field(page, username: str) -> None:
             box = page.get_by_role("textbox", name=name)
             box.click(timeout=2500)
             box.fill(username, timeout=2500)
+            _action_pause()
             return
         except Exception:  # noqa: BLE001
             continue
@@ -658,6 +739,7 @@ def _fill_username_field(page, username: str) -> None:
             if loc.count() > 0:
                 loc.first.click(timeout=2500)
                 loc.first.fill(username, timeout=2500)
+                _action_pause()
                 return
         except Exception:  # noqa: BLE001
             continue
@@ -670,12 +752,14 @@ def _fill_password_field(page, password: str) -> None:
         try:
             box = page.get_by_role("textbox", name=name)
             box.fill(password, timeout=4000)
+            _action_pause()
             return
         except Exception:  # noqa: BLE001
             continue
     for name in ("输入密码", "密码", "Password"):
         try:
             page.get_by_label(name).fill(password, timeout=4000)
+            _action_pause()
             return
         except Exception:  # noqa: BLE001
             continue
@@ -683,6 +767,7 @@ def _fill_password_field(page, password: str) -> None:
     if loc.count() == 0:
         raise RuntimeError("未找到密码输入框")
     loc.first.fill(password, timeout=4000)
+    _action_pause()
 
 
 def _click_auth_primary_button(
@@ -696,8 +781,7 @@ def _click_auth_primary_button(
     # Recorded UAT flow uses data-testid="Button" for both 继续 and 登录.
     try:
         btn = page.get_by_test_id("Button")
-        _status(status, f"点击「{label}」")
-        btn.click(timeout=timeout)
+        _click(status, btn, label, timeout=timeout)
         return
     except Exception:  # noqa: BLE001
         pass
@@ -755,144 +839,101 @@ def _fill_eams_login_form(
     _click_auth_primary_button(page, label="登录", status=status)
 
 
-def _maybe_open_available_manage(
-    page,
-    env: EamsEnvironment,
-    *,
-    status: StatusFn | None = None,
-    control: AutofillControl | None = None,
-) -> bool:
-    """Open Manage via the portal「Available Manage」link when that chooser appears.
-
-    Matches recorded flow:
-      page.goto(env.portal)
-      page.get_by_role("link", name="Available Manage").click()
-    Returns True if the link was clicked.
-    """
-
-    def check():
-        if control is not None:
-            control.checkpoint(status)
-
-    check()
-    # Prefer clicking if the link is already on the current page (auth redirect).
-    link = page.get_by_role("link", name="Available Manage")
-    visible = False
+def _locator_if_visible(page, role: str, name: str, *, exact: bool = False, timeout_ms: int = 1500):
+    """Return the first matching locator if it becomes visible quickly, else None."""
+    loc = page.get_by_role(role, name=name, exact=exact)
     try:
-        visible = link.count() > 0 and bool(link.first.is_visible())
+        loc.first.wait_for(state="visible", timeout=max(200, int(timeout_ms)))
+        if loc.first.is_visible():
+            return loc.first
     except Exception:  # noqa: BLE001
-        visible = False
-
-    if not visible:
-        try:
-            _status(status, f"打开 EAMS 门户（{env.label}）…")
-            page.goto(env.portal, wait_until="domcontentloaded")
-        except Exception:  # noqa: BLE001
-            return False
-        check()
-        link = page.get_by_role("link", name="Available Manage")
-        try:
-            link.first.wait_for(state="visible", timeout=5_000)
-            visible = True
-        except Exception:  # noqa: BLE001
-            return False
-
-    if not visible:
-        return False
-
-    check()
-    _click(status, link.first, "Available Manage", timeout=8_000)
-    return True
+        return None
+    return None
 
 
-def login_eams(
+def _post_login_enter_manage(
     page,
-    username: str,
-    password: str,
     *,
-    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
     status: StatusFn | None = None,
-    env: EamsEnvironment | None = None,
     control: AutofillControl | None = None,
 ) -> None:
-    """Open EAMS auth portal and autofill credentials.
+    """App chooser: close (optional) → Available Manage → dismiss dialog → 启动.
 
-    Waits are sliced so pause/exit can interrupt (avoids multi-minute hangs on UAT).
+    When the Manage chooser is already showing (consecutive runs / no password),
+    skip long waits for controls that are absent.
     """
-    username = (username or "").strip()
-    password = password or ""
-    if not username or not password:
-        raise ValueError("请先在设置中填写 EAMS 用户名和密码")
 
     def check():
         if control is not None:
             control.checkpoint(status)
 
-    target = env or resolve_eams_environment(testing=False)
-
-    # Auth portal first (matches recorded UAT codegen). If already logged in,
-    # home will show the shell without needing the form.
     check()
-    _status(status, f"打开 EAMS 登录页（{target.label}）…")
     try:
-        page.goto(target.login, wait_until="domcontentloaded")
-    except Exception:  # noqa: BLE001
-        page.goto(target.home, wait_until="domcontentloaded")
-
-    check()
-    if _already_logged_in(page, timeout_ms=2500):
-        _status(status, "已检测到登录会话")
-        return
-
-    # Wait for the username field used by MAS UAT/prod auth UI.
-    try:
-        page.get_by_role("textbox", name="输入用户名").wait_for(
-            state="visible", timeout=10_000
-        )
-    except Exception:  # noqa: BLE001
-        # Fall back to home → login redirect if the portal didn't render.
-        try:
-            check()
-            page.goto(target.home, wait_until="domcontentloaded")
-            check()
-            if _already_logged_in(page, timeout_ms=2000):
-                _status(status, "已检测到登录会话")
-                return
-            page.goto(target.login, wait_until="domcontentloaded")
-            page.get_by_role("textbox", name="输入用户名").wait_for(
-                state="visible", timeout=8000
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-    check()
-    if _already_logged_in(page, timeout_ms=1000):
-        _status(status, "已检测到登录会话")
-        return
-
-    _status(status, "正在自动填写登录信息…")
-    check()
-    _fill_eams_login_form(page, username, password, status=status)
-    check()
-
-    # Post-password app chooser (UAT/prod): portal → Available Manage, if shown.
-    try:
-        _maybe_open_available_manage(
-            page, target, status=status, control=control
-        )
-    except AutofillCancelled:
-        raise
+        page.wait_for_load_state("domcontentloaded", timeout=8_000)
     except Exception:  # noqa: BLE001
         pass
 
-    deadline = time.time() + max(login_wait_seconds, 30)
-    _status(status, "等待登录完成…")
+    # close is often missing on direct Manage-chooser landings — keep this short.
+    check()
+    close_btn = _locator_if_visible(
+        page, "button", "close", exact=True, timeout_ms=1_200
+    )
+    if close_btn is not None:
+        _status(status, "关闭提示…")
+        _click(status, close_btn, "close", timeout=5_000)
+    else:
+        _status(status, "无 close 提示，继续…")
+
+    check()
+    manage = _locator_if_visible(
+        page, "link", "Available Manage", exact=False, timeout_ms=8_000
+    )
+    if manage is None:
+        raise RuntimeError("未找到 Available Manage")
+    _status(status, "打开 Available Manage…")
+    _click(status, manage, "Available Manage", timeout=10_000)
+
+    check()
+    # Dialog is raised by the following 启动 click (codegen order).
+    page.once("dialog", lambda dialog: dialog.dismiss())
+    launch = _locator_if_visible(
+        page, "link", "启动", exact=True, timeout_ms=12_000
+    )
+    if launch is None:
+        raise RuntimeError("未找到「启动」")
+    _status(status, "点击启动…")
+    _click(status, launch, "启动", timeout=10_000)
+    page.wait_for_timeout(400)
+
+
+def _wait_for_manage_shell(
+    page,
+    target: EamsEnvironment,
+    *,
+    login_wait_seconds: int,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+) -> None:
+    """Poll until Maximo shell is up after Manage entry (or existing session).
+
+    Navigates to home early if the shell does not appear — avoids burning the
+    full login timeout while stuck on the Available Manage chooser.
+    """
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
+    # Post-启动 should load quickly; do not inherit the full manual-login timeout.
+    deadline = time.time() + min(max(20, int(login_wait_seconds)), 45)
+    _status(status, "等待进入 EAMS…")
     navigated_home = False
+    started = time.time()
+    retried_manage = False
     while True:
         check()
-        # Shell iframe means login already landed in Maximo.
         try:
-            page.wait_for_selector(SHELL_IFRAME, timeout=2000)
+            page.wait_for_selector(SHELL_IFRAME, timeout=1500)
             _status(status, f"EAMS 登录成功（{target.label}）")
             return
         except AutofillCancelled:
@@ -901,10 +942,26 @@ def login_eams(
             if control is not None and control.cancelled():
                 raise AutofillCancelled("用户退出自动填写") from exc
 
+        # Still on the app chooser — retry Manage once, then go home.
+        if (
+            not retried_manage
+            and _manage_chooser_visible(page)
+            and (time.time() - started) >= 3
+        ):
+            retried_manage = True
+            try:
+                _status(status, "仍在 Available Manage，重试进入…")
+                _post_login_enter_manage(page, status=status, control=control)
+                started = time.time()
+                continue
+            except AutofillCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _status(status, f"重试进入 Manage 未完成：{exc}")
+
         check()
-        # Brief URL wait — never block the full login timeout in one call.
         try:
-            page.wait_for_url(target.post_login_url_glob, timeout=1500)
+            page.wait_for_url(target.post_login_url_glob, timeout=1200)
             if not navigated_home:
                 check()
                 page.goto(target.home, wait_until="domcontentloaded")
@@ -916,14 +973,26 @@ def login_eams(
             if control is not None and control.cancelled():
                 raise AutofillCancelled("用户退出自动填写") from exc
 
+        # Don't sit on the portal for the whole deadline — open home sooner.
+        if not navigated_home and (time.time() - started) >= 8:
+            check()
+            _status(status, f"打开 EAMS 主页（{target.label}）…")
+            try:
+                page.goto(target.home, wait_until="domcontentloaded")
+                navigated_home = True
+            except AutofillCancelled:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+
         if time.time() >= deadline:
             break
 
     check()
-    # Last attempt: open home and require shell, still with a short timeout.
     try:
-        page.goto(target.home, wait_until="domcontentloaded")
-        page.wait_for_selector(SHELL_IFRAME, timeout=8000)
+        if not navigated_home:
+            page.goto(target.home, wait_until="domcontentloaded")
+        page.wait_for_selector(SHELL_IFRAME, timeout=10_000)
         _status(status, f"EAMS 登录成功（{target.label}）")
         return
     except AutofillCancelled:
@@ -937,13 +1006,210 @@ def login_eams(
         ) from exc
 
 
-def next_export_path(prefix: str = "vincert_batch") -> Path:
-    """Timestamped Excel path under the project ``exports/`` folder."""
+
+def login_eams(
+    page,
+    username: str,
+    password: str,
+    *,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
+    status: StatusFn | None = None,
+    env: EamsEnvironment | None = None,
+    control: AutofillControl | None = None,
+) -> None:
+    """Open EAMS auth portal and autofill credentials when needed.
+
+    Consecutive runs may skip the password form and land on the Manage
+    chooser — that path still runs close → Available Manage → 启动.
+    """
+    username = (username or "").strip()
+    password = password or ""
+    if not username or not password:
+        raise ValueError("请先在设置中填写 EAMS 用户名和密码")
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
+    target = env or resolve_eams_environment(testing=False)
+
+    check()
+    _status(status, f"打开 EAMS 登录页（{target.label}）…")
+    try:
+        page.goto(target.login, wait_until="domcontentloaded")
+    except Exception:  # noqa: BLE001
+        try:
+            page.goto(target.portal, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            page.goto(target.home, wait_until="domcontentloaded")
+
+    check()
+    if _already_logged_in(page, timeout_ms=2500):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    # Session cookie present: auth redirects to app chooser (no password).
+    if _manage_chooser_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    # Short race: username form OR Available Manage (avoid 8s dead-wait).
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        check()
+        if _already_logged_in(page, timeout_ms=400):
+            _status(status, "已检测到登录会话（Manage 已打开）")
+            return
+        if _manage_chooser_visible(page):
+            break
+        if _login_form_visible(page):
+            break
+        page.wait_for_timeout(250)
+
+    check()
+    if _already_logged_in(page, timeout_ms=800):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    if _manage_chooser_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    if not _login_form_visible(page):
+        # Auth may send us elsewhere — try the EAMS portal chooser next.
+        try:
+            check()
+            _status(status, f"打开 EAMS 门户（{target.label}）…")
+            page.goto(target.portal, wait_until="domcontentloaded")
+        except Exception:  # noqa: BLE001
+            pass
+
+    check()
+    if _already_logged_in(page, timeout_ms=1500):
+        _status(status, "已检测到登录会话（Manage 已打开）")
+        return
+
+    if _manage_chooser_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    if not _login_form_visible(page):
+        # Last chance: home may already be the shell, or show login redirect.
+        try:
+            check()
+            page.goto(target.home, wait_until="domcontentloaded")
+            if _already_logged_in(page, timeout_ms=2000):
+                _status(status, "已检测到登录会话（Manage 已打开）")
+                return
+            if _manage_chooser_visible(page):
+                _status(status, "已登录，进入 Available Manage…")
+                _post_login_enter_manage(page, status=status, control=control)
+                _wait_for_manage_shell(
+                    page,
+                    target,
+                    login_wait_seconds=login_wait_seconds,
+                    status=status,
+                    control=control,
+                )
+                return
+            page.goto(target.login, wait_until="domcontentloaded")
+            page.get_by_role("textbox", name="输入用户名").wait_for(
+                state="visible", timeout=5000
+            )
+        except AutofillCancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+
+    if _manage_chooser_visible(page) and not _login_form_visible(page):
+        _status(status, "已登录，进入 Available Manage…")
+        try:
+            _post_login_enter_manage(page, status=status, control=control)
+        except AutofillCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _status(status, f"进入 Manage 步骤未完成：{exc}")
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return
+
+    _status(status, "正在自动填写登录信息…")
+    check()
+    _fill_eams_login_form(page, username, password, status=status)
+    check()
+
+    try:
+        _post_login_enter_manage(page, status=status, control=control)
+    except AutofillCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"进入 Manage 步骤未完成：{exc}")
+
+    _wait_for_manage_shell(
+        page,
+        target,
+        login_wait_seconds=login_wait_seconds,
+        status=status,
+        control=control,
+    )
+
+
+def next_export_path(
+    prefix: str = "vincert_batch",
+    *,
+    directory: Path | str | None = None,
+) -> Path:
+    """Timestamped Excel path under ``directory``, or project ``exports/`` if omitted."""
     from datetime import datetime
 
-    EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(directory) if directory else EXPORTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return EXPORTS_DIR / f"{prefix}_{stamp}.xlsx"
+    return out_dir / f"{prefix}_{stamp}.xlsx"
 
 
 def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> Path:
@@ -968,8 +1234,28 @@ def write_batch_excel(rows: list[list[str]], headers: list[str], path: Path) -> 
     return path
 
 
+def _delete_export_spreadsheet(
+    excel_path: Path | str | None,
+    *,
+    status: StatusFn | None = None,
+) -> bool:
+    """Remove a batch-export Excel after a failed EAMS import. Returns True if deleted."""
+    if not excel_path:
+        return False
+    path = Path(excel_path)
+    try:
+        if not path.is_file():
+            return False
+        path.unlink()
+        _status(status, f"已删除失败导入表格：{path.name}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"删除失败导入表格未成功：{path.name}（{exc}）")
+        return False
+
+
 def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
-    """Place the Chromium window — native right snap on Windows, CDP elsewhere."""
+    """Place the Chromium window via CDP bounds (no Win+Arrow snap)."""
     left, top, width, height = bounds
     width = max(400, int(width))
     height = max(400, int(height))
@@ -988,14 +1274,6 @@ def _set_browser_window_bounds(page, bounds: tuple[int, int, int, int]) -> None:
             },
         },
     )
-    if sys.platform == "win32":
-        try:
-            from .win_snap import snap_chrome
-
-            time.sleep(0.12)
-            snap_chrome(side="right")
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _step_pause(
@@ -1049,7 +1327,7 @@ def run_mas_autofill(
     Pass ``control`` to support pause / continue / exit from the UI.
     Set ``testing=True`` to use the UAT hosts and a separate browser profile.
     ``window_bounds`` snaps the browser like the PDF preview (left=app, right=browser).
-    ``step_delay_sec`` pauses between major automation steps (default 1s).
+    ``step_delay_sec`` pauses after each click/fill (default 1s).
     Pass ``shared_context`` + ``shared_page`` to reuse the PDF preview Chromium
     window (EAMS runs in its own tab and is not closed afterward).
     """
@@ -1063,14 +1341,17 @@ def run_mas_autofill(
     gate = control or AutofillControl()
     delay = max(0.0, float(step_delay_sec))
     owns_browser = shared_context is None or shared_page is None
+    _bind_action_timing(gate, delay, status)
 
     def check():
         gate.checkpoint(status)
 
     def pause_step(label: str | None = None):
+        # Control interval is applied after each click/fill; this only
+        # checkpoints pause/exit between major phases.
         if label:
             _status(status, label)
-        _step_pause(gate, delay, status=status)
+        gate.checkpoint(status)
 
     playwright = None
     context = None
@@ -1079,30 +1360,23 @@ def run_mas_autofill(
         check()
         if owns_browser:
             sync_playwright = ensure_playwright()
-            launch_args: list[str] = []
-            if window_bounds is not None:
-                left, top, width, height = window_bounds
-                launch_args.extend(
-                    [
-                        f"--window-position={int(left)},{int(top)}",
-                        f"--window-size={max(400, int(width))},{max(400, int(height))}",
-                    ]
-                )
+            from .browser_launch import chromium_persistent_kwargs
+
             # A prior kept-alive session must be closed before reusing the profile dir.
             close_keepalive_browser()
             playwright = sync_playwright().start()
             _status(status, f"正在启动浏览器（{env.label}）…")
             pw_dl = PROJECT_ROOT / "browser_downloads" / "playwright_tmp"
             pw_dl.mkdir(parents=True, exist_ok=True)
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile),
+            launch_kwargs = chromium_persistent_kwargs(
+                profile,
+                bounds=window_bounds,
                 headless=headless,
                 slow_mo=slow_mo,
-                no_viewport=True,
                 accept_downloads=True,
                 downloads_path=str(pw_dl),
-                args=launch_args or None,
             )
+            context = playwright.chromium.launch_persistent_context(**launch_kwargs)
             page = context.pages[0] if context.pages else context.new_page()
             if window_bounds is not None:
                 try:
@@ -1161,13 +1435,20 @@ def run_mas_autofill(
                     raise FileNotFoundError(f"Excel 不存在且未提供数据行：{excel_path}")
                 write_batch_excel(excel_rows, excel_headers, excel_path)
             _status(status, f"批量导入 Excel：{excel_path.name}")
-            _batch_import_excel(
-                shell,
-                excel_path,
-                status=status,
-                control=gate,
-                wait_seconds=login_wait_seconds,
-            )
+            try:
+                _batch_import_excel(
+                    shell,
+                    excel_path,
+                    status=status,
+                    control=gate,
+                    wait_seconds=login_wait_seconds,
+                )
+            except AutofillBatchImportError:
+                _delete_export_spreadsheet(excel_path, status=status)
+                raise
+            except TimeoutError as exc:
+                _delete_export_spreadsheet(excel_path, status=status)
+                raise AutofillBatchImportError(str(exc)) from exc
             report.imported_excel = True
             check()
             pause_step("批量导入已完成，开始逐份自动填写…")
@@ -1217,6 +1498,13 @@ def run_mas_autofill(
                         check()
                         pause_step()
                         _submit_workflow(shell, status=status)
+                    check()
+                    pause_step()
+                    _return_to_list_view_and_save(shell, status=status)
+                    _status(
+                        status,
+                        f"第 {i}/{len(items)} 份已保存，返回列表视图",
+                    )
                 except AutofillCancelled:
                     raise
                 except AutofillItemError as exc:
@@ -1227,6 +1515,12 @@ def run_mas_autofill(
                     _status(status, f"失败 — {msg}")
                     if exc.quarantine and item.pdf_path:
                         report.quarantine_paths.append(item.pdf_path)
+                    try:
+                        _return_to_list_view_and_save(
+                            shell, status=status, require_save=False
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception as exc:  # noqa: BLE001
                     if gate.cancelled():
                         raise AutofillCancelled("用户退出自动填写") from exc
@@ -1235,6 +1529,12 @@ def run_mas_autofill(
                     _status(status, f"失败 — {msg}")
                     if item.pdf_path:
                         report.quarantine_paths.append(item.pdf_path)
+                    try:
+                        _return_to_list_view_and_save(
+                            shell, status=status, require_save=False
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
     except AutofillCancelled as exc:
         report.cancelled = True
         _status(status, f"已退出 — {exc}")
@@ -1253,6 +1553,7 @@ def run_mas_autofill(
                     pass
             raise
     finally:
+        _unbind_action_timing()
         gate.clear_context()
         if owns_browser and context is not None and playwright is not None:
             _retain_keepalive(playwright, context)
@@ -1278,11 +1579,10 @@ def open_eams_login_session(
     profile.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
+        from .browser_launch import chromium_persistent_kwargs
+
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=False,
-            slow_mo=100,
-            no_viewport=True,
+            **chromium_persistent_kwargs(profile, slow_mo=100)
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
@@ -1465,6 +1765,7 @@ def _batch_import_excel(
     upload = _upload_frame(shell)
     _status(status, f"选择文件：{excel_path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(excel_path))
+    _action_pause()
     check()
     _click(status, shell.get_by_role("button", name="确定"), "确定")
     _status(status, "等待批量导入完成…")
@@ -1495,16 +1796,167 @@ def _batch_import_excel(
         time.sleep(0.35)
 
 
+def _list_view_ready(shell) -> bool:
+    """True when the measure-entry list toolbar is showing."""
+    try:
+        loc = shell.get_by_role("menuitem", name="批量导入计量结果")
+        return loc.count() > 0 and bool(loc.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _confirm_leave_detail_yes(
+    shell, *, status: StatusFn | None = None, timeout: float = 8_000
+) -> bool:
+    """Click「是」if the leave-detail confirm appears. Returns True if clicked."""
+    yes = shell.get_by_role("button", name="是")
+    try:
+        yes.wait_for(state="visible", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    _click(status, yes, "是", timeout=8_000)
+    return True
+
+
+def _click_save_if_present(
+    shell, *, status: StatusFn | None = None, timeout: float = 2_500
+) -> bool:
+    """Click「保存」when it is still on screen. Returns True if clicked."""
+    save = shell.get_by_role("menuitem", name="保存")
+    try:
+        save.wait_for(state="visible", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        _click(status, save, "保存", timeout=8_000)
+        return True
+    except Exception:  # noqa: BLE001
+        # Save often dismisses the menuitem as soon as it is pressed.
+        _status(status, "保存已提交")
+        return True
+
+
+def _return_to_list_view_and_save(
+    shell,
+    *,
+    status: StatusFn | None = None,
+    require_save: bool = True,
+) -> None:
+    """Leave the detail form: 列表视图 → 是 → 保存 (if still shown)."""
+    _status(status, "返回列表视图…")
+    list_link = shell.get_by_role("link", name="列表视图")
+    try:
+        list_link.wait_for(state="visible", timeout=8_000)
+        _click(status, list_link, "列表视图", timeout=12_000)
+    except Exception as exc:  # noqa: BLE001
+        if _list_view_ready(shell):
+            _status(status, "已在列表视图")
+            return
+        if require_save:
+            raise AutofillItemError(f"无法打开列表视图：{exc}", quarantine=False) from exc
+        _status(status, "未找到「列表视图」，继续…")
+        return
+
+    if _confirm_leave_detail_yes(shell, status=status, timeout=8_000):
+        _status(status, "已确认离开")
+    elif require_save:
+        # Confirm usually appears; if list is already up, 是 was not needed.
+        if not _list_view_ready(shell):
+            try:
+                _confirm_leave_detail_yes(shell, status=status, timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 「是」often already saved. Only click 保存 if the menu is still there.
+    saved = _click_save_if_present(shell, status=status)
+    if saved:
+        _status(status, "已保存")
+    elif _list_view_ready(shell):
+        _status(status, "已返回列表（无需再点保存）")
+    elif require_save:
+        # Last chance: list toolbar can lag behind 是/保存.
+        try:
+            shell.get_by_role("menuitem", name="批量导入计量结果").wait_for(
+                state="visible", timeout=8_000
+            )
+            _status(status, "已返回列表视图")
+            return
+        except Exception as exc:  # noqa: BLE001
+            raise AutofillItemError(f"无法保存：{exc}", quarantine=False) from exc
+
+    try:
+        shell.get_by_role("menuitem", name="批量导入计量结果").wait_for(
+            state="visible", timeout=12_000
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(0.35)
+
+
+def _search_list_by_serial(
+    shell, serial: str, *, status: StatusFn | None = None
+) -> None:
+    """Filter the Maximo list to this 计量器具编号, then click 搜索."""
+    _status(status, f"搜索编号：{serial}")
+    box = None
+    for name in ("计量器具编号", "编号", "搜索", "查找"):
+        try:
+            loc = shell.get_by_role("textbox", name=name)
+            if loc.count() > 0 and loc.first.is_visible():
+                box = loc.first
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if box is None:
+        try:
+            loc = shell.get_by_role("searchbox")
+            if loc.count() > 0 and loc.first.is_visible():
+                box = loc.first
+        except Exception:  # noqa: BLE001
+            box = None
+    if box is None:
+        _status(status, "未找到搜索框，尝试在当前列表中打开…")
+        return
+
+    _click(status, box, "搜索", timeout=8_000, pause=False)
+    box.fill(serial, timeout=8_000)
+    _action_pause()
+    clicked_search = False
+    for role, name in (
+        ("button", "搜索"),
+        ("menuitem", "搜索"),
+        ("button", "查找"),
+        ("menuitem", "查找"),
+    ):
+        try:
+            btn = shell.get_by_role(role, name=name)
+            if btn.count() > 0 and btn.first.is_visible():
+                _click(status, btn.first, name, timeout=8_000)
+                clicked_search = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not clicked_search:
+        box.press("Enter")
+    time.sleep(0.45)
+
+
 def _open_record_by_serial(
     shell, serial: str, *, status: StatusFn | None = None
 ) -> None:
     if not serial:
         raise AutofillItemError("缺少计量器具编号，无法定位网页记录", quarantine=True)
+    _search_list_by_serial(shell, serial, status=status)
     # Prefer exact text match in the result list / table.
     target = shell.get_by_text(serial, exact=True)
-    if target.count() == 0:
-        # Fallback: contains match (some rows append units/status).
+    try:
+        target.first.wait_for(state="visible", timeout=8_000)
+    except Exception:  # noqa: BLE001
         target = shell.get_by_text(serial)
+        try:
+            target.first.wait_for(state="visible", timeout=5_000)
+        except Exception:  # noqa: BLE001
+            pass
     if target.count() == 0:
         raise AutofillItemError(
             f"网页列表中未找到编号：{serial}",
@@ -1667,31 +2119,6 @@ def _fill_record_fields(
         _fill_textbox(shell, "检测机构", fields.measurement_unit, status=status)
 
     result = (fields.result_info or "").strip() or "合格"
-    if "\n" not in result and len(result) <= 10:
-        try:
-            _click(
-                status,
-                shell.get_by_label("检验结果").get_by_role("img", name="下拉映像"),
-                "检验结果",
-                timeout=3000,
-            )
-            if not _click_dropdown_option(
-                shell, result, timeout=3000, status=status, page=page
-            ):
-                _click(
-                    status,
-                    shell.get_by_role("menuitem", name=result, exact=True),
-                    result,
-                    timeout=3000,
-                )
-        except Exception:
-            try:
-                _select_combobox(
-                    shell, "检验结果", result, status=status, page=page
-                )
-            except Exception:
-                pass
-
     _fill_textbox(shell, "计量结果信息", result, status=status)
 
 
@@ -1705,6 +2132,7 @@ def _upload_certificate_pdf(
     upload = _upload_frame(shell)
     _status(status, f"选择附件：{path.name}")
     upload.get_by_role("button", name="Choose File").set_input_files(str(path))
+    _action_pause()
     try:
         _select_combobox(shell, "类型", "证书", status=status, page=page)
     except Exception as exc:  # noqa: BLE001

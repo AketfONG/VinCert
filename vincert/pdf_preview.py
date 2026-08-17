@@ -111,6 +111,13 @@ class PdfPreviewController:
         self._ensure_thread()
         self._cmds.put(("focus_pdf", None, None, None))
 
+    def raise_window(self) -> None:
+        """Raise the Chromium OS window above other apps (no tab switch)."""
+        if not self.is_open:
+            return
+        self._ensure_thread()
+        self._cmds.put(("raise_window", None, None, None))
+
     def close(self) -> None:
         """Close only the PDF tab. EAMS tab / window stay if still open."""
         if not self._alive and self._thread is None:
@@ -297,29 +304,14 @@ class PdfPreviewController:
         slow_mo: int,
     ):
         profile_dir.mkdir(parents=True, exist_ok=True)
-        launch_args = [
-            "--disable-infobars",
-            "--new-window",
-            "--disable-features=Translate,TranslateUI,OptimizationHints",
-            "--disable-translate",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-        if bounds is not None:
-            launch_args.extend(
-                [
-                    f"--window-position={int(bounds[0])},{int(bounds[1])}",
-                    f"--window-size={max(400, int(bounds[2]))},{max(400, int(bounds[3]))}",
-                ]
-            )
-        kwargs: dict[str, Any] = {
-            "user_data_dir": str(profile_dir),
-            "headless": False,
-            "no_viewport": True,
-            "accept_downloads": accept_downloads,
-            "args": launch_args,
-            "ignore_default_args": ["--enable-automation"],
-        }
+        from .browser_launch import chromium_persistent_kwargs
+
+        kwargs: dict[str, Any] = chromium_persistent_kwargs(
+            profile_dir,
+            bounds=bounds,
+            extra_args=["--new-window"],
+            accept_downloads=accept_downloads,
+        )
         if slow_mo > 0:
             kwargs["slow_mo"] = slow_mo
         if accept_downloads:
@@ -342,12 +334,10 @@ class PdfPreviewController:
         if bounds is None:
             return
         try:
-            if sys.platform == "win32":
-                self._set_window_bounds(page, bounds)
-                time.sleep(0.12)
-                self._snap_browser_right(title_hint=title_hint)
-            else:
-                self._set_window_bounds(page, bounds)
+            # CDP bounds only — avoid Win+Right snap (animates / flickers).
+            self._set_window_bounds(page, bounds)
+            # Keep Chromium above other apps after a resize/move.
+            self._bring_browser_to_front(title_hint=title_hint)
         except Exception:  # noqa: BLE001
             if force:
                 raise
@@ -530,6 +520,11 @@ class PdfPreviewController:
                             except Exception:  # noqa: BLE001
                                 pass
                         self._bring_browser_to_front(title_hint=hint)
+                        continue
+
+                    if cmd == "raise_window":
+                        # OS Z-order only — do not switch tabs.
+                        self._bring_browser_to_front()
                         continue
 
                     if cmd == "show_pdf":
