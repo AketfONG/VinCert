@@ -810,33 +810,235 @@ def _click_auth_primary_button(
     _click(status, submit.first, label, timeout=timeout)
 
 
-def _fill_eams_login_form(
-    page, username: str, password: str, *, status: StatusFn | None = None
-) -> None:
-    """MAS auth (UAT/prod): 输入用户名 → Button → 输入密码 → Button."""
-    _status(status, "填写用户名…")
-    _fill_username_field(page, username)
-
-    _click_auth_primary_button(page, label="继续", status=status)
-
-    # Password step appears after 继续 / primary Button.
-    page.wait_for_timeout(500)
+def _password_field_visible(page) -> bool:
+    """True when a MAS auth password input is visible."""
     try:
-        page.get_by_role("textbox", name="输入密码").wait_for(
-            state="visible", timeout=10_000
-        )
+        box = page.get_by_role("textbox", name="输入密码")
+        if box.count() > 0 and bool(box.first.is_visible()):
+            return True
     except Exception:  # noqa: BLE001
+        pass
+    for name in ("密码", "Password"):
         try:
-            page.locator('input[type="password"]').first.wait_for(
-                state="visible", timeout=5000
-            )
+            box = page.get_by_role("textbox", name=name)
+            if box.count() > 0 and bool(box.first.is_visible()):
+                return True
         except Exception:  # noqa: BLE001
-            pass
+            continue
+    try:
+        loc = page.locator('input[type="password"]')
+        return loc.count() > 0 and bool(loc.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
 
+
+def _wait_for_password_field(page, *, timeout_ms: int) -> bool:
+    deadline = time.time() + max(0, int(timeout_ms)) / 1000
+    while time.time() < deadline:
+        if _password_field_visible(page):
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
+def _wait_for_manage_chooser(page, *, timeout_ms: int) -> bool:
+    deadline = time.time() + max(0, int(timeout_ms)) / 1000
+    while time.time() < deadline:
+        if _manage_chooser_visible(page):
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
+def _measure_entry_ready(page, *, timeout_ms: int = 800) -> bool:
+    """True when Maximo shell is up and the measure-entry app link is visible."""
+    if not _already_logged_in(page, timeout_ms=timeout_ms):
+        return False
+    try:
+        shell = _shell(page)
+        link = shell.get_by_role("link", name="计量器具结果录入", exact=True)
+        return link.count() > 0 and bool(link.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _try_password_login_step(
+    page,
+    password: str,
+    *,
+    status: StatusFn | None = None,
+    timeout_ms: int = 10_000,
+) -> bool:
+    """Wait for password → fill → 登录. True when the EAMS shell is reachable."""
+    _status(status, "检查密码步骤…")
+    if not password:
+        _status(status, "未配置密码，跳过密码步骤")
+        return False
+    if not _wait_for_password_field(page, timeout_ms=timeout_ms):
+        _status(status, "未出现密码框，跳过密码步骤")
+        return False
     _status(status, "填写密码…")
-    _fill_password_field(page, password)
+    try:
+        _fill_password_field(page, password)
+        _click_auth_primary_button(page, label="登录", status=status)
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"密码步骤未完成：{exc}")
+        return False
+    page.wait_for_timeout(800)
+    if _already_logged_in(page, timeout_ms=3000):
+        _status(status, "密码登录成功")
+        return True
+    _status(status, "密码步骤未完成：未进入 EAMS 主界面")
+    return False
 
-    _click_auth_primary_button(page, label="登录", status=status)
+
+def _try_manage_login_step(
+    page,
+    target: EamsEnvironment,
+    *,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+    login_wait_seconds: int,
+    timeout_ms: int = 10_000,
+) -> bool:
+    """Wait for Manage chooser → enter → shell. True when the shell is reachable."""
+    _status(status, "检查 Manage 步骤…")
+    if not _wait_for_manage_chooser(page, timeout_ms=timeout_ms):
+        _status(status, "未出现 Manage 选择页，跳过 Manage 步骤")
+        return False
+    _status(status, "已登录，进入 Available Manage…")
+    try:
+        _post_login_enter_manage(page, status=status, control=control)
+        _wait_for_manage_shell(
+            page,
+            target,
+            login_wait_seconds=login_wait_seconds,
+            status=status,
+            control=control,
+        )
+        return True
+    except AutofillCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"Manage 步骤未完成：{exc}")
+        return False
+
+
+def _try_measure_entry_home_step(
+    page,
+    target: EamsEnvironment,
+    *,
+    status: StatusFn | None = None,
+    timeout_ms: int = 15_000,
+) -> bool:
+    """Open EAMS home and wait for 计量器具结果录入. True when the app link is visible."""
+    _status(status, "检查 EAMS 主页（计量器具结果录入）…")
+    try:
+        page.goto(target.home, wait_until="domcontentloaded")
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"主页步骤未完成：{exc}")
+        return False
+
+    deadline = time.time() + max(0, int(timeout_ms)) / 1000
+    while time.time() < deadline:
+        if _measure_entry_ready(page, timeout_ms=800):
+            _status(status, f"EAMS 登录成功（{target.label}）")
+            return True
+        page.wait_for_timeout(300)
+
+    try:
+        page.wait_for_selector(SHELL_IFRAME, timeout=min(10_000, timeout_ms))
+        shell = _shell(page)
+        shell.get_by_role("link", name="计量器具结果录入", exact=True).wait_for(
+            timeout=min(15_000, timeout_ms)
+        )
+        _status(status, f"EAMS 登录成功（{target.label}）")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _status(status, f"主页步骤未完成：{exc}")
+        return False
+
+
+def _complete_login_after_username(
+    page,
+    username: str,
+    password: str,
+    *,
+    target: EamsEnvironment,
+    login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
+    status: StatusFn | None = None,
+    control: AutofillControl | None = None,
+    step_timeout_ms: int = 10_000,
+) -> None:
+    """Username → 继续, then password → Manage → 结果录入 (fail only if all miss)."""
+
+    def check():
+        if control is not None:
+            control.checkpoint(status)
+
+    _status(status, "填写用户名…")
+    check()
+    _fill_username_field(page, username)
+    _click_auth_primary_button(page, label="继续", status=status)
+    page.wait_for_timeout(500)
+
+    check()
+    if _already_logged_in(page, timeout_ms=1500):
+        _status(status, "已检测到登录会话（EAMS 已打开）")
+        return
+    if _measure_entry_ready(page, timeout_ms=800):
+        _status(status, f"EAMS 登录成功（{target.label}）")
+        return
+
+    step_ms = max(3_000, int(step_timeout_ms))
+    failures: list[str] = []
+
+    check()
+    try:
+        if _try_password_login_step(
+            page, password, status=status, timeout_ms=step_ms
+        ):
+            return
+    except AutofillCancelled:
+        raise
+    failures.append("密码")
+
+    check()
+    if _measure_entry_ready(page, timeout_ms=800):
+        _status(status, f"EAMS 登录成功（{target.label}）")
+        return
+
+    check()
+    try:
+        if _try_manage_login_step(
+            page,
+            target,
+            status=status,
+            control=control,
+            login_wait_seconds=login_wait_seconds,
+            timeout_ms=step_ms,
+        ):
+            return
+    except AutofillCancelled:
+        raise
+    failures.append("Manage")
+
+    check()
+    home_ms = max(step_ms, 15_000)
+    try:
+        if _try_measure_entry_home_step(
+            page, target, status=status, timeout_ms=home_ms
+        ):
+            return
+    except AutofillCancelled:
+        raise
+    failures.append("结果录入主页")
+
+    raise TimeoutError(
+        f"登录失败（{target.label}）："
+        f"已尝试 {'、'.join(failures)}，均未进入 EAMS。"
+        "请确认账号或在浏览器中手动登录后重试。"
+    )
 
 
 def _locator_if_visible(page, role: str, name: str, *, exact: bool = False, timeout_ms: int = 1500):
@@ -1019,13 +1221,14 @@ def login_eams(
 ) -> None:
     """Open EAMS auth portal and autofill credentials when needed.
 
-    Consecutive runs may skip the password form and land on the Manage
-    chooser — that path still runs close → Available Manage → 启动.
+    After username, tries password → Manage → 结果录入 home in order; only
+    fails when every step times out. Consecutive runs may skip straight to
+    Manage or an existing shell session.
     """
     username = (username or "").strip()
     password = password or ""
-    if not username or not password:
-        raise ValueError("请先在设置中填写 EAMS 用户名和密码")
+    if not username:
+        raise ValueError("请先在设置中填写 EAMS 用户名")
 
     def check():
         if control is not None:
@@ -1179,19 +1382,11 @@ def login_eams(
 
     _status(status, "正在自动填写登录信息…")
     check()
-    _fill_eams_login_form(page, username, password, status=status)
-    check()
-
-    try:
-        _post_login_enter_manage(page, status=status, control=control)
-    except AutofillCancelled:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        _status(status, f"进入 Manage 步骤未完成：{exc}")
-
-    _wait_for_manage_shell(
+    _complete_login_after_username(
         page,
-        target,
+        username,
+        password,
+        target=target,
         login_wait_seconds=login_wait_seconds,
         status=status,
         control=control,
@@ -1399,7 +1594,7 @@ def run_mas_autofill(
 
         check()
         pause_step()
-        if username and password:
+        if username:
             login_eams(
                 page,
                 username,

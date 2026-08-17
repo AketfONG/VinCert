@@ -6146,10 +6146,10 @@ class App(customtkinter.CTk):
 
     def _save_eams_login_info(self):
         username, password = self._eams_credentials()
-        if not username or not password:
-            self.set_status("请先填写 EAMS 用户名和密码")
+        if not username:
+            self.set_status("请先填写 EAMS 用户名")
             self.show_toast(
-                "请先填写 EAMS 用户名和密码。",
+                "请先填写 EAMS 用户名（正式环境可无密码）。",
                 title="EAMS 登录",
                 duration_ms=TOAST_SUCCESS_MS,
             )

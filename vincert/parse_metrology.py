@@ -12,7 +12,7 @@ LABEL_ALIASES: dict[str, tuple[str, ...]] = {
     "client_name": ("客户名称", "送检单位", "委托单位", "委托者", "委托方"),
     "name": ("计量器具名称", "仪器/样品名称", "仪器名称", "样品名称", "器具名称"),
     "model": ("型号/规格", "型号规格", "型号：", "型号"),
-    "manufacturer": ("制造厂商", "制造单位", "制造厂"),
+    "manufacturer": ("制造厂商", "制造单位", "制造厂", "生产厂家", "生产商"),
     "serial_num": ("出厂编号", "计量器具编号", "器具编号"),
     "management_no": ("管理编号", "管理号"),
     "receipt_date": ("接收日期", "受样日期"),
@@ -139,13 +139,15 @@ def _join_vertical_cjk_chars(lines: list[str]) -> list[str]:
     return out
 
 
-def _is_noise(line: str) -> bool:
+def _is_noise(line: str, *, allow_english_value: bool = False) -> bool:
     if SKIP_LINE_RE.match(line):
         return True
     # Empty / placeholder values used by some labs (e.g. 力赛)
     if re.fullmatch(r"[/／—\-–]+", line):
         return True
     # Bilingual English label phrases (not short manufacturer names like Druck/Leipai)
+    if allow_english_value:
+        return False
     if (
         re.fullmatch(r"[A-Za-z][A-Za-z\s./-]{2,}", line)
         and not re.search(r"\d", line)
@@ -207,25 +209,97 @@ def _value_after_label(
     *,
     aliases: tuple[str, ...],
     stop_labels: set[str],
+    allow_english_value: bool = False,
 ) -> str:
     """Collect the first meaningful value after a label line."""
     label_line = lines[start]
     alias = _matched_alias(label_line, aliases)
     if alias and len(label_line) > len(alias):
         rest = label_line[len(alias) :].lstrip(" ：:.\t")
-        if rest and not _is_noise(rest):
+        if rest and not _is_noise(rest, allow_english_value=allow_english_value):
             return rest.strip()
 
     for j in range(start + 1, len(lines)):
         candidate = lines[j]
         if _is_label_line(candidate, stop_labels):
             break
-        if _is_noise(candidate):
+        if _is_noise(candidate, allow_english_value=allow_english_value):
             continue
         # Skip pure English company lines that follow Chinese issuer names occasionally
-        if candidate.isascii() and not re.search(r"\d", candidate) and len(candidate) > 20:
+        if (
+            not allow_english_value
+            and candidate.isascii()
+            and not re.search(r"\d", candidate)
+            and len(candidate) > 20
+        ):
             continue
         return candidate.strip()
+    return ""
+
+
+def _collect_manufacturer_value(
+    lines: list[str],
+    start: int,
+    *,
+    aliases: tuple[str, ...],
+    stop_labels: set[str],
+) -> str:
+    """Resolve 制造厂 from bilingual / multi-line blocks and odd PDF text order."""
+    value = _value_after_label(
+        lines,
+        start,
+        aliases=aliases,
+        stop_labels=stop_labels,
+        allow_english_value=True,
+    )
+    if value:
+        return value
+
+    # PDF text order may place the value on the line(s) before the label.
+    for offset in (1, 2):
+        i = start - offset
+        if i < 0:
+            break
+        candidate = lines[i].strip()
+        if not candidate or _is_label_line(candidate, stop_labels):
+            break
+        if _is_noise(candidate, allow_english_value=True):
+            continue
+        if re.fullmatch(r"[/／—\-–]+", candidate):
+            continue
+        return candidate
+
+    # Gather every non-label line between this label and the next field label.
+    block: list[str] = []
+    for j in range(start + 1, min(len(lines), start + 10)):
+        candidate = lines[j].strip()
+        if not candidate:
+            continue
+        if _is_label_line(candidate, stop_labels):
+            break
+        if _is_noise(candidate, allow_english_value=True):
+            continue
+        block.append(candidate)
+    if block:
+        for item in block:
+            if re.search(r"[\u4e00-\u9fff]", item):
+                return item
+        return block[0]
+
+    # Glued or single-line forms inside a small neighborhood.
+    window = "\n".join(lines[max(0, start - 1) : min(len(lines), start + 8)])
+    for alias in sorted(aliases, key=len, reverse=True):
+        for pattern in (
+            rf"{re.escape(alias)}\s*[：:]\s*([^\n]+)",
+            rf"{re.escape(alias)}\s+([^\n]+)",
+            rf"{re.escape(alias)}([A-Za-z\u4e00-\u9fff][^\n]+)",
+        ):
+            match = re.search(pattern, window)
+            if not match:
+                continue
+            candidate = match.group(1).strip()
+            if candidate and not _is_noise(candidate, allow_english_value=True):
+                return candidate
     return ""
 
 
@@ -407,6 +481,10 @@ def parse_fields(
             continue
         if key in {"receipt_date", "measurement_date", "due_date", "issue_date"}:
             value = parse_date_near(lines, idx)
+        elif key == "manufacturer":
+            value = _collect_manufacturer_value(
+                lines, idx, aliases=aliases, stop_labels=stops
+            )
         else:
             value = _value_after_label(lines, idx, aliases=aliases, stop_labels=stops)
             if key == "serial_num":
