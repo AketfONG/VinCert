@@ -348,7 +348,7 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.6"
+BUILD_VERSION = "v0.6.1"
 BUILD_DATE = "17/08/2026"
 RELEASES_URL = "https://github.com/AketfONG/VinCert/releases"
 
