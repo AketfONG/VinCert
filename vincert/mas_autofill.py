@@ -458,8 +458,8 @@ def _click(
     pause: bool = True,
 ):
     """Click a Playwright locator, then wait the configured control interval."""
-    _status(status, f"点击「{label}」")
     locator.click(timeout=timeout)
+    _status(status, f"点击「{label}」")
     if pause:
         _action_pause()
 
@@ -579,6 +579,15 @@ def _click_dropdown_option(
     return False
 
 
+def _combobox_has_value(frame, name: str, value: str) -> bool:
+    """True when the combobox already shows ``value`` (normalized)."""
+    want = _norm_compare(value)
+    if not want:
+        return False
+    got = _norm_compare(_read_labeled_value(frame, name))
+    return bool(got) and (got == want or want in got or got in want)
+
+
 def _select_combobox(
     frame,
     name: str,
@@ -591,10 +600,14 @@ def _select_combobox(
     if not value:
         return
     target = (value or "").strip()
+    if _combobox_has_value(frame, name, target):
+        return
     _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
     if _click_dropdown_option(
         frame, target, timeout=timeout, status=status, page=page
     ):
+        return
+    if _combobox_has_value(frame, name, target):
         return
 
     # Type-to-filter fallback (editable Maximo comboboxes).
@@ -609,18 +622,15 @@ def _select_combobox(
             return
         box.press("Enter")
         time.sleep(0.2)
-        # If the combobox retained our value, treat as success.
-        try:
-            current = (box.input_value(timeout=1500) or "").strip()
-            if target in current or current in target:
-                return
-        except Exception:  # noqa: BLE001
-            pass
+        if _combobox_has_value(frame, name, target):
+            return
     except Exception:  # noqa: BLE001
         pass
 
     # One more open+click attempt after typing.
     try:
+        if _combobox_has_value(frame, name, target):
+            return
         _open_maximo_dropdown(frame, name, timeout=timeout, status=status)
         if _click_dropdown_option(
             frame, target, timeout=timeout, status=status, page=page
@@ -629,6 +639,8 @@ def _select_combobox(
     except Exception:  # noqa: BLE001
         pass
 
+    if _combobox_has_value(frame, name, target):
+        return
     raise RuntimeError(f"无法选择下拉项：{name} = {value}")
 
 
@@ -1348,30 +1360,23 @@ def run_mas_autofill(
         check()
         if owns_browser:
             sync_playwright = ensure_playwright()
-            launch_args: list[str] = []
-            if window_bounds is not None:
-                left, top, width, height = window_bounds
-                launch_args.extend(
-                    [
-                        f"--window-position={int(left)},{int(top)}",
-                        f"--window-size={max(400, int(width))},{max(400, int(height))}",
-                    ]
-                )
+            from .browser_launch import chromium_persistent_kwargs
+
             # A prior kept-alive session must be closed before reusing the profile dir.
             close_keepalive_browser()
             playwright = sync_playwright().start()
             _status(status, f"正在启动浏览器（{env.label}）…")
             pw_dl = PROJECT_ROOT / "browser_downloads" / "playwright_tmp"
             pw_dl.mkdir(parents=True, exist_ok=True)
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile),
+            launch_kwargs = chromium_persistent_kwargs(
+                profile,
+                bounds=window_bounds,
                 headless=headless,
                 slow_mo=slow_mo,
-                no_viewport=True,
                 accept_downloads=True,
                 downloads_path=str(pw_dl),
-                args=launch_args or None,
             )
+            context = playwright.chromium.launch_persistent_context(**launch_kwargs)
             page = context.pages[0] if context.pages else context.new_page()
             if window_bounds is not None:
                 try:
@@ -1574,11 +1579,10 @@ def open_eams_login_session(
     profile.mkdir(parents=True, exist_ok=True)
 
     with sync_playwright() as p:
+        from .browser_launch import chromium_persistent_kwargs
+
         context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile),
-            headless=False,
-            slow_mo=100,
-            no_viewport=True,
+            **chromium_persistent_kwargs(profile, slow_mo=100)
         )
         try:
             page = context.pages[0] if context.pages else context.new_page()
@@ -1792,13 +1796,44 @@ def _batch_import_excel(
         time.sleep(0.35)
 
 
+def _list_view_ready(shell) -> bool:
+    """True when the measure-entry list toolbar is showing."""
+    try:
+        loc = shell.get_by_role("menuitem", name="批量导入计量结果")
+        return loc.count() > 0 and bool(loc.first.is_visible())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _confirm_leave_detail_yes(
     shell, *, status: StatusFn | None = None, timeout: float = 8_000
-) -> None:
-    """Click「是」on the leave-detail confirm that follows 列表视图."""
+) -> bool:
+    """Click「是」if the leave-detail confirm appears. Returns True if clicked."""
     yes = shell.get_by_role("button", name="是")
-    yes.wait_for(state="visible", timeout=timeout)
+    try:
+        yes.wait_for(state="visible", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
     _click(status, yes, "是", timeout=8_000)
+    return True
+
+
+def _click_save_if_present(
+    shell, *, status: StatusFn | None = None, timeout: float = 2_500
+) -> bool:
+    """Click「保存」when it is still on screen. Returns True if clicked."""
+    save = shell.get_by_role("menuitem", name="保存")
+    try:
+        save.wait_for(state="visible", timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        _click(status, save, "保存", timeout=8_000)
+        return True
+    except Exception:  # noqa: BLE001
+        # Save often dismisses the menuitem as soon as it is pressed.
+        _status(status, "保存已提交")
+        return True
 
 
 def _return_to_list_view_and_save(
@@ -1807,39 +1842,47 @@ def _return_to_list_view_and_save(
     status: StatusFn | None = None,
     require_save: bool = True,
 ) -> None:
-    """Leave the detail form: 列表视图 → 是 → 保存 (codegen order)."""
+    """Leave the detail form: 列表视图 → 是 → 保存 (if still shown)."""
     _status(status, "返回列表视图…")
     list_link = shell.get_by_role("link", name="列表视图")
     try:
         list_link.wait_for(state="visible", timeout=8_000)
         _click(status, list_link, "列表视图", timeout=12_000)
     except Exception as exc:  # noqa: BLE001
+        if _list_view_ready(shell):
+            _status(status, "已在列表视图")
+            return
         if require_save:
             raise AutofillItemError(f"无法打开列表视图：{exc}", quarantine=False) from exc
         _status(status, "未找到「列表视图」，继续…")
         return
 
-    try:
-        _status(status, "确认离开（是）…")
-        _confirm_leave_detail_yes(shell, status=status)
-    except Exception as exc:  # noqa: BLE001
-        if require_save:
-            raise AutofillItemError(
-                f"未出现或无法点击「是」：{exc}",
-                quarantine=False,
-            ) from exc
-        _status(status, "未找到「是」，继续…")
+    if _confirm_leave_detail_yes(shell, status=status, timeout=8_000):
+        _status(status, "已确认离开")
+    elif require_save:
+        # Confirm usually appears; if list is already up, 是 was not needed.
+        if not _list_view_ready(shell):
+            try:
+                _confirm_leave_detail_yes(shell, status=status, timeout=2_000)
+            except Exception:  # noqa: BLE001
+                pass
 
-    save = shell.get_by_role("menuitem", name="保存")
-    try:
-        save.wait_for(state="visible", timeout=8_000)
-        _status(status, "保存…")
-        _click(status, save, "保存", timeout=12_000)
-    except Exception as exc:  # noqa: BLE001
-        if require_save:
+    # 「是」often already saved. Only click 保存 if the menu is still there.
+    saved = _click_save_if_present(shell, status=status)
+    if saved:
+        _status(status, "已保存")
+    elif _list_view_ready(shell):
+        _status(status, "已返回列表（无需再点保存）")
+    elif require_save:
+        # Last chance: list toolbar can lag behind 是/保存.
+        try:
+            shell.get_by_role("menuitem", name="批量导入计量结果").wait_for(
+                state="visible", timeout=8_000
+            )
+            _status(status, "已返回列表视图")
+            return
+        except Exception as exc:  # noqa: BLE001
             raise AutofillItemError(f"无法保存：{exc}", quarantine=False) from exc
-        _status(status, "未找到「保存」，继续…")
-        return
 
     try:
         shell.get_by_role("menuitem", name="批量导入计量结果").wait_for(
@@ -2076,31 +2119,6 @@ def _fill_record_fields(
         _fill_textbox(shell, "检测机构", fields.measurement_unit, status=status)
 
     result = (fields.result_info or "").strip() or "合格"
-    if "\n" not in result and len(result) <= 10:
-        try:
-            _click(
-                status,
-                shell.get_by_label("检验结果").get_by_role("img", name="下拉映像"),
-                "检验结果",
-                timeout=3000,
-            )
-            if not _click_dropdown_option(
-                shell, result, timeout=3000, status=status, page=page
-            ):
-                _click(
-                    status,
-                    shell.get_by_role("menuitem", name=result, exact=True),
-                    result,
-                    timeout=3000,
-                )
-        except Exception:
-            try:
-                _select_combobox(
-                    shell, "检验结果", result, status=status, page=page
-                )
-            except Exception:
-                pass
-
     _fill_textbox(shell, "计量结果信息", result, status=status)
 
 
