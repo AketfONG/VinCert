@@ -104,6 +104,14 @@ class PdfPreviewController:
         profile = str(Path(profile_dir).resolve()) if profile_dir else None
         self._cmds.put(("show_pdf", path, bounds, profile))
 
+    def update_pdf(self, pdf_path: str) -> None:
+        """Load a PDF in the existing preview tab without stealing the EAMS tab."""
+        path = str(Path(pdf_path).expanduser().resolve())
+        if not Path(path).is_file() or not self.is_open:
+            return
+        self._ensure_thread()
+        self._cmds.put(("update_pdf", path, None, None))
+
     def focus(self) -> None:
         """Bring the Chromium window / PDF tab to the front."""
         if not self.is_open:
@@ -580,6 +588,21 @@ class PdfPreviewController:
                             else:
                                 pdf_page = None
                                 self._set_state(pdf_path=None)
+                        continue
+
+                    if cmd == "update_pdf":
+                        _cmd, path, _bounds, _profile = item
+                        if not self._page_alive(pdf_page):
+                            continue
+                        try:
+                            url = path_to_file_url(path, hide_sidebar=True)
+                            current = (pdf_page.url or "").split("#", 1)[0]
+                            target = url.split("#", 1)[0]
+                            if current != target:
+                                pdf_page.goto(url, wait_until="domcontentloaded")
+                            self._set_state(pdf_path=path, browser_open=True)
+                        except Exception as exc:  # noqa: BLE001
+                            self._emit(f"PDF 预览更新失败：{exc}")
                         continue
 
                     if cmd == "run":

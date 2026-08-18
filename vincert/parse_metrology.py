@@ -237,6 +237,26 @@ def _value_after_label(
     return ""
 
 
+_PLACEHOLDER_VALUE_RE = re.compile(r"^[\/／—\-–]+$")
+
+
+def _forward_has_placeholder(
+    lines: list[str],
+    start: int,
+    stop_labels: set[str],
+) -> bool:
+    """True when the field block after the label is an explicit empty marker (e.g. /)."""
+    for j in range(start + 1, len(lines)):
+        candidate = lines[j].strip()
+        if not candidate:
+            continue
+        if _is_label_line(candidate, stop_labels):
+            return False
+        if _PLACEHOLDER_VALUE_RE.fullmatch(candidate):
+            return True
+    return False
+
+
 def _collect_manufacturer_value(
     lines: list[str],
     start: int,
@@ -254,6 +274,10 @@ def _collect_manufacturer_value(
     )
     if value:
         return value
+    # 天溯 etc. write 「/」 when manufacturer is blank. Do not steal 型号/规格
+    # (e.g. 600mm) from the line above the bilingual Manufacturer label.
+    if _forward_has_placeholder(lines, start, stop_labels):
+        return ""
 
     # PDF text order may place the value on the line(s) before the label.
     for offset in (1, 2):

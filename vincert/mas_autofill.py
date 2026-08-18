@@ -1514,6 +1514,7 @@ def run_mas_autofill(
     step_delay_sec: float = 1.0,
     shared_context=None,
     shared_page=None,
+    on_item: Callable[[int, int, AutofillItem], None] | None = None,
 ) -> AutofillReport:
     """
     Drive EAMS 计量器具结果录入 using a persistent Chromium profile.
@@ -1525,6 +1526,8 @@ def run_mas_autofill(
     ``step_delay_sec`` pauses after each click/fill (default 1s).
     Pass ``shared_context`` + ``shared_page`` to reuse the PDF preview Chromium
     window (EAMS runs in its own tab and is not closed afterward).
+    ``on_item(index, total, item)`` fires when each certificate fill starts
+    (1-based index) so the UI can follow the live document.
     """
     if not items and not (batch_import and excel_rows):
         raise ValueError("没有可自动填写的条目")
@@ -1663,6 +1666,11 @@ def run_mas_autofill(
                             "缺少对应 PDF，无法上传附件",
                             quarantine=True,
                         )
+                    if on_item is not None:
+                        try:
+                            on_item(i, len(items), item)
+                        except Exception:  # noqa: BLE001
+                            pass
                     _status(status, f"填写第 {i}/{len(items)} 份：{label}")
                     check()
                     pause_step()

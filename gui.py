@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import re
 import shutil
 import sys
 import threading
@@ -74,6 +75,7 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "status_dots": True,
         "doc_list_scale_fonts": True,
         "hide_scrollbars": False,
+        "compact_min_window": False,
         "auto_window_snap": True,
         "pdf_preview_enabled": True,
         "feature_extensions": False,
@@ -106,6 +108,8 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["doc_list_scale_fonts"] = bool(data["doc_list_scale_fonts"])
     if "hide_scrollbars" in data:
         out["hide_scrollbars"] = bool(data["hide_scrollbars"])
+    if "compact_min_window" in data:
+        out["compact_min_window"] = bool(data["compact_min_window"])
     if "auto_window_snap" in data:
         out["auto_window_snap"] = bool(data["auto_window_snap"])
     if "pdf_preview_enabled" in data:
@@ -243,6 +247,15 @@ def save_hide_scrollbars(enabled: bool, path: Path | None = None) -> Path:
     return save_ui_settings(hide_scrollbars=bool(enabled))
 
 
+def load_compact_min_window(path: Path | None = None) -> bool:
+    """Return True when a smaller window minsize is allowed."""
+    return bool(load_ui_settings(path).get("compact_min_window", False))
+
+
+def save_compact_min_window(enabled: bool, path: Path | None = None) -> Path:
+    return save_ui_settings(compact_min_window=bool(enabled))
+
+
 def load_auto_window_snap(path: Path | None = None) -> bool:
     """Return True when VinCert auto-snaps beside the browser / PDF preview."""
     return bool(load_ui_settings(path).get("auto_window_snap", True))
@@ -348,8 +361,8 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v0.6.1"
-BUILD_DATE = "17/08/2026"
+BUILD_VERSION = "v1.0"
+BUILD_DATE = "18/08/2026"
 RELEASES_URL = "https://github.com/AketfONG/VinCert/releases"
 
 # Typography — sizes chosen for readability at both 1.0× and 1.2× UI scale.
@@ -405,6 +418,10 @@ DANGER_BTN_TEXT = ("#ffffff", "#ffffff")
 CUSTOM_AUTOFILL_BTN_FG = ("#7c3aed", "#6d28d9")
 CUSTOM_AUTOFILL_BTN_HOVER = ("#8b5cf6", "#7c3aed")
 CUSTOM_AUTOFILL_BTN_TEXT = ("#ffffff", "#ffffff")
+FEATURE_ACCENT_OUTLINE = CUSTOM_AUTOFILL_BTN_FG
+FEATURE_ACCENT_TILE_ACTIVE = ("#ede9fe", "#343638")
+FEATURE_DOC_ROW_ACTIVE = CUSTOM_AUTOFILL_BTN_FG
+FEATURE_DOC_MARK_NUMBER_ACTIVE = ("#c4b5fd", "#a78bfa")
 TOAST_BG = ("#ffffff", "#1a1a1a")
 TOAST_TITLE_COLOR = ("gray10", "#ffffff")
 TOAST_MESSAGE_COLOR = ("gray30", "#f0f0f0")
@@ -485,10 +502,17 @@ EXPORT_COLUMNS = [
     ("measurement_type", "计量类型"),
 ]
 
+# Sidebar 设置 stays highlighted on these nested pages.
+SETTINGS_SUBPAGES = {"settings", "parse_rules", "more_options"}
+
 
 WINDOW_MIN_HEIGHT_NORMAL = 830  # design units × 1.0 scale
 WINDOW_MIN_HEIGHT_ZOOMED = 820  # design units × 1.2 scale — tune separately from normal
 WINDOW_MIN_WIDTH = DOC_SIDEBAR_WIDTH + MAIN_MIN_WIDTH
+COMPACT_DOC_SIDEBAR_WIDTH = 320
+COMPACT_MAIN_COL_MIN = 360
+WINDOW_MIN_WIDTH_COMPACT = COMPACT_DOC_SIDEBAR_WIDTH + COMPACT_MAIN_COL_MIN
+WINDOW_MIN_HEIGHT_COMPACT = 520
 
 
 class App(customtkinter.CTk):
@@ -549,9 +573,11 @@ class App(customtkinter.CTk):
         self._status_dots = load_status_dots()
         self._doc_list_scale_fonts = load_doc_list_scale_fonts()
         self._hide_scrollbars = load_hide_scrollbars()
+        self._compact_min_window = load_compact_min_window()
         self._auto_window_snap = load_auto_window_snap()
         self._pdf_preview_enabled = load_pdf_preview_enabled()
         self._feature_extensions = load_feature_extensions()
+        self._accent_buttons: list[customtkinter.CTkButton] = []
         self._testing_mode = load_testing_mode()
         self._demo_folder_enabled = load_demo_folder_enabled()
         self._demo_folder = load_demo_folder()
@@ -573,8 +599,10 @@ class App(customtkinter.CTk):
         self._build_doc_sidebar()
         self._build_controls_panel()
         self._apply_min_window_size()
+        self._apply_doc_sidebar_width()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.show_step("extract")
+        self._apply_feature_extension_theme()
         self._update_extract_ocr_ui()
         self.after_idle(self._bootstrap_window_layout)
         if self._hide_scrollbars:
@@ -588,14 +616,36 @@ class App(customtkinter.CTk):
             )
         return max(customtkinter.ScalingTracker.widget_scaling, 0.01)
 
+    def _doc_sidebar_width(self) -> int:
+        if getattr(self, "_compact_min_window", False):
+            return COMPACT_DOC_SIDEBAR_WIDTH
+        return DOC_SIDEBAR_WIDTH
+
+    def _apply_doc_sidebar_width(self):
+        width = self._doc_sidebar_width()
+        if hasattr(self, "doc_sidebar"):
+            self.doc_sidebar.configure(width=width)
+            self.doc_sidebar.grid(row=0, column=0, sticky="nsew")
+        if hasattr(self, "folder_label"):
+            self.folder_label.configure(wraplength=max(80, (width - 32) // 2))
+        if hasattr(self, "doc_list_frame"):
+            self._schedule_doc_list_scrollbar_sync()
+            self._refresh_doc_list_fonts()
+
     def _apply_layout_column_minsizes(self):
         # Tk grid minsize is in pixels; CTk widget widths are design units × scale.
         scale = self._widget_scaling_factor()
-        self.grid_columnconfigure(
-            0, weight=0, minsize=int(DOC_SIDEBAR_WIDTH * scale)
+        sidebar_min = self._doc_sidebar_width()
+        main_min = (
+            COMPACT_MAIN_COL_MIN
+            if getattr(self, "_compact_min_window", False)
+            else MAIN_MIN_WIDTH
         )
         self.grid_columnconfigure(
-            1, weight=1, minsize=int(MAIN_MIN_WIDTH * scale)
+            0, weight=0, minsize=int(sidebar_min * scale)
+        )
+        self.grid_columnconfigure(
+            1, weight=1, minsize=int(main_min * scale)
         )
 
     def _bootstrap_window_layout(self):
@@ -1061,6 +1111,67 @@ class App(customtkinter.CTk):
         self._fix_ctk_button_text_vcenter(button)
         return button
 
+    def _feature_accent_active(self) -> bool:
+        return bool(getattr(self, "_feature_extensions", False))
+
+    def _accent_outline(self):
+        return FEATURE_ACCENT_OUTLINE if self._feature_accent_active() else ACTIVE_OUTLINE
+
+    def _accent_tile_active_bg(self):
+        return FEATURE_ACCENT_TILE_ACTIVE if self._feature_accent_active() else TILE_BG_ACTIVE
+
+    def _accent_doc_row_active(self):
+        return FEATURE_DOC_ROW_ACTIVE if self._feature_accent_active() else DOC_ROW_ACTIVE
+
+    def _accent_doc_mark_number_active(self):
+        return (
+            FEATURE_DOC_MARK_NUMBER_ACTIVE
+            if self._feature_accent_active()
+            else DOC_MARK_NUMBER_ACTIVE
+        )
+
+    def _accent_primary_btn_colors(self) -> tuple:
+        if self._feature_accent_active():
+            return CUSTOM_AUTOFILL_BTN_FG, CUSTOM_AUTOFILL_BTN_HOVER, CUSTOM_AUTOFILL_BTN_TEXT
+        return PRIMARY_BTN_FG, PRIMARY_BTN_HOVER, PRIMARY_BTN_TEXT
+
+    def _make_accent_button(self, parent, **kwargs) -> customtkinter.CTkButton:
+        fg, hover, text = self._accent_primary_btn_colors()
+        kwargs.setdefault("fg_color", fg)
+        kwargs.setdefault("hover_color", hover)
+        kwargs.setdefault("text_color", text)
+        btn = customtkinter.CTkButton(parent, **kwargs)
+        self._accent_buttons.append(btn)
+        return btn
+
+    def _apply_feature_extension_theme(self) -> None:
+        """Purple accent chrome when 功能拓展 is on; autofill CTA stays blue."""
+        fg, hover, text = self._accent_primary_btn_colors()
+        for btn in getattr(self, "_accent_buttons", []):
+            try:
+                btn.configure(fg_color=fg, hover_color=hover, text_color=text)
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "autofill_button"):
+            try:
+                self.autofill_button.configure(
+                    fg_color=PRIMARY_BTN_FG,
+                    hover_color=PRIMARY_BTN_HOVER,
+                    text_color=PRIMARY_BTN_TEXT,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if hasattr(self, "step_tiles"):
+            self._update_step_tiles(getattr(self, "_current_step", "extract"))
+        if hasattr(self, "settings_button"):
+            self._update_settings_button(
+                getattr(self, "_current_step", None) in SETTINGS_SUBPAGES
+            )
+        if hasattr(self, "_doc_rows") and self._doc_rows:
+            self._highlight_selected_doc()
+        if getattr(self, "_doc_name_tip", None) is not None:
+            self._hide_doc_name_tip()
+
     def _restyle_primary_action_buttons(self):
         for name in (
             "ocr_extract_button",
@@ -1091,7 +1202,7 @@ class App(customtkinter.CTk):
             corner_radius=UI_RADIUS,
             fg_color=TILE_BG_NORMAL,
             border_width=0,
-            border_color=ACTIVE_OUTLINE,
+            border_color=self._accent_outline(),
         )
         tile.grid_propagate(False)
         tile.grid_columnconfigure(1, weight=1)
@@ -1102,7 +1213,7 @@ class App(customtkinter.CTk):
             width=NAV_BADGE_SIZE,
             height=NAV_BADGE_SIZE,
             corner_radius=NAV_BADGE_SIZE // 2,
-            fg_color=ACTIVE_OUTLINE,
+            fg_color=self._accent_outline(),
         )
         badge.grid(row=0, column=0, padx=(12, 8), pady=12, sticky="w")
         badge.grid_propagate(False)
@@ -1174,9 +1285,15 @@ class App(customtkinter.CTk):
             return
         self._apply_tile_style(key, "hover" if entering else "normal")
 
+    def _automate_step_unlocked(self) -> bool:
+        """自动化 is reachable after an approve, or when 功能拓展 custom import is on."""
+        if self._autofill_queue:
+            return True
+        return bool(getattr(self, "_feature_extensions", False))
+
     def _step_tile_is_locked(self, key: str) -> bool:
         """True when a workflow tile should appear greyed / inactive."""
-        if key == "automate" and not self._autofill_queue:
+        if key == "automate" and not self._automate_step_unlocked():
             return True
         return False
 
@@ -1211,8 +1328,8 @@ class App(customtkinter.CTk):
                 "border_width": 0,
             },
             "active": {
-                "tile_fg": TILE_BG_ACTIVE,
-                "tile_border": ACTIVE_OUTLINE,
+                "tile_fg": self._accent_tile_active_bg(),
+                "tile_border": self._accent_outline(),
                 "border_width": 2,
             },
         }
@@ -1226,7 +1343,7 @@ class App(customtkinter.CTk):
         for child in tile.winfo_children():
             try:
                 if isinstance(child, customtkinter.CTkFrame):
-                    child.configure(fg_color=ACTIVE_OUTLINE)
+                    child.configure(fg_color=self._accent_outline())
                     for sub in child.winfo_children():
                         if isinstance(sub, customtkinter.CTkLabel):
                             sub.configure(text_color=("#ffffff", "#ffffff"))
@@ -1251,7 +1368,7 @@ class App(customtkinter.CTk):
         self._update_remove_failed_button()
         self._update_approve_toggle_button()
         self._update_remove_toggle_button()
-        if self._current_step not in ("extract", "settings", "parse_rules"):
+        if self._current_step not in ("extract", *SETTINGS_SUBPAGES):
             self.show_step("extract")
         else:
             self._update_step_tiles(self._current_step)
@@ -1277,9 +1394,9 @@ class App(customtkinter.CTk):
         if active:
             self.settings_button.configure(
                 border_width=2,
-                border_color=ACTIVE_OUTLINE,
-                fg_color=TILE_BG_ACTIVE,
-                hover_color=TILE_BG_ACTIVE,
+                border_color=self._accent_outline(),
+                fg_color=self._accent_tile_active_bg(),
+                hover_color=self._accent_tile_active_bg(),
                 text_color=SECONDARY_BTN_TEXT,
             )
         else:
@@ -1295,7 +1412,7 @@ class App(customtkinter.CTk):
     def _build_doc_sidebar(self):
         self.doc_sidebar = customtkinter.CTkFrame(
             self,
-            width=DOC_SIDEBAR_WIDTH,
+            width=self._doc_sidebar_width(),
             corner_radius=0,
             fg_color=APP_BG_COLOR,
         )
@@ -1410,7 +1527,7 @@ class App(customtkinter.CTk):
             font=customtkinter.CTkFont(size=FONT_META),
             text_color="gray60",
             anchor="e",
-            wraplength=DOC_WRAP // 2,
+            wraplength=max(80, (self._doc_sidebar_width() - 32) // 2),
             justify="right",
         )
         self.folder_label.grid(row=0, column=1, sticky="e")
@@ -1419,14 +1536,11 @@ class App(customtkinter.CTk):
         btn_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
         btn_row.grid_columnconfigure((0, 1), weight=1)
 
-        customtkinter.CTkButton(
+        self._make_accent_button(
             btn_row,
             text="选择文件夹…",
             height=SMALL_BTN_HEIGHT,
             corner_radius=UI_RADIUS,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._pick_folder,
         ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
@@ -1543,6 +1657,42 @@ class App(customtkinter.CTk):
         )
         self.controls_header.grid(row=0, column=0, sticky="w")
 
+        self.controls_header_right = customtkinter.CTkFrame(
+            self.controls_header_wrap,
+            fg_color="transparent",
+            width=1,
+            height=1,
+        )
+        self.controls_header_right.grid(row=0, column=1, sticky="e")
+        self.controls_header_right.grid_remove()
+        self.controls_header_right.grid_columnconfigure(0, weight=0)
+        self.controls_header_right.grid_columnconfigure(1, weight=0)
+
+        self.automate_env_label = customtkinter.CTkLabel(
+            self.controls_header_right,
+            text="",
+            font=customtkinter.CTkFont(size=FONT_META),
+            text_color="gray60",
+            anchor="e",
+        )
+        self.automate_env_label.grid(row=0, column=0, sticky="e", padx=(0, 6))
+
+        self.automate_testing_mode_switch = customtkinter.CTkSwitch(
+            self.controls_header_right,
+            text="",
+            width=36,
+            height=24,
+            switch_width=36,
+            switch_height=18,
+            font=customtkinter.CTkFont(size=FONT_META),
+            command=self._on_automate_testing_mode_toggle,
+        )
+        if self._testing_mode:
+            self.automate_testing_mode_switch.select()
+        else:
+            self.automate_testing_mode_switch.deselect()
+        self.automate_testing_mode_switch.grid(row=0, column=1, sticky="e")
+
         self.controls_header_back_btn = customtkinter.CTkButton(
             self.controls_header_wrap,
             corner_radius=UI_RADIUS,
@@ -1569,6 +1719,7 @@ class App(customtkinter.CTk):
             ("automate", self._build_automate_controls),
             ("settings", self._build_settings_controls),
             ("parse_rules", self._build_parse_rules_controls),
+            ("more_options", self._build_more_options_controls),
         ]:
             frame = customtkinter.CTkFrame(self.controls_body, fg_color="transparent")
             frame.grid(row=0, column=0, sticky="nsew")
@@ -1614,7 +1765,7 @@ class App(customtkinter.CTk):
             return
         if (
             key == "automate"
-            and not self._autofill_queue
+            and not self._automate_step_unlocked()
             and key != self._current_step
         ):
             self.set_status("请先批准至少一份证书")
@@ -1622,16 +1773,17 @@ class App(customtkinter.CTk):
         self._current_step = key
 
         self._update_step_tiles(key)
-        self._update_settings_button(key in {"settings", "parse_rules"})
+        self._update_settings_button(key in SETTINGS_SUBPAGES)
 
         titles = {
             "extract": "提取核对",
             "automate": "自动化",
             "settings": "设置",
             "parse_rules": "解析规则",
+            "more_options": "更多选项",
         }
         self.controls_header.configure(text=titles.get(key, key))
-        self._update_controls_header_back(key == "parse_rules")
+        self._update_controls_header_extras()
 
         for name, frame in self.step_views.items():
             if name == key:
@@ -1643,11 +1795,16 @@ class App(customtkinter.CTk):
         elif key == "automate":
             self._cancel_pending_quarantine()
             self._update_autofill_button()
+            if not self._autofill_busy:
+                path = self._selected_path or self._current_cert_path()
+                self._load_automate_fields(path)
             self._schedule_active_page_vcenter(force=True)
         elif key == "settings":
             self._schedule_active_page_vcenter(force=True)
         elif key == "parse_rules":
             self._refresh_parse_rules_panel()
+            self._schedule_active_page_vcenter(force=True)
+        elif key == "more_options":
             self._schedule_active_page_vcenter(force=True)
 
     def _schedule_active_page_vcenter(self, *, force: bool = False):
@@ -1919,18 +2076,32 @@ class App(customtkinter.CTk):
         """
         parent.grid_columnconfigure(0, weight=1)
 
-        header = customtkinter.CTkFrame(parent, fg_color="transparent")
+        # CTkFrame defaults to 200×200; empty headers (e.g. 自动化 with
+        # 功能拓展 off) would steal space and break content centering.
+        header = customtkinter.CTkFrame(
+            parent, fg_color="transparent", width=1, height=1
+        )
         header.grid_columnconfigure(0, weight=1)
 
-        middle = customtkinter.CTkFrame(parent, fg_color="transparent")
+        middle = customtkinter.CTkFrame(
+            parent, fg_color="transparent", width=1, height=1
+        )
         middle.grid_columnconfigure(0, weight=1)
 
-        top = customtkinter.CTkFrame(middle, fg_color="transparent", height=0)
-        content = customtkinter.CTkFrame(middle, fg_color="transparent")
+        top = customtkinter.CTkFrame(
+            middle, fg_color="transparent", width=1, height=0
+        )
+        content = customtkinter.CTkFrame(
+            middle, fg_color="transparent", width=1, height=1
+        )
         content.grid_columnconfigure(0, weight=1)
-        bottom = customtkinter.CTkFrame(middle, fg_color="transparent", height=0)
+        bottom = customtkinter.CTkFrame(
+            middle, fg_color="transparent", width=1, height=0
+        )
 
-        footer = customtkinter.CTkFrame(parent, fg_color="transparent")
+        footer = customtkinter.CTkFrame(
+            parent, fg_color="transparent", width=1, height=1
+        )
         footer.grid_columnconfigure(0, weight=1)
 
         if with_header and with_footer:
@@ -1963,6 +2134,8 @@ class App(customtkinter.CTk):
             "bottom": bottom,
             "middle": middle,
             "content": content,
+            "header": header,
+            "footer": footer,
             "centered": None,
             "with_header": with_header,
             "with_footer": with_footer,
@@ -2068,14 +2241,11 @@ class App(customtkinter.CTk):
         if saved_pass:
             self.eams_password_entry.insert(0, saved_pass)
 
-        customtkinter.CTkButton(
+        self._make_accent_button(
             content,
             corner_radius=UI_RADIUS,
             text="保存登录信息",
             height=40,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._save_eams_login_info,
         ).grid(row=3, column=0, sticky="ew")
@@ -2110,15 +2280,12 @@ class App(customtkinter.CTk):
         )
         self.autofill_step_delay_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         self.autofill_step_delay_entry.insert(0, f"{self._autofill_step_delay_sec:g}")
-        customtkinter.CTkButton(
+        self._make_accent_button(
             delay_row,
             corner_radius=UI_RADIUS,
             text="保存",
             width=88,
             height=40,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._save_autofill_step_delay,
         ).grid(row=1, column=1, sticky="e")
@@ -2146,18 +2313,6 @@ class App(customtkinter.CTk):
         self.ui_zoom_switch.configure(command=self._on_ui_zoom_toggle)
         self.ui_zoom_switch.grid(row=0, column=0, sticky="w", padx=(0, 4))
 
-        self.ocr_enabled_switch = customtkinter.CTkSwitch(
-            switches_row,
-            text="启用 OCR",
-            font=customtkinter.CTkFont(size=FONT_BODY),
-        )
-        if self._ocr_enabled:
-            self.ocr_enabled_switch.select()
-        else:
-            self.ocr_enabled_switch.deselect()
-        self.ocr_enabled_switch.configure(command=self._on_ocr_enabled_toggle)
-        self.ocr_enabled_switch.grid(row=0, column=1, sticky="w", padx=(4, 0))
-
         self.buttons_bold_switch = customtkinter.CTkSwitch(
             switches_row,
             text="按钮加粗",
@@ -2168,7 +2323,7 @@ class App(customtkinter.CTk):
         else:
             self.buttons_bold_switch.deselect()
         self.buttons_bold_switch.configure(command=self._on_buttons_bold_toggle)
-        self.buttons_bold_switch.grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(10, 0))
+        self.buttons_bold_switch.grid(row=0, column=1, sticky="w", padx=(4, 0))
 
         self.content_centering_switch = customtkinter.CTkSwitch(
             switches_row,
@@ -2181,7 +2336,7 @@ class App(customtkinter.CTk):
             self.content_centering_switch.deselect()
         self.content_centering_switch.configure(command=self._on_content_centering_toggle)
         self.content_centering_switch.grid(
-            row=1, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+            row=1, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
         )
 
         self.status_dots_switch = customtkinter.CTkSwitch(
@@ -2194,7 +2349,9 @@ class App(customtkinter.CTk):
         else:
             self.status_dots_switch.deselect()
         self.status_dots_switch.configure(command=self._on_status_dots_toggle)
-        self.status_dots_switch.grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(10, 0))
+        self.status_dots_switch.grid(
+            row=1, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+        )
 
         self.doc_list_scale_fonts_switch = customtkinter.CTkSwitch(
             switches_row,
@@ -2209,7 +2366,7 @@ class App(customtkinter.CTk):
             command=self._on_doc_list_scale_fonts_toggle
         )
         self.doc_list_scale_fonts_switch.grid(
-            row=2, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+            row=2, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
         )
 
         self.hide_scrollbars_switch = customtkinter.CTkSwitch(
@@ -2223,38 +2380,36 @@ class App(customtkinter.CTk):
             self.hide_scrollbars_switch.deselect()
         self.hide_scrollbars_switch.configure(command=self._on_hide_scrollbars_toggle)
         self.hide_scrollbars_switch.grid(
+            row=2, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
+        )
+
+        self.compact_min_window_switch = customtkinter.CTkSwitch(
+            switches_row,
+            text="更小窗口",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._compact_min_window:
+            self.compact_min_window_switch.select()
+        else:
+            self.compact_min_window_switch.deselect()
+        self.compact_min_window_switch.configure(
+            command=self._on_compact_min_window_toggle
+        )
+        self.compact_min_window_switch.grid(
             row=3, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
         )
 
-        self.auto_window_snap_switch = customtkinter.CTkSwitch(
-            switches_row,
-            text="自动窗口分屏",
-            font=customtkinter.CTkFont(size=FONT_BODY),
-        )
-        if self._auto_window_snap:
-            self.auto_window_snap_switch.select()
-        else:
-            self.auto_window_snap_switch.deselect()
-        self.auto_window_snap_switch.configure(command=self._on_auto_window_snap_toggle)
-        self.auto_window_snap_switch.grid(
-            row=3, column=1, sticky="w", padx=(4, 0), pady=(10, 0)
-        )
-
-        self.pdf_preview_enabled_switch = customtkinter.CTkSwitch(
-            switches_row,
-            text="PDF 预览",
-            font=customtkinter.CTkFont(size=FONT_BODY),
-        )
-        if self._pdf_preview_enabled:
-            self.pdf_preview_enabled_switch.select()
-        else:
-            self.pdf_preview_enabled_switch.deselect()
-        self.pdf_preview_enabled_switch.configure(
-            command=self._on_pdf_preview_enabled_toggle
-        )
-        self.pdf_preview_enabled_switch.grid(
-            row=4, column=0, sticky="w", padx=(0, 4), pady=(10, 0)
-        )
+        customtkinter.CTkButton(
+            content,
+            corner_radius=UI_RADIUS,
+            text="更多选项…",
+            height=40,
+            fg_color=SECONDARY_BTN_FG,
+            hover_color=SECONDARY_BTN_HOVER,
+            text_color=SECONDARY_BTN_TEXT,
+            font=self._button_font(FONT_BUTTON),
+            command=self._open_more_options,
+        ).grid(row=9, column=0, sticky="ew", pady=(16, 16))
 
         customtkinter.CTkLabel(
             content,
@@ -2268,7 +2423,8 @@ class App(customtkinter.CTk):
                 content,
                 text=(
                     "将其他工具的能力并入当前流程。开启后，自动化页显示"
-                    "「自定义目录自动填写」，可对已备好的 Excel 与对应 PDF 直接跑自动填写。"
+                    "「自定义 Excel 导入」，可选择一份已生成格式的 Excel，"
+                    "按编号匹配当前文件夹中的 PDF 后导入 EAMS。"
                 ),
                 anchor="w",
                 font=customtkinter.CTkFont(size=FONT_BODY),
@@ -2372,14 +2528,11 @@ class App(customtkinter.CTk):
         demo_dir_row.grid(row=22, column=0, sticky="ew", pady=(0, 16))
         demo_dir_row.grid_columnconfigure((0, 1), weight=1)
 
-        customtkinter.CTkButton(
+        self._make_accent_button(
             demo_dir_row,
             corner_radius=UI_RADIUS,
             text="选择文件夹…",
             height=40,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._pick_demo_folder,
         ).grid(row=0, column=0, padx=(0, 4), sticky="ew")
@@ -2418,19 +2571,132 @@ class App(customtkinter.CTk):
             )
         ).grid(row=24, column=0, sticky="ew", pady=(0, 12))
 
-        customtkinter.CTkButton(
+        self._make_accent_button(
             content,
             corner_radius=UI_RADIUS,
             text="配置解析规则…",
             height=40,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._open_parse_rules_config,
         ).grid(row=25, column=0, sticky="ew", pady=(0, 16))
 
         self._bind_scrollable_mousewheel(self.settings_scroll, self.settings_scroll)
+        self._schedule_active_page_vcenter(force=True)
+
+    def _build_more_options_controls(self, parent: customtkinter.CTkFrame):
+        """Settings sub-page: OCR, split-screen, and PDF preview."""
+        _header, old_content, _footer = self._make_pinned_footer_layout(
+            parent, with_header=False, with_footer=False
+        )
+        meta = parent._vcenter_meta
+        middle = meta["middle"]
+        old_content.destroy()
+
+        self.more_options_scroll = customtkinter.CTkScrollableFrame(
+            middle,
+            fg_color="transparent",
+            corner_radius=0,
+        )
+        self.more_options_scroll.grid_columnconfigure(0, weight=1)
+        meta["content"] = self.more_options_scroll
+        meta["scrollable"] = True
+
+        content = self.more_options_scroll
+        self._bind_scrollable_mousewheel(self.more_options_scroll, self.more_options_scroll)
+        self._bind_scrollable_mousewheel(
+            self.more_options_scroll, self.more_options_scroll._parent_canvas
+        )
+
+        customtkinter.CTkLabel(
+            content,
+            text="OCR",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text="开启后，提取页显示 OCR 按钮，用于扫描件或封面无嵌入文本的证书。",
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self.ocr_enabled_switch = customtkinter.CTkSwitch(
+            content,
+            text="启用 OCR",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._ocr_enabled:
+            self.ocr_enabled_switch.select()
+        else:
+            self.ocr_enabled_switch.deselect()
+        self.ocr_enabled_switch.configure(command=self._on_ocr_enabled_toggle)
+        self.ocr_enabled_switch.grid(row=2, column=0, sticky="w", pady=(0, 16))
+
+        customtkinter.CTkLabel(
+            content,
+            text="窗口分屏",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=3, column=0, sticky="ew", pady=(8, 8))
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text="开启后，PDF 预览或自动填写时将 VinCert 与浏览器左右分屏。",
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=4, column=0, sticky="ew", pady=(0, 6))
+        self.auto_window_snap_switch = customtkinter.CTkSwitch(
+            content,
+            text="自动窗口分屏",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._auto_window_snap:
+            self.auto_window_snap_switch.select()
+        else:
+            self.auto_window_snap_switch.deselect()
+        self.auto_window_snap_switch.configure(command=self._on_auto_window_snap_toggle)
+        self.auto_window_snap_switch.grid(row=5, column=0, sticky="w", pady=(0, 16))
+
+        customtkinter.CTkLabel(
+            content,
+            text="PDF 预览",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+        ).grid(row=6, column=0, sticky="ew", pady=(8, 8))
+        self._track_content_wrap(
+            customtkinter.CTkLabel(
+                content,
+                text="开启后，选中证书时在右侧浏览器中预览 PDF。",
+                anchor="w",
+                font=customtkinter.CTkFont(size=FONT_BODY),
+                text_color="gray60",
+                wraplength=CONTENT_WRAP,
+                justify="left",
+            )
+        ).grid(row=7, column=0, sticky="ew", pady=(0, 6))
+        self.pdf_preview_enabled_switch = customtkinter.CTkSwitch(
+            content,
+            text="启用 PDF 预览",
+            font=customtkinter.CTkFont(size=FONT_BODY),
+        )
+        if self._pdf_preview_enabled:
+            self.pdf_preview_enabled_switch.select()
+        else:
+            self.pdf_preview_enabled_switch.deselect()
+        self.pdf_preview_enabled_switch.configure(
+            command=self._on_pdf_preview_enabled_toggle
+        )
+        self.pdf_preview_enabled_switch.grid(row=8, column=0, sticky="w", pady=(0, 16))
+
+        self._bind_scrollable_mousewheel(self.more_options_scroll, self.more_options_scroll)
         self._schedule_active_page_vcenter(force=True)
 
     def _build_parse_rules_controls(self, parent: customtkinter.CTkFrame):
@@ -2543,15 +2809,12 @@ class App(customtkinter.CTk):
             add_row, placeholder="新标签别名，例如：设备编号"
         )
         self.parse_rules_alias_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        customtkinter.CTkButton(
+        self._make_accent_button(
             add_row,
             corner_radius=UI_RADIUS,
             text="添加",
             width=88,
             height=36,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._on_add_parse_rule_alias,
         ).grid(row=0, column=1, sticky="e")
@@ -2565,14 +2828,11 @@ class App(customtkinter.CTk):
         preview_row = customtkinter.CTkFrame(content, fg_color="transparent")
         preview_row.grid(row=9, column=0, sticky="ew", pady=(0, 8))
         preview_row.grid_columnconfigure(1, weight=1)
-        customtkinter.CTkButton(
+        self._make_accent_button(
             preview_row,
             corner_radius=UI_RADIUS,
             text="试解析当前原文",
             height=36,
-            fg_color=PRIMARY_BTN_FG,
-            hover_color=PRIMARY_BTN_HOVER,
-            text_color=PRIMARY_BTN_TEXT,
             font=self._button_font(FONT_BUTTON),
             command=self._on_try_parse_rules,
         ).grid(row=0, column=0, sticky="w")
@@ -2604,22 +2864,69 @@ class App(customtkinter.CTk):
         self._update_parse_rules_builtin_hint()
         self._schedule_active_page_vcenter(force=True)
 
-    def _update_controls_header_back(self, visible: bool) -> None:
-        """Show/hide the title-bar「返回设置」control (parse-rules page only)."""
-        if not hasattr(self, "controls_header_back_btn"):
+    def _automate_env_label_text(self) -> str:
+        if self._testing_mode:
+            return "测试环境 · EAMS UAT"
+        return "正式环境 · EAMS"
+
+    def _sync_testing_mode_switches(self) -> None:
+        enabled = bool(self._testing_mode)
+        for name in ("testing_mode_switch", "automate_testing_mode_switch"):
+            switch = getattr(self, name, None)
+            if switch is None:
+                continue
+            try:
+                if enabled:
+                    switch.select()
+                else:
+                    switch.deselect()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _update_controls_header_extras(self) -> None:
+        """Right-side title chrome: automate env + switch, or settings back."""
+        step = getattr(self, "_current_step", None)
+        show_back = step in {"parse_rules", "more_options"}
+        show_automate = step == "automate" and not show_back
+
+        if hasattr(self, "controls_header_back_btn"):
+            if show_back:
+                self.controls_header_back_btn.grid()
+            else:
+                self.controls_header_back_btn.grid_remove()
+
+        right = getattr(self, "controls_header_right", None)
+        if right is None:
             return
-        if visible:
-            self.controls_header_back_btn.grid()
+        if show_automate:
+            label = getattr(self, "automate_env_label", None)
+            if label is not None:
+                label.configure(text=self._automate_env_label_text())
+            self._sync_testing_mode_switches()
+            right.grid()
         else:
-            self.controls_header_back_btn.grid_remove()
+            right.grid_remove()
+
+    def _update_controls_header_back(self, visible: bool) -> None:
+        """Show/hide the title-bar「返回设置」control on nested settings pages."""
+        del visible  # Kept for call-site compat; extras handler owns layout.
+        self._update_controls_header_extras()
 
     def _open_parse_rules_config(self):
         if self._autofill_busy:
             self.set_status("自动填写进行中，请先暂停或退出…")
             return
-        if self._current_step not in {"settings", "parse_rules"}:
+        if self._current_step not in SETTINGS_SUBPAGES:
             self._step_before_settings = self._current_step
         self.show_step("parse_rules")
+
+    def _open_more_options(self):
+        if self._autofill_busy:
+            self.set_status("自动填写进行中，请先暂停或退出…")
+            return
+        if self._current_step not in SETTINGS_SUBPAGES:
+            self._step_before_settings = self._current_step
+        self.show_step("more_options")
 
     def _open_releases_page(self):
         """Open the public GitHub Releases page in the default browser."""
@@ -2833,11 +3140,12 @@ class App(customtkinter.CTk):
             self.set_status("启动加载已关闭")
             self.show_success_toast("启动时不再自动加载文件夹。", title="启动加载文件夹")
 
-    def _on_testing_mode_toggle(self):
-        enabled = bool(self.testing_mode_switch.get())
-        self._testing_mode = enabled
-        save_testing_mode(enabled)
-        if enabled:
+    def _apply_testing_mode(self, enabled: bool) -> None:
+        self._testing_mode = bool(enabled)
+        save_testing_mode(self._testing_mode)
+        self._sync_testing_mode_switches()
+        self._update_controls_header_extras()
+        if self._testing_mode:
             self.set_status("测试模式已开启 · EAMS 测试环境（auth.masuat.apps.ocpuat）")
             self.show_success_toast(
                 "已切换到 EAMS 测试环境。",
@@ -2849,6 +3157,12 @@ class App(customtkinter.CTk):
                 "已切换到 EAMS 正式环境。",
                 title="测试模式",
             )
+
+    def _on_testing_mode_toggle(self):
+        self._apply_testing_mode(bool(self.testing_mode_switch.get()))
+
+    def _on_automate_testing_mode_toggle(self):
+        self._apply_testing_mode(bool(self.automate_testing_mode_switch.get()))
 
     def _pick_demo_folder(self):
         initial = self._demo_folder if self._demo_folder and Path(self._demo_folder).is_dir() else None
@@ -2867,6 +3181,25 @@ class App(customtkinter.CTk):
         self.show_success_toast(msg, title="启动加载文件夹")
 
     def _clear_demo_folder(self):
+        """Ask for confirmation before clearing the startup folder path."""
+        current = (self._demo_folder or "").strip()
+        if not current:
+            self.set_status("未配置启动加载文件夹")
+            return
+        self.show_toast(
+            f"将清除启动加载文件夹路径：\n{current}\n"
+            "下次启动将不再自动加载该文件夹。",
+            title="清除启动加载文件夹",
+            action_text="确认清除",
+            undo_text="取消",
+            on_complete=self._confirm_clear_demo_folder,
+            complete_on_timeout=False,
+            duration_ms=TOAST_DEFAULT_MS,
+            style="danger",
+        )
+        self.set_status("确认清除启动加载文件夹？")
+
+    def _confirm_clear_demo_folder(self):
         self._demo_folder = save_demo_folder("")
         self._update_demo_folder_label()
         self.set_status("已清除启动加载文件夹")
@@ -2914,6 +3247,9 @@ class App(customtkinter.CTk):
     def _on_hide_scrollbars_toggle(self):
         self._apply_hide_scrollbars(bool(self.hide_scrollbars_switch.get()))
 
+    def _on_compact_min_window_toggle(self):
+        self._apply_compact_min_window(bool(self.compact_min_window_switch.get()))
+
     def _on_auto_window_snap_toggle(self):
         self._apply_auto_window_snap(bool(self.auto_window_snap_switch.get()))
 
@@ -2953,6 +3289,17 @@ class App(customtkinter.CTk):
             else "已显示滚动条"
         )
 
+    def _apply_compact_min_window(self, enabled: bool):
+        self._compact_min_window = enabled
+        save_compact_min_window(enabled)
+        self._apply_layout_column_minsizes()
+        self._apply_min_window_size()
+        self._apply_doc_sidebar_width()
+        self._controls_inner_width = -1
+        self._sync_controls_inner_width()
+        self._schedule_active_page_vcenter(force=True)
+        self.set_status("已允许更小窗口" if enabled else "已恢复默认最小窗口")
+
     def _apply_auto_window_snap(self, enabled: bool):
         self._auto_window_snap = enabled
         save_auto_window_snap(enabled)
@@ -2979,18 +3326,22 @@ class App(customtkinter.CTk):
     def _apply_feature_extensions(self, enabled: bool):
         self._feature_extensions = enabled
         save_feature_extensions(enabled)
+        self._apply_feature_extension_theme()
         self._update_custom_dir_autofill_button()
+        self._update_autofill_button()
         self.set_status("已开启功能拓展" if enabled else "已关闭功能拓展")
 
     def _update_custom_dir_autofill_button(self):
-        """Show the purple custom-dir button only when 功能拓展 is on."""
+        """Show the purple custom Excel button at top when 功能拓展 is on."""
         btn = getattr(self, "custom_dir_autofill_button", None)
+        header = getattr(self, "automate_page_header", None)
         if btn is None:
             return
-        if self._autofill_busy:
-            btn.grid_remove()
-            return
-        if getattr(self, "_feature_extensions", False):
+        show = (
+            bool(getattr(self, "_feature_extensions", False))
+            and not self._autofill_busy
+        )
+        if show:
             try:
                 btn.configure(
                     state="normal",
@@ -2998,28 +3349,33 @@ class App(customtkinter.CTk):
                     hover_color=CUSTOM_AUTOFILL_BTN_HOVER,
                     text_color=CUSTOM_AUTOFILL_BTN_TEXT,
                 )
-                btn.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+                btn.grid(row=0, column=0, sticky="ew", pady=(0, 12))
             except Exception:  # noqa: BLE001
                 pass
-            hint = (
-                "导出已批准的证书，或导出并自动填写到 EAMS。\n"
-                "也可选择自定义目录（内含一份正确格式的 Excel 与对应 PDF 文本证书）。"
-            )
+            if header is not None:
+                try:
+                    header.grid(row=0, column=0, sticky="ew")
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             try:
                 btn.grid_remove()
             except Exception:  # noqa: BLE001
                 pass
-            hint = "导出已批准的证书，或导出并自动填写到 EAMS。"
-        label = getattr(self, "automate_hint_label", None)
-        if label is not None:
-            try:
-                label.configure(text=hint)
-            except Exception:  # noqa: BLE001
-                pass
+            if header is not None:
+                try:
+                    header.grid_remove()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._schedule_active_page_vcenter(force=True)
 
     def _iter_app_scrollables(self):
-        for name in ("doc_list_frame", "settings_scroll", "parse_rules_scroll"):
+        for name in (
+            "doc_list_frame",
+            "settings_scroll",
+            "parse_rules_scroll",
+            "more_options_scroll",
+        ):
             frame = getattr(self, name, None)
             if frame is not None:
                 yield frame
@@ -3129,8 +3485,7 @@ class App(customtkinter.CTk):
 
         if hasattr(self, "doc_sidebar"):
             # Re-apply design width so scaled pixel size updates on zoom-out.
-            self.doc_sidebar.configure(width=DOC_SIDEBAR_WIDTH)
-            self.doc_sidebar.grid(row=0, column=0, sticky="nsew")
+            self._apply_doc_sidebar_width()
         if hasattr(self, "controls_panel"):
             self.controls_panel.grid(row=0, column=1, sticky="nsew", padx=0)
 
@@ -3842,17 +4197,105 @@ class App(customtkinter.CTk):
 
     def _apply_min_window_size(self):
         scale = self._widget_scaling_factor()
-        min_h = (
-            WINDOW_MIN_HEIGHT_ZOOMED
-            if self._ui_zoomed
-            else WINDOW_MIN_HEIGHT_NORMAL
-        )
+        if getattr(self, "_compact_min_window", False):
+            min_w = WINDOW_MIN_WIDTH_COMPACT
+            min_h = WINDOW_MIN_HEIGHT_COMPACT
+        else:
+            min_w = WINDOW_MIN_WIDTH
+            min_h = (
+                WINDOW_MIN_HEIGHT_ZOOMED
+                if self._ui_zoomed
+                else WINDOW_MIN_HEIGHT_NORMAL
+            )
         self.minsize(
-            int(WINDOW_MIN_WIDTH * scale),
+            int(min_w * scale),
             int(min_h * scale),
         )
 
     # ---------------------------------------------------------------- extract
+    def _pack_certificate_fields(
+        self,
+        content: customtkinter.CTkFrame,
+        *,
+        start_row: int = 0,
+    ) -> tuple[int, dict[str, customtkinter.CTkEntry | customtkinter.CTkTextbox]]:
+        """Build the read/write certificate field stack; return next row + widgets."""
+        entries: dict[str, customtkinter.CTkEntry | customtkinter.CTkTextbox] = {}
+        row = start_row
+        customtkinter.CTkLabel(
+            content,
+            text="比对字段",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+            anchor="w",
+        ).grid(row=row, column=0, sticky="ew", pady=(0, 4))
+        row += 1
+        for key, label in MATCH_FIELDS:
+            customtkinter.CTkLabel(
+                content,
+                text=label,
+                anchor="w",
+                width=96,
+                font=customtkinter.CTkFont(size=FONT_LABEL),
+                text_color="gray60",
+            ).grid(row=row, column=0, sticky="w", pady=4)
+            entry = self._make_field_entry(content, placeholder=f"请输入{label}")
+            entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
+            entries[key] = entry
+            row += 1
+
+        customtkinter.CTkLabel(
+            content,
+            text="填写字段",
+            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
+            anchor="w",
+        ).grid(row=row, column=0, sticky="ew", pady=(14, 8))
+        row += 1
+        for key, label in METROLOGY_FIELDS:
+            customtkinter.CTkLabel(
+                content,
+                text=label,
+                anchor="w",
+                width=96,
+                font=customtkinter.CTkFont(size=FONT_LABEL),
+                text_color="gray60",
+            ).grid(row=row, column=0, sticky="w", pady=4)
+            entry = self._make_field_entry(content, placeholder=f"请输入{label}")
+            entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
+            entries[key] = entry
+            row += 1
+
+        result_label_wrap = customtkinter.CTkFrame(
+            content,
+            fg_color="transparent",
+            width=96,
+            height=ENTRY_HEIGHT,
+        )
+        result_label_wrap.grid(row=row, column=0, sticky="nw", pady=4)
+        result_label_wrap.grid_propagate(False)
+        result_label_wrap.grid_rowconfigure(0, weight=1)
+        result_label_wrap.grid_columnconfigure(0, weight=1)
+        customtkinter.CTkLabel(
+            result_label_wrap,
+            text="计量结果信息",
+            anchor="w",
+            font=customtkinter.CTkFont(size=FONT_LABEL),
+            text_color="gray60",
+        ).grid(row=0, column=0, sticky="w")
+        result_box = customtkinter.CTkTextbox(
+            content,
+            height=RESULT_INFO_HEIGHT,
+            corner_radius=UI_RADIUS,
+            border_width=FIELD_BORDER_WIDTH,
+            border_color=FIELD_FG_COLOR,
+            fg_color=FIELD_FG_COLOR,
+            text_color=FIELD_TEXT_COLOR,
+            activate_scrollbars=False,
+            font=customtkinter.CTkFont(size=FONT_ENTRY),
+        )
+        result_box.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
+        entries["result_info"] = result_box
+        return row + 1, entries
+
     def _build_extract_controls(self, parent: customtkinter.CTkFrame):
         """提取核对: remove-failed pinned at top; editing locked until quarantine done."""
         header, content, footer = self._make_pinned_footer_layout(parent)
@@ -3872,84 +4315,9 @@ class App(customtkinter.CTk):
         self.remove_failed_button.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         self._style_primary_action_button(self.remove_failed_button)
 
-        match_header_label = customtkinter.CTkLabel(
-            content,
-            text="比对字段",
-            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-            anchor="w",
+        next_row, self.field_entries = self._pack_certificate_fields(
+            content, start_row=0
         )
-        match_header_label.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-
-        self.field_entries: dict[str, customtkinter.CTkEntry | customtkinter.CTkTextbox] = {}
-        for row, (key, label) in enumerate(MATCH_FIELDS, start=1):
-            customtkinter.CTkLabel(
-                content,
-                text=label,
-                anchor="w",
-                width=96,
-                font=customtkinter.CTkFont(size=FONT_LABEL),
-                text_color="gray60",
-            ).grid(row=row, column=0, sticky="w", pady=4)
-
-            entry = self._make_field_entry(content, placeholder=f"请输入{label}")
-            entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
-            self.field_entries[key] = entry
-
-        fill_header_row = 1 + len(MATCH_FIELDS)
-        customtkinter.CTkLabel(
-            content,
-            text="填写字段",
-            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-            anchor="w",
-        ).grid(row=fill_header_row, column=0, sticky="ew", pady=(14, 8))
-
-        for offset, (key, label) in enumerate(METROLOGY_FIELDS):
-            row = fill_header_row + 1 + offset
-            customtkinter.CTkLabel(
-                content,
-                text=label,
-                anchor="w",
-                width=96,
-                font=customtkinter.CTkFont(size=FONT_LABEL),
-                text_color="gray60",
-            ).grid(row=row, column=0, sticky="w", pady=4)
-
-            entry = self._make_field_entry(content, placeholder=f"请输入{label}")
-            entry.grid(row=row, column=0, sticky="ew", padx=(104, 0), pady=4)
-            self.field_entries[key] = entry
-
-        result_row = fill_header_row + 1 + len(METROLOGY_FIELDS)
-        result_label_wrap = customtkinter.CTkFrame(
-            content,
-            fg_color="transparent",
-            width=96,
-            height=ENTRY_HEIGHT,
-        )
-        result_label_wrap.grid(row=result_row, column=0, sticky="nw", pady=4)
-        result_label_wrap.grid_propagate(False)
-        result_label_wrap.grid_rowconfigure(0, weight=1)
-        result_label_wrap.grid_columnconfigure(0, weight=1)
-        customtkinter.CTkLabel(
-            result_label_wrap,
-            text="计量结果信息",
-            anchor="w",
-            font=customtkinter.CTkFont(size=FONT_LABEL),
-            text_color="gray60",
-        ).grid(row=0, column=0, sticky="w")
-
-        result_box = customtkinter.CTkTextbox(
-            content,
-            height=RESULT_INFO_HEIGHT,
-            corner_radius=UI_RADIUS,
-            border_width=FIELD_BORDER_WIDTH,
-            border_color=FIELD_FG_COLOR,
-            fg_color=FIELD_FG_COLOR,
-            text_color=FIELD_TEXT_COLOR,
-            activate_scrollbars=False,
-            font=customtkinter.CTkFont(size=FONT_ENTRY),
-        )
-        result_box.grid(row=result_row, column=0, sticky="ew", padx=(104, 0), pady=4)
-        self.field_entries["result_info"] = result_box
 
         self.extract_errors_label = self._track_content_wrap(
             customtkinter.CTkLabel(
@@ -3963,7 +4331,7 @@ class App(customtkinter.CTk):
             )
         )
         self.extract_errors_label.grid(
-            row=result_row + 1, column=0, sticky="ew", pady=(8, 0)
+            row=next_row, column=0, sticky="ew", pady=(8, 0)
         )
 
         self.ocr_progress = customtkinter.CTkProgressBar(footer, height=10)
@@ -4034,19 +4402,28 @@ class App(customtkinter.CTk):
     # ----------------------------------------------------------- automate
     def _build_automate_controls(self, parent: customtkinter.CTkFrame):
         """自动化: Excel export + autofill run controls."""
-        _header, content, footer = self._make_pinned_footer_layout(
-            parent, with_header=False
-        )
+        header, content, footer = self._make_pinned_footer_layout(parent)
+        self.automate_page_header = header
 
-        self.automate_hint_label = customtkinter.CTkLabel(
-            content,
-            text="导出已批准的证书，或导出并自动填写到 EAMS。",
-            anchor="w",
-            justify="left",
-            font=customtkinter.CTkFont(size=FONT_BODY),
-            text_color="gray60",
+        self.custom_dir_autofill_button = customtkinter.CTkButton(
+            header,
+            corner_radius=UI_RADIUS,
+            text="自定义 Excel 导入并自动填写",
+            height=PRIMARY_ACTION_BTN_HEIGHT,
+            round_height_to_even_numbers=False,
+            font=self._button_font(FONT_SECTION),
+            fg_color=CUSTOM_AUTOFILL_BTN_FG,
+            hover_color=CUSTOM_AUTOFILL_BTN_HOVER,
+            text_color=CUSTOM_AUTOFILL_BTN_TEXT,
+            command=self._on_custom_excel_autofill,
         )
-        self.automate_hint_label.grid(row=0, column=0, sticky="ew")
+        self._style_primary_action_button(self.custom_dir_autofill_button)
+        self._update_custom_dir_autofill_button()
+
+        _next_row, self.automate_field_entries = self._pack_certificate_fields(
+            content, start_row=0
+        )
+        self._set_field_widgets_locked(self.automate_field_entries, True)
 
         self.export_excel_button = customtkinter.CTkButton(
             footer,
@@ -4077,21 +4454,6 @@ class App(customtkinter.CTk):
         )
         self.autofill_button.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         self._style_primary_action_button(self.autofill_button)
-
-        self.custom_dir_autofill_button = customtkinter.CTkButton(
-            footer,
-            corner_radius=UI_RADIUS,
-            text="自定义目录自动填写",
-            height=PRIMARY_ACTION_BTN_HEIGHT,
-            round_height_to_even_numbers=False,
-            font=self._button_font(FONT_SECTION),
-            fg_color=CUSTOM_AUTOFILL_BTN_FG,
-            hover_color=CUSTOM_AUTOFILL_BTN_HOVER,
-            text_color=CUSTOM_AUTOFILL_BTN_TEXT,
-            command=self._on_custom_dir_autofill,
-        )
-        self._style_primary_action_button(self.custom_dir_autofill_button)
-        self._update_custom_dir_autofill_button()
 
         self.autofill_controls_frame = customtkinter.CTkFrame(
             footer, fg_color="transparent"
@@ -5034,9 +5396,9 @@ class App(customtkinter.CTk):
         tip = customtkinter.CTkFrame(
             self,
             corner_radius=UI_RADIUS,
-            fg_color=DOC_ROW_ACTIVE if selected else TOAST_BG,
+            fg_color=self._accent_doc_row_active() if selected else TOAST_BG,
             border_width=0 if selected else TOAST_BORDER_WIDTH,
-            border_color=ACTIVE_OUTLINE,
+            border_color=self._accent_outline(),
         )
         label = customtkinter.CTkLabel(
             tip,
@@ -5193,7 +5555,7 @@ class App(customtkinter.CTk):
             return DOC_STATUS_DOT_OK if kind == "ok" else DOC_STATUS_DOT_BAD
         if kind:
             return DOC_ROW_ACTIVE_TEXT if selected else ("gray10", "gray90")
-        return DOC_MARK_NUMBER_ACTIVE if selected else DOC_MARK_NUMBER_COLOR
+        return self._accent_doc_mark_number_active() if selected else DOC_MARK_NUMBER_COLOR
 
     def _doc_mark_font_size(self, path: str) -> int:
         # Keep body size when number + dot share the cell so both stay readable.
@@ -5210,21 +5572,33 @@ class App(customtkinter.CTk):
         mark_text = self._doc_leading_label(path, row.get("index", 0))
         name_text = row.get("full_name") or self._doc_name_label(path, row.get("index", 0))
         if self._autofill_busy or self._autofill_ui_chrome_locked:
-            # Mute selection blue + keep rows non-interactive looking.
-            surface = UI_LOCK_DOC_ROW if selected else "transparent"
-            text = UI_LOCK_DOC_TEXT
-            row["frame"].configure(fg_color=surface)
-            self._set_doc_canvas_text(row["mark"], mark_text, fill=text, size=mark_size)
-            self._set_doc_canvas_text(row["name"], name_text, fill=text, size=FONT_BODY)
-            self._sync_doc_row_surfaces(path, surface)
+            # Keep the live autofill target visible; mute the rest.
+            if selected:
+                row["frame"].configure(fg_color=self._accent_doc_row_active())
+                self._set_doc_canvas_text(
+                    row["mark"], mark_text, fill=mark_color, size=mark_size
+                )
+                self._set_doc_canvas_text(
+                    row["name"], name_text, fill=DOC_ROW_ACTIVE_TEXT, size=FONT_BODY
+                )
+                self._sync_doc_row_surfaces(path, self._accent_doc_row_active())
+            else:
+                row["frame"].configure(fg_color="transparent")
+                self._set_doc_canvas_text(
+                    row["mark"], mark_text, fill=UI_LOCK_DOC_TEXT, size=mark_size
+                )
+                self._set_doc_canvas_text(
+                    row["name"], name_text, fill=UI_LOCK_DOC_TEXT, size=FONT_BODY
+                )
+                self._sync_doc_row_surfaces(path, "transparent")
             return
         if selected:
-            row["frame"].configure(fg_color=DOC_ROW_ACTIVE)
+            row["frame"].configure(fg_color=self._accent_doc_row_active())
             self._set_doc_canvas_text(row["mark"], mark_text, fill=mark_color, size=mark_size)
             self._set_doc_canvas_text(
                 row["name"], name_text, fill=DOC_ROW_ACTIVE_TEXT, size=FONT_BODY
             )
-            self._sync_doc_row_surfaces(path, DOC_ROW_ACTIVE)
+            self._sync_doc_row_surfaces(path, self._accent_doc_row_active())
         else:
             row["frame"].configure(fg_color="transparent")
             self._set_doc_canvas_text(row["mark"], mark_text, fill=mark_color, size=mark_size)
@@ -5370,6 +5744,8 @@ class App(customtkinter.CTk):
         if hasattr(self, "field_entries"):
             self._load_approve_fields_for_current()
             self._update_review_cert_status()
+        if not self._autofill_busy:
+            self._load_automate_fields(path)
         if self._current_step == "parse_rules":
             self._refresh_parse_rules_panel()
         if sync_preview:
@@ -5459,22 +5835,99 @@ class App(customtkinter.CTk):
             return False
         return path in self._autofill_queue or path in self._removed_paths
 
-    def _set_review_fields_locked(self, locked: bool):
-        if not hasattr(self, "field_entries"):
+    def _set_field_widgets_locked(
+        self,
+        widgets: dict[str, customtkinter.CTkEntry | customtkinter.CTkTextbox] | None,
+        locked: bool,
+    ) -> None:
+        if not widgets:
             return
         if locked:
-            self.focus_set()
+            try:
+                self.focus_set()
+            except Exception:  # noqa: BLE001
+                pass
         state = "disabled" if locked else "normal"
         fg_color = FIELD_FG_COLOR_DISABLED if locked else FIELD_FG_COLOR
-        text_color = FIELD_TEXT_COLOR_DISABLED if locked else FIELD_TEXT_COLOR
-        for widget in self.field_entries.values():
-            kwargs = {
-                "state": state,
-                "fg_color": fg_color,
-                "text_color": text_color,
-                "border_color": fg_color,
-            }
-            widget.configure(**kwargs)
+        # Keep parsed values readable while locked (grey field, normal text).
+        text_color = FIELD_TEXT_COLOR
+        for widget in widgets.values():
+            try:
+                widget.configure(
+                    state=state,
+                    fg_color=fg_color,
+                    text_color=text_color,
+                    border_color=fg_color,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _load_fields_into_widgets(
+        self,
+        widgets: dict[str, customtkinter.CTkEntry | customtkinter.CTkTextbox] | None,
+        *,
+        path: str | None = None,
+        fields: CertificateFields | None = None,
+        keep_locked: bool = False,
+    ) -> None:
+        if not widgets:
+            return
+        self._set_field_widgets_locked(widgets, False)
+        for widget in widgets.values():
+            self._set_field_widget_value(widget, "")
+        source = fields
+        if source is None and path:
+            result = self._parse_results.get(path)
+            source = result.fields if result is not None else None
+        if source is not None:
+            for key, widget in widgets.items():
+                value = getattr(source, key, "") or ""
+                if not value and key == "result_info":
+                    value = DEFAULT_RESULT_INFO
+                self._set_field_widget_value(widget, value)
+        self._set_field_widgets_locked(widgets, keep_locked)
+
+    def _load_automate_fields(
+        self,
+        path: str | None = None,
+        fields: CertificateFields | None = None,
+    ) -> None:
+        widgets = getattr(self, "automate_field_entries", None)
+        self._load_fields_into_widgets(
+            widgets, path=path, fields=fields, keep_locked=True
+        )
+
+    def _focus_certificate_for_autofill(
+        self,
+        path: str | None,
+        fields: CertificateFields | None = None,
+        *,
+        index: int | None = None,
+        total: int | None = None,
+        pending: bool = False,
+    ) -> None:
+        """Show this certificate on 自动化 (fields + list + PDF) during a run."""
+        del index, total, pending  # kept for call-site compatibility
+        resolved = str(path) if path else ""
+        if resolved and resolved in self._imported_files:
+            self._selected_path = resolved
+            self._current_cert_index = self._imported_files.index(resolved)
+            self._highlight_selected_doc()
+        self._load_automate_fields(resolved or None, fields)
+        if resolved and self._pdf_preview_enabled:
+            try:
+                self._pdf_preview.update_pdf(resolved)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_autofill_item(self, index: int, total: int, item: AutofillItem) -> None:
+        path = str(item.pdf_path) if item.pdf_path else None
+        self._focus_certificate_for_autofill(
+            path, item.fields, index=index, total=total
+        )
+
+    def _set_review_fields_locked(self, locked: bool):
+        self._set_field_widgets_locked(getattr(self, "field_entries", None), locked)
 
     def _update_review_fields_state(self):
         self._set_review_fields_locked(self._review_fields_locked())
@@ -5545,22 +5998,12 @@ class App(customtkinter.CTk):
         return result
 
     def _load_approve_fields_for_current(self):
-        self._set_review_fields_locked(False)
-        self._clear_approve_fields()
         path = self._current_cert_path()
-        if path is None:
-            self._update_review_cert_status()
-            return
-        result = self._parse_results.get(path)
-        if result is None:
-            self._update_review_cert_status()
-            return
-        fields: CertificateFields = result.fields
-        for key, widget in self.field_entries.items():
-            value = getattr(fields, key, "") or ""
-            if not value and key == "result_info":
-                value = DEFAULT_RESULT_INFO
-            self._set_field_widget_value(widget, value)
+        self._load_fields_into_widgets(
+            getattr(self, "field_entries", None),
+            path=path,
+            keep_locked=self._review_fields_locked(),
+        )
         self._update_review_cert_status()
 
     def _update_review_cert_status(self):
@@ -5667,7 +6110,7 @@ class App(customtkinter.CTk):
         # Unlock/lock 自动化 when the approve queue gains or loses its first item.
         if (
             getattr(self, "_current_step", None) == "automate"
-            and not self._autofill_queue
+            and not self._automate_step_unlocked()
             and not self._autofill_busy
         ):
             self.show_step("extract")
@@ -5678,8 +6121,7 @@ class App(customtkinter.CTk):
         """Swap the autofill CTA for 暂停 / 退出 while a run is active."""
         if hasattr(self, "autofill_button"):
             self.autofill_button.grid_remove()
-        if hasattr(self, "custom_dir_autofill_button"):
-            self.custom_dir_autofill_button.grid_remove()
+        self._update_custom_dir_autofill_button()
         if hasattr(self, "autofill_controls_frame"):
             self.autofill_pause_button.configure(
                 text="暂停",
@@ -5729,6 +6171,8 @@ class App(customtkinter.CTk):
         if hasattr(self, "export_excel_button"):
             self.export_excel_button.configure(state="normal")
         self._update_autofill_button()
+        if hasattr(self, "field_entries"):
+            self._load_approve_fields_for_current()
 
     def _autofill_interactive_types(self) -> tuple:
         types = [
@@ -5794,7 +6238,7 @@ class App(customtkinter.CTk):
             for child in tile.winfo_children():
                 try:
                     if isinstance(child, customtkinter.CTkFrame):
-                        child.configure(fg_color=ACTIVE_OUTLINE)
+                        child.configure(fg_color=self._accent_outline())
                         for sub in child.winfo_children():
                             if isinstance(sub, customtkinter.CTkLabel):
                                 sub.configure(text_color=("#ffffff", "#ffffff"))
@@ -5852,6 +6296,8 @@ class App(customtkinter.CTk):
         field_widgets = set()
         if hasattr(self, "field_entries"):
             field_widgets = set(self.field_entries.values())
+        if hasattr(self, "automate_field_entries"):
+            field_widgets |= set(self.automate_field_entries.values())
 
         toast_root = getattr(self, "_toast_host", None)
         log_frame = getattr(self, "_autofill_log_frame", None)
@@ -5964,6 +6410,12 @@ class App(customtkinter.CTk):
         except Exception:  # noqa: BLE001
             pass
         try:
+            self._set_field_widgets_locked(
+                getattr(self, "automate_field_entries", None), True
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self._update_extract_ocr_ui()
         except Exception:  # noqa: BLE001
             pass
@@ -5972,7 +6424,7 @@ class App(customtkinter.CTk):
         except Exception:  # noqa: BLE001
             pass
         try:
-            self._update_settings_button(self._current_step in {"settings", "parse_rules"})
+            self._update_settings_button(self._current_step in SETTINGS_SUBPAGES)
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -6125,14 +6577,14 @@ class App(customtkinter.CTk):
     def _leave_settings_if_open(self, key: str | None = None):
         """If settings is showing, leave to `key` or the step that opened settings.
 
-        Parse-rules stays open so selecting documents can refresh raw text.
+        Parse-rules and more-options stay open so nested settings are not dismissed.
         """
-        if self._current_step == "parse_rules":
+        if self._current_step in {"parse_rules", "more_options"}:
             return
         if self._current_step != "settings":
             return
         target = key or getattr(self, "_step_before_settings", None) or "extract"
-        if target in {"settings", "parse_rules"}:
+        if target in SETTINGS_SUBPAGES:
             target = "extract"
         self.show_step(target)
 
@@ -6140,7 +6592,7 @@ class App(customtkinter.CTk):
         if self._autofill_busy:
             self.set_status("自动填写进行中，请先暂停或退出…")
             return
-        if self._current_step not in {"settings", "parse_rules"}:
+        if self._current_step not in SETTINGS_SUBPAGES:
             self._step_before_settings = self._current_step
         self.show_step("settings")
 
@@ -6363,23 +6815,28 @@ class App(customtkinter.CTk):
             log_note=f"队列导出 · {where}",
         )
 
-    def _on_custom_dir_autofill(self):
-        """Automate from a folder with one Excel + matching digital-text PDFs."""
+    def _on_custom_excel_autofill(self):
+        """Pick one generated-format Excel, import to EAMS, upload PDFs by serial."""
         if self._autofill_busy:
             self.set_status("自动填写进行中，请稍候…")
             return
-        folder = filedialog.askdirectory(
-            parent=self, title="选择自定义自动填写目录"
+        excel_pick = filedialog.askopenfilename(
+            parent=self,
+            title="选择自定义导入 Excel",
+            filetypes=[
+                ("Excel 工作簿", "*.xlsx *.xlsm"),
+                ("所有文件", "*.*"),
+            ],
         )
-        if not folder:
+        if not excel_pick:
             return
         try:
             excel_path, items, excel_headers, excel_rows = (
-                self._load_custom_autofill_bundle(Path(folder))
+                self._load_custom_excel_import(Path(excel_pick))
             )
         except Exception as exc:  # noqa: BLE001
-            self.set_status(f"自定义目录无效：{exc}")
-            self.show_toast(str(exc), title="自定义目录自动填写")
+            self.set_status(f"自定义 Excel 无效：{exc}")
+            self.show_toast(str(exc), title="自定义 Excel 导入")
             return
 
         self._start_autofill_run(
@@ -6387,8 +6844,8 @@ class App(customtkinter.CTk):
             excel_path=excel_path,
             excel_headers=excel_headers,
             excel_rows=excel_rows,
-            title="自定义目录自动填写",
-            log_note=f"自定义目录 · {Path(folder).name} · {excel_path.name}",
+            title="自定义 Excel 导入",
+            log_note=f"自定义 Excel · {excel_path.name}",
         )
 
     @staticmethod
@@ -6399,33 +6856,46 @@ class App(customtkinter.CTk):
             return str(int(value))
         return str(value).strip()
 
-    def _load_custom_autofill_bundle(
-        self, folder: Path
+    def _custom_excel_pdf_candidates(self, excel_path: Path) -> list[Path]:
+        """PDFs to match against Excel 编号: loaded files, import folder, then Excel folder."""
+        seen: set[str] = set()
+        out: list[Path] = []
+
+        def add_path(path: Path) -> None:
+            if not path.is_file() or path.suffix.lower() != ".pdf":
+                return
+            key = str(path.resolve())
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(path)
+
+        def add_folder(folder: Path | None) -> None:
+            if folder is None or not folder.is_dir():
+                return
+            for pattern in ("*.pdf", "*.PDF"):
+                for path in sorted(folder.glob(pattern)):
+                    add_path(path)
+
+        for raw in getattr(self, "_imported_files", []) or []:
+            add_path(Path(raw))
+        add_folder(self._import_folder_root())
+        if not out:
+            add_folder(excel_path.parent)
+        return out
+
+    def _load_custom_excel_import(
+        self, excel_path: Path
     ) -> tuple[Path, list[AutofillItem], list[str], list[list[str]]]:
-        """Require exactly one Excel and match each row to a PDF in ``folder``."""
-        folder = Path(folder)
-        if not folder.is_dir():
-            raise FileNotFoundError("请选择有效的文件夹")
+        """Read one VinCert-format Excel and pair each 编号 with a matching PDF."""
+        excel_path = Path(excel_path)
+        if not excel_path.is_file():
+            raise FileNotFoundError("请选择有效的 Excel 文件")
+        if excel_path.name.startswith("~$"):
+            raise ValueError("请选择正式 Excel 文件，不要选择临时锁文件")
+        if excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            raise ValueError("请选择 .xlsx / .xlsm 文件")
 
-        excel_files = sorted(
-            {
-                *folder.glob("*.xlsx"),
-                *folder.glob("*.xlsm"),
-                *folder.glob("*.XLSX"),
-                *folder.glob("*.XLSM"),
-            }
-        )
-        # Ignore Excel lock / temp files.
-        excel_files = [
-            p for p in excel_files if not p.name.startswith("~$") and p.is_file()
-        ]
-        if len(excel_files) == 0:
-            raise FileNotFoundError("目录中未找到 Excel（.xlsx）文件")
-        if len(excel_files) > 1:
-            names = "、".join(p.name for p in excel_files[:5])
-            raise ValueError(f"目录中应只有一份 Excel，当前有 {len(excel_files)} 份：{names}")
-
-        excel_path = excel_files[0]
         from openpyxl import load_workbook  # pyright: ignore[reportMissingModuleSource]
 
         workbook = load_workbook(excel_path, data_only=True, read_only=True)
@@ -6438,7 +6908,6 @@ class App(customtkinter.CTk):
                 raise ValueError("Excel 为空") from exc
             headers = [self._excel_cell_text(v) for v in header_row]
             expected = [label for _key, label in EXPORT_COLUMNS]
-            # Allow exact match or headers that contain the expected labels in order.
             missing = [h for h in expected if h not in headers]
             if missing:
                 raise ValueError(
@@ -6463,8 +6932,9 @@ class App(customtkinter.CTk):
                     export_vals.append(cell)
                 if not any(export_vals):
                     continue
-                if not (fields.serial_num or fields.name):
-                    raise ValueError("Excel 行缺少「编号」或「名称」，无法匹配 PDF")
+                serial = (fields.serial_num or "").strip()
+                if not serial:
+                    raise ValueError("Excel 行缺少「编号」，无法匹配 PDF")
                 field_rows.append(fields)
                 data_rows.append(export_vals)
         finally:
@@ -6473,82 +6943,82 @@ class App(customtkinter.CTk):
         if not field_rows:
             raise ValueError("Excel 没有可导入的数据行")
 
-        pdfs = sorted(
-            {
-                *folder.glob("*.pdf"),
-                *folder.glob("*.PDF"),
-            }
-        )
-        pdfs = [p for p in pdfs if p.is_file()]
+        pdfs = self._custom_excel_pdf_candidates(excel_path)
         if not pdfs:
-            raise FileNotFoundError("目录中未找到 PDF 证书")
+            raise FileNotFoundError(
+                "未找到可匹配的 PDF。请先加载证书文件夹，或将 PDF 与 Excel 放在同一目录。"
+            )
 
         used: set[str] = set()
         items: list[AutofillItem] = []
         for fields in field_rows:
-            pdf = self._match_pdf_for_fields(fields, pdfs, used=used)
+            serial = (fields.serial_num or "").strip()
+            pdf = self._match_pdf_for_serial(serial, pdfs, used=used)
             if pdf is None:
-                tip = fields.serial_num or fields.name
-                raise FileNotFoundError(f"找不到与「{tip}」对应的 PDF")
+                raise FileNotFoundError(f"找不到编号「{serial}」对应的 PDF")
             used.add(str(pdf))
             items.append(AutofillItem(fields=fields, pdf_path=str(pdf)))
 
         return excel_path, items, expected, data_rows
 
-    def _match_pdf_for_fields(
+    def _match_pdf_for_serial(
         self,
-        fields: CertificateFields,
+        serial: str,
         pdfs: list[Path],
         *,
         used: set[str],
     ) -> Path | None:
-        """Match a PDF by serial/name in the filename (unused files only)."""
-        serial = (fields.serial_num or "").strip()
-        name = (fields.name or "").strip()
+        """Match a PDF to Excel 编号: filename, cached parse, then digital text."""
+        serial = (serial or "").strip()
+        if not serial:
+            return None
+        serial_l = serial.casefold()
+        serial_compact = re.sub(r"\s+", "", serial_l)
         available = [p for p in pdfs if str(p) not in used]
         if not available:
             return None
 
-        def score(path: Path) -> int:
+        def filename_score(path: Path) -> int:
             stem = path.stem
             stem_l = stem.casefold()
-            points = 0
-            if serial:
-                serial_l = serial.casefold()
-                if stem_l == serial_l:
-                    points += 100
-                elif serial_l in stem_l:
-                    points += 80
-            if name:
-                name_l = name.casefold()
-                if name_l in stem_l:
-                    points += 40
-            return points
+            stem_compact = re.sub(r"\s+", "", stem_l)
+            if stem_l == serial_l or stem_compact == serial_compact:
+                return 100
+            if serial_l in stem_l or serial_compact in stem_compact:
+                return 80
+            return 0
 
         ranked = sorted(
-            ((score(p), len(p.stem), p) for p in available),
+            ((filename_score(p), len(p.stem), p) for p in available),
             key=lambda t: (-t[0], t[1], t[2].name.casefold()),
         )
         best_score, _len, best = ranked[0]
-        if best_score <= 0:
-            # Fall back to parse digital text for serial match.
-            for path in available:
-                try:
-                    result = parse_certificate(
-                        str(path),
-                        use_ocr_fallback=False,
-                        force_ocr=False,
-                        extra_label_aliases=self._extra_label_aliases(),
-                    )
-                except Exception:  # noqa: BLE001
-                    continue
-                parsed = result.fields
-                if serial and (parsed.serial_num or "").strip() == serial:
-                    return path
-                if name and (parsed.name or "").strip() == name and not serial:
-                    return path
-            return None
-        return best
+        if best_score > 0:
+            return best
+
+        parsed_map = getattr(self, "_parse_results", {}) or {}
+        for path in available:
+            result = parsed_map.get(str(path)) or parsed_map.get(str(path.resolve()))
+            if result is None:
+                continue
+            parsed = re.sub(r"\s+", "", (result.fields.serial_num or "").strip())
+            if parsed.casefold() == serial_compact:
+                return path
+
+        for path in available:
+            try:
+                result = parse_certificate(
+                    str(path),
+                    use_ocr_fallback=False,
+                    force_ocr=False,
+                    extra_label_aliases=self._extra_label_aliases(),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            parsed = re.sub(r"\s+", "", (result.fields.serial_num or "").strip())
+            if parsed.casefold() == serial_compact:
+                return path
+        return None
 
     def _start_autofill_run(
         self,
@@ -6560,7 +7030,7 @@ class App(customtkinter.CTk):
         title: str,
         log_note: str,
     ) -> None:
-        """Shared Playwright autofill launcher for queue / custom-directory runs."""
+        """Shared Playwright autofill launcher for queue / custom Excel runs."""
         self._autofill_busy = True
         self._autofill_control = AutofillControl()
         self._show_autofill_run_controls()
@@ -6574,6 +7044,15 @@ class App(customtkinter.CTk):
             f"{log_note} · 步骤间隔 {step_delay:g}s · "
             f"{'测试环境' if self._testing_mode else '正式环境'}"
         )
+        if items:
+            first = items[0]
+            self._focus_certificate_for_autofill(
+                first.pdf_path,
+                first.fields,
+                index=1,
+                total=len(items),
+                pending=True,
+            )
 
         username, password = self._eams_credentials()
         if not username or not password:
@@ -6611,6 +7090,12 @@ class App(customtkinter.CTk):
                     user_data_dir=profile,
                     shared_context=context,
                     shared_page=page,
+                    on_item=lambda i, n, item: self.after(
+                        0,
+                        lambda i=i, n=n, item=item: self._on_autofill_item(
+                            i, n, item
+                        ),
+                    ),
                 )
 
             try:
@@ -6629,6 +7114,15 @@ class App(customtkinter.CTk):
 
     def _on_autofill_progress(self, message: str, *, duration_ms: int | None = None):
         del duration_ms  # Kept for call-site compat; lines live in the terminal panel.
+        if message.startswith("已保存下载："):
+            body = message.removeprefix("已保存下载：").strip()
+            if " → " in body:
+                name, folder = body.split(" → ", 1)
+                toast_body = f"{name}\n保存到：{folder}"
+            else:
+                toast_body = body or message
+            self.show_success_toast(toast_body, title="下载已保存")
+            return
         self.append_autofill_log(
             message,
             error=message.startswith("失败"),
@@ -6641,6 +7135,10 @@ class App(customtkinter.CTk):
         """
         self._sync_window_layout_to_browser()
         self._raise_workspace_windows()
+
+    def _refresh_automate_fields_idle(self) -> None:
+        path = self._selected_path or self._current_cert_path()
+        self._load_automate_fields(path)
 
     def _on_autofill_done(self, report, excel_path: Path | None = None):
         self._autofill_busy = False
@@ -6726,6 +7224,9 @@ class App(customtkinter.CTk):
                 self.show_success_toast("Successfully done", title="自动填写")
             else:
                 self.show_toast(summary, title="导出并自动填写")
+        if hasattr(self, "field_entries"):
+            self._load_approve_fields_for_current()
+        self._refresh_automate_fields_idle()
 
     def _on_autofill_fail(self, message: str):
         self._autofill_busy = False
@@ -6735,6 +7236,9 @@ class App(customtkinter.CTk):
         self.append_autofill_log(f"自动填写失败：{message}", error=True)
         self.finish_autofill_log(ok=False, auto_close_ms=4000)
         self.show_toast(f"自动填写失败：{message}", title="导出并自动填写")
+        if hasattr(self, "field_entries"):
+            self._load_approve_fields_for_current()
+        self._refresh_automate_fields_idle()
 
     def _export_rows(self) -> list[list[str]]:
         rows: list[list[str]] = []
