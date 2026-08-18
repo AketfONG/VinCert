@@ -14,6 +14,14 @@
 ```bash
 py -m pip install -r requirements.txt
 ```
+4. 创建快捷方式: 创造 txt 文档，输入:
+
+```bash
+@echo off
+py D:/... (gui.py 路径)
+pause
+```
+将 txt 格式改成 bat 后缀，双击运行
 
 如果显示 pip 版本太旧提示更新，按终端提示操作更新 pip
 
