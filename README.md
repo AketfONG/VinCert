@@ -70,7 +70,7 @@ py -m pip install -r requirements.txt
 
 ---
  
-# v1.0.1 (18/08/2026) Release Notes
+# v1.0 (18/08/2026) Release Notes
 
 - **Purple Mode** — Allow choosing custom excel spreadsheet for batch import and automation, software would choose appropriate pdfs for certificate uploads
-- **Bug Fixes & Improvements** — Windows Zoom Fix + Smaller Window Option, Updated UX, Fixed Incorrect Parsing + Valid Till Date Usage
+- **Bug Fixes & Improvements** — Windows Zoom Fix + Smaller Window Option, Updated UX, Fixed Incorrect Parsing

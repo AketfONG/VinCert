@@ -78,9 +78,6 @@ def load_ui_settings(path: Path | None = None) -> dict:
         "compact_min_window": False,
         "auto_window_snap": True,
         "pdf_preview_enabled": True,
-        # Default OFF for the UI toggle "使用提取结果":
-        # - off => system auto-determination
-        "valid_till_from_system": True,
         "feature_extensions": False,
         "testing_mode": False,
         "demo_folder_enabled": False,
@@ -117,8 +114,6 @@ def load_ui_settings(path: Path | None = None) -> dict:
         out["auto_window_snap"] = bool(data["auto_window_snap"])
     if "pdf_preview_enabled" in data:
         out["pdf_preview_enabled"] = bool(data["pdf_preview_enabled"])
-    if "valid_till_from_system" in data:
-        out["valid_till_from_system"] = bool(data["valid_till_from_system"])
     if "feature_extensions" in data:
         out["feature_extensions"] = bool(data["feature_extensions"])
     if "testing_mode" in data:
@@ -340,15 +335,6 @@ def save_autofill_step_delay_sec(seconds: float, path: Path | None = None) -> fl
     return value
 
 
-def load_valid_till_from_system(path: Path | None = None) -> bool:
-    """When True, let EAMS system auto-determination set 有效期至."""
-    return bool(load_ui_settings(path).get("valid_till_from_system", False))
-
-
-def save_valid_till_from_system(enabled: bool, path: Path | None = None) -> Path:
-    return save_ui_settings(valid_till_from_system=bool(enabled))
-
-
 def apply_ui_scale(zoomed: bool) -> float:
     scale = UI_SCALE_ZOOMED if zoomed else UI_SCALE_NORMAL
     customtkinter.set_widget_scaling(scale)
@@ -375,7 +361,7 @@ SMALL_BTN_HEIGHT = 36
 ENTRY_HEIGHT = 44
 PRIMARY_ACTION_BTN_HEIGHT = 45  # 45×1.2 = 54px — avoids CTk odd-height text bias when zoomed
 UI_RADIUS = 12  # shared corner radius for panels + buttons
-BUILD_VERSION = "v1.0.1"
+BUILD_VERSION = "v1.0"
 BUILD_DATE = "18/08/2026"
 RELEASES_URL = "https://github.com/AketfONG/VinCert/releases"
 
@@ -596,7 +582,6 @@ class App(customtkinter.CTk):
         self._demo_folder_enabled = load_demo_folder_enabled()
         self._demo_folder = load_demo_folder()
         self._autofill_step_delay_sec = load_autofill_step_delay_sec()
-        self._valid_till_from_system = load_valid_till_from_system()
         self._parse_rules: dict[str, list[str]] = load_parse_rules()
         self._parse_rules_field_key = PARSE_RULE_FIELDS[0][0]
         self._content_wrap_labels: list[customtkinter.CTkLabel] = []
@@ -2711,41 +2696,6 @@ class App(customtkinter.CTk):
         )
         self.pdf_preview_enabled_switch.grid(row=8, column=0, sticky="w", pady=(0, 16))
 
-        customtkinter.CTkLabel(
-            content,
-            text="有效期至",
-            anchor="w",
-            font=customtkinter.CTkFont(size=FONT_SECTION, weight="bold"),
-        ).grid(row=9, column=0, sticky="ew", pady=(8, 8))
-        self._track_content_wrap(
-            customtkinter.CTkLabel(
-                content,
-                text="开启后使用已解析的「本次检测有效期至」字段；关闭则清空该输入，让系统自动判定。",
-                anchor="w",
-                font=customtkinter.CTkFont(size=FONT_BODY),
-                text_color="gray60",
-                wraplength=CONTENT_WRAP,
-                justify="left",
-            )
-        ).grid(row=10, column=0, sticky="ew", pady=(0, 6))
-
-        self.valid_till_use_extracted_switch = customtkinter.CTkSwitch(
-            content,
-            text="使用提取结果（开启时写入）",
-            font=customtkinter.CTkFont(size=FONT_BODY),
-        )
-        # ON => use extracted due_date; OFF => clear and let system auto-determinate.
-        if not self._valid_till_from_system:
-            self.valid_till_use_extracted_switch.select()
-        else:
-            self.valid_till_use_extracted_switch.deselect()
-        self.valid_till_use_extracted_switch.configure(
-            command=self._on_valid_till_use_extracted_toggle
-        )
-        self.valid_till_use_extracted_switch.grid(
-            row=11, column=0, sticky="w", pady=(0, 16)
-        )
-
         self._bind_scrollable_mousewheel(self.more_options_scroll, self.more_options_scroll)
         self._schedule_active_page_vcenter(force=True)
 
@@ -3306,11 +3256,6 @@ class App(customtkinter.CTk):
     def _on_pdf_preview_enabled_toggle(self):
         self._apply_pdf_preview_enabled(bool(self.pdf_preview_enabled_switch.get()))
 
-    def _on_valid_till_use_extracted_toggle(self):
-        # UI switch means "use extracted due_date when ON".
-        use_extracted = bool(self.valid_till_use_extracted_switch.get())
-        self._apply_valid_till_from_system(not use_extracted)
-
     def _on_feature_extensions_toggle(self):
         self._apply_feature_extensions(bool(self.feature_extensions_switch.get()))
 
@@ -3377,15 +3322,6 @@ class App(customtkinter.CTk):
             if self._pdf_preview.has_pdf:
                 self._pdf_preview.close()
             self.set_status("已关闭 PDF 预览")
-
-    def _apply_valid_till_from_system(self, enabled: bool):
-        self._valid_till_from_system = enabled
-        save_valid_till_from_system(enabled)
-        self.set_status(
-            "有效期至：已使用系统自动判定"
-            if enabled
-            else "有效期至：将使用提取结果"
-        )
 
     def _apply_feature_extensions(self, enabled: bool):
         self._feature_extensions = enabled
@@ -7149,7 +7085,6 @@ class App(customtkinter.CTk):
                     ),
                     control=control,
                     testing=bool(self._testing_mode),
-                        fill_due_date=not bool(self._valid_till_from_system),
                     window_bounds=browser_bounds,
                     step_delay_sec=step_delay,
                     user_data_dir=profile,
