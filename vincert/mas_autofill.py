@@ -489,6 +489,24 @@ def _fill_textbox(
     _action_pause()
 
 
+def _clear_textbox(
+    frame,
+    name: str,
+    *,
+    timeout: float = 8000,
+    status: StatusFn | None = None,
+) -> None:
+    """Clear a labeled textbox so the product system can auto-determinate."""
+    try:
+        box = frame.get_by_role("textbox", name=name)
+        _click(status, box, name, timeout=timeout, pause=False)
+        box.fill("", timeout=timeout)
+        box.press("Tab")
+        _action_pause()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _open_maximo_dropdown(
     frame,
     name: str,
@@ -1504,6 +1522,7 @@ def run_mas_autofill(
     slow_mo: int = 100,
     batch_import: bool = True,
     fill_details: bool = True,
+    fill_due_date: bool = True,
     upload_pdf: bool = True,
     submit_workflow: bool = False,
     login_wait_seconds: int = DEFAULT_LOGIN_WAIT_SECONDS,
@@ -1688,7 +1707,11 @@ def run_mas_autofill(
                         check()
                         pause_step()
                         _fill_record_fields(
-                            shell, item.fields, status=status, page=page
+                            shell,
+                            item.fields,
+                            status=status,
+                            page=page,
+                            fill_due_date=fill_due_date,
                         )
                         report.filled += 1
                     check()
@@ -2293,6 +2316,7 @@ def _fill_record_fields(
     *,
     status: StatusFn | None = None,
     page=None,
+    fill_due_date: bool = True,
 ) -> None:
     """Fill certificate type, check date, result info (and related dates/org)."""
     if fields.measurement_type:
@@ -2316,8 +2340,14 @@ def _fill_record_fields(
         raise AutofillItemError("缺少本次检测日期", quarantine=True)
     _fill_textbox(shell, "本次检测日期", fields.measurement_date, status=status)
 
-    if fields.due_date:
-        _fill_textbox(shell, "本次检测有效期至", fields.due_date, status=status)
+    if fill_due_date:
+        if fields.due_date:
+            _fill_textbox(
+                shell, "本次检测有效期至", fields.due_date, status=status
+            )
+    else:
+        # Clear the field so EAMS system can auto-determinate.
+        _clear_textbox(shell, "本次检测有效期至", status=status)
     if fields.measurement_unit:
         _fill_textbox(shell, "检测机构", fields.measurement_unit, status=status)
 
