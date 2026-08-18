@@ -26,7 +26,7 @@ py -m pip install -r requirements.txt
 1. EAMS 登录：填写用户名、密码，点击 保存登录信息， 实现自动登录系统功能
 2. 步骤间隔：每个自动化步骤之间的等待秒数（默认 1 秒），运行一段时间后没问题可以改成 0 秒以达到更快速度
 3. 启动加载文件夹：可配置证书文件夹，启动时自动加载
-4. 其他可选：界面放大、失败证书目录等
+4. 其他可选：界面放大、更小窗口、失败证书目录等
 5. 解析规则：为新证书添加新规则
 6. 功能拓展：指定自定义批量导入 EAMS 的 Excel 模版，并完成自动化操作
 
@@ -72,6 +72,5 @@ py -m pip install -r requirements.txt
  
 # v1.0 (18/08/2026) Release Notes
 
-- **Automation Done** - Robust Logic Ready for Beta Testing, Optimised for Production Environment
-- **Purple Mode** — 提取核对 & 自动化
-- **Bug Fixes & Improvements** — Windows Zoom Fix, Updated UX, Fixed Incorrect Parsing
+- **Purple Mode** — Allow choosing custom excel spreadsheet for batch import and automation, software would choose appropriate pdfs for certificate uploads
+- **Bug Fixes & Improvements** — Windows Zoom Fix + Smaller Window Option, Updated UX, Fixed Incorrect Parsing
